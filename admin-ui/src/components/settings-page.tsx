@@ -100,7 +100,7 @@ export function SettingsPage({
             variant="ghost"
             onClick={onBack}
           >
-            <span className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
+            <span className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg">
               <LogoMark className="size-[1.125rem]" />
             </span>
             <span className="min-w-0 text-left">

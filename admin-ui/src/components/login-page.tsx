@@ -48,7 +48,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
       </div>
       <div className="w-full max-w-sm">
         <div className="mb-6 flex flex-col items-center text-center">
-          <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-brand-foreground shadow-brand">
+          <div className="brand-mark flex size-12 items-center justify-center rounded-xl">
             <LogoMark className="size-7" />
           </div>
           <div className="mt-4 text-base font-semibold leading-none tracking-tight">Coban</div>

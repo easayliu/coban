@@ -221,7 +221,7 @@ function App() {
       <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
         <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
+            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg">
               <LogoMark className="size-[1.125rem]" />
             </div>
             <div className="min-w-0">

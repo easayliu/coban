@@ -534,6 +534,11 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
 /// 一个 JSON 响应变成 SSE。所以这里同时记下「客户端本来没要流」，由 [`collapse_upstream`]
 /// 把流收回成 JSON——只改体不管回程的话，客户端拿到的是一堆读不懂的 `data:` 行。
 ///
+/// 顺手**丢掉 `max_output_tokens`**：上游不认这个参数（实测回 `Unsupported parameter:
+/// max_output_tokens`），带上去是整条请求 400。与 [`crate::chat`] 丢 `max_tokens` 同一个
+/// 取舍——客户端设的输出上限静默失效，好过每条请求都失败，且后者在客户端那头看到的只是
+/// 一句「请求失败」。codex CLI 不发这个字段，照 OpenAI 官方 Responses API 写的客户端会发。
+///
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
 fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
@@ -547,10 +552,11 @@ fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     let yes = Some(&serde_json::Value::Bool(true));
     let no = Some(&serde_json::Value::Bool(false));
     let collapse = obj.get("stream") != yes;
-    if !collapse && obj.get("store") == no {
-        // 两项已经都对：不重新序列化（也就不会顺手改掉字段顺序）。
+    if !collapse && obj.get("store") == no && !obj.contains_key("max_output_tokens") {
+        // 三项都已经对：不重新序列化（也就不会顺手改掉字段顺序）。
         return Normalized { body, collapse, chat: None, sticky };
     }
+    obj.remove("max_output_tokens");
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
@@ -2112,6 +2118,29 @@ mod tests {
         assert_eq!(v["store"], false);
         assert_eq!(v["stream"], true);
         assert_eq!(v["model"], "gpt-5.4");
+    }
+
+    /// `max_output_tokens` 一定要在这里丢掉：上游回 `Unsupported parameter`，带上去是每条
+    /// 请求都 400。别的字段一个不能顺手丢。
+    #[test]
+    fn max_output_tokens_is_dropped_on_responses() {
+        let pin = |b: &str| -> serde_json::Value {
+            serde_json::from_slice(&norm("responses", b).body).unwrap()
+        };
+        let v = pin(r#"{"model":"gpt-5.4","store":false,"stream":true,"max_output_tokens":64}"#);
+        assert!(v.get("max_output_tokens").is_none());
+        // 丢一个字段不能顺带把这条路上的硬约束与客户端的别的参数搅了。
+        assert_eq!(v["store"], false);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["model"], "gpt-5.4");
+        // 与 store/stream 的改写正交：漏传那两项时同样要丢。
+        let v = pin(r#"{"model":"gpt-5.4","max_output_tokens":64,"reasoning":{"effort":"high"}}"#);
+        assert!(v.get("max_output_tokens").is_none());
+        assert_eq!(v["store"], false);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["reasoning"]["effort"], "high");
+        // 客户端本来要不要流不受影响。
+        assert!(!norm("responses", r#"{"stream":true,"max_output_tokens":1}"#).collapse);
     }
 
     /// 「客户端本来要不要流」必须与改写分开记：钉了 `stream` 还得把回程的 SSE 收回成

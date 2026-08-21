@@ -281,6 +281,10 @@
     padding-bottom: env(safe-area-inset-bottom);
   }
 
+  /* 品牌标识的底与前景，随主题反转（浅色近黑底/近白标，深色反过来）。
+     用它的地方**不要再叠 text-* 工具类**：utilities 层排在 components 层之后，同样的单类
+     特异性下工具类会把这里的 color 顶掉——叠一个 text-white 的结果是深色主题下近白底上
+     画白色标识，整个标识看不见。 */
   .brand-mark {
     color: var(--primary-foreground);
     background: var(--primary);
