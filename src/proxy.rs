@@ -51,8 +51,8 @@ pub async fn handle(
         }
     }
 
-    // 请求体在重试间要重发多次，规范化只做一次（见 force_store_false）。
-    let body = force_store_false(&path, body);
+    // 请求体在重试间要重发多次，规范化只做一次（见 normalize_responses_body）。
+    let Normalized { body, collapse } = normalize_responses_body(&path, body);
 
     let started = Instant::now();
     let retry_max = state
@@ -96,6 +96,7 @@ pub async fn handle(
             &uri,
             &headers,
             &body,
+            collapse,
             started,
             in_flight.clone(),
         )
@@ -148,6 +149,7 @@ async fn forward_once(
     uri: &Uri,
     headers: &HeaderMap,
     body: &Bytes,
+    collapse: bool,
     started: Instant,
     in_flight: InFlightGuard,
 ) -> anyhow::Result<Outcome> {
@@ -155,7 +157,12 @@ async fn forward_once(
     let token = state.store.valid_access_token(&state.clients, cred).await?;
 
     let url = upstream_url(path, uri.query());
-    let fwd_headers = build_forward_headers(headers, cred, &token);
+    let mut fwd_headers = build_forward_headers(headers, cred, &token);
+    if collapse {
+        // 体里的 `stream` 已被我们钉成 true，`accept` 得跟着说 SSE：官方客户端不存在
+        // 「体里要流、头里要 JSON」这种自相矛盾的形态，别让上游去猜。
+        fwd_headers.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+    }
 
     let req = client
         .request(wreq::Method::from_bytes(method.as_str().as_bytes())?, &url)
@@ -201,7 +208,110 @@ async fn forward_once(
         return Ok(Outcome::Done(passthrough(status, &up_headers, bytes)));
     }
 
+    if collapse {
+        return Ok(Outcome::Done(
+            collapse_upstream(state, cred, path, headers, up, quota, started).await,
+        ));
+    }
+
     Ok(Outcome::Done(stream_upstream(state, cred, path, headers, up, quota, started, in_flight)))
+}
+
+/// 把上游的 SSE 收拢成一个一次性 JSON 响应。
+///
+/// 只在客户端没要流时走这里（见 [`Normalized`]）：体里的 `stream` 被钉成了 true，
+/// 上游必然回 SSE，而这个客户端等的是一个 `response` 对象，把事件流原样交给它等于
+/// 让它读一堆读不懂的 `data:` 行。
+///
+/// 代价是这条路径不再是流式的：整段响应读完才回。要延迟就该在请求里写 `stream: true`。
+async fn collapse_upstream(
+    state: &AppState,
+    cred: &Credential,
+    path: &str,
+    req_headers: &HeaderMap,
+    up: wreq::Response,
+    quota: QuotaSnapshot,
+    started: Instant,
+) -> Response {
+    let status = StatusCode::from_u16(up.status().as_u16()).unwrap_or(StatusCode::OK);
+    let up_headers = up.headers().clone();
+    let bytes = match up.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            log_usage(
+                state,
+                cred,
+                path,
+                req_headers,
+                status.as_u16() as i64,
+                None,
+                &quota,
+                started,
+                None,
+            );
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!("failed to read the upstream response body: {e}"),
+            );
+        }
+    };
+
+    // 用量与流式路径共用同一个嗅探器：SSE 的形态是一样的，两处各写一份解析必然走岔。
+    let mut sniffer = UsageSniffer::default();
+    sniffer.feed(&bytes);
+    let model = sniffer.model.clone();
+    log_usage(
+        state,
+        cred,
+        path,
+        req_headers,
+        status.as_u16() as i64,
+        model,
+        &quota,
+        started,
+        sniffer.usage,
+    );
+
+    // 上游会先回 200 再在流里说这次生成失败；非流式客户端读不到那个事件，得翻成 HTTP 错误。
+    if let Some((etype, message)) = sse_failure(&bytes) {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            etype.as_deref().unwrap_or("upstream_error"),
+            message,
+        );
+    }
+
+    let Some(resp) = sse_final_response(&bytes) else {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "the upstream stream ended without a completed response",
+        );
+    };
+
+    let body = serde_json::to_vec(&resp)
+        .unwrap_or_else(|_| error_body("internal_error", "failed to serialize the response"));
+    let mut builder = Response::builder().status(status);
+    for (name, value) in up_headers.iter() {
+        // 逐条跳过的理由同 resp_builder；`content-type` 也不能照抄——上游说的是
+        // `text/event-stream`，而这里交出去的是一个 JSON 对象。
+        if matches!(
+            name.as_str(),
+            "content-length"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "connection"
+                | "content-type"
+        ) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    builder
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|e| internal_error_plain(&e.to_string()))
 }
 
 /// 把上游响应流式转出去，边转边嗅探用量。
@@ -248,29 +358,50 @@ fn stream_upstream(
 }
 
 /// 拼上游 URL：`UPSTREAM_BASE` + 来访路径（+ 原样带上 query）。
-/// 把 `responses` 请求体里的 `store` 按住在 `false`。
+/// 规范化后的请求体。
+struct Normalized {
+    /// 发给上游的体。非 `responses` 路径、或解不动的体，原样带回。
+    body: Bytes,
+    /// 客户端要的是一次性 JSON（体里的 `stream` 不是 `true`）。上游只出 SSE，所以这种
+    /// 请求要在本层把流收拢回一个 JSON 体（见 [`collapse_upstream`]）。
+    collapse: bool,
+}
+
+/// 把 `responses` 请求体钉成上游要的样子：`store: false`、`stream: true`。
 ///
-/// 上游只接受 `store: false`（会话不落在 ChatGPT 侧），漏传或传 `true` 一律 400
-/// `Store must be set to false`。codex CLI 自己会带上，但照 OpenAI 官方 Responses API
-/// 写的客户端不会——那边 `store` 默认就是 `true`。这种改写只此一处：它是上游的硬约束，
-/// 不是用户的选择，让每个接入方各自去踩一遍没有意义。
+/// 上游对这两项都是硬约束，且各自的 400 长得一模一样地不讲道理：
+/// - `store` 漏传或传 `true` → `Store must be set to false`（会话不落在 ChatGPT 侧）；
+/// - `stream` 漏传或传 `false` → `Stream must be set to true`（这条路径只出 SSE）。
+///
+/// codex CLI 两项都带对了，但照 OpenAI 官方 Responses API 写的客户端不会——那边 `store`
+/// 默认 `true`、`stream` 默认 `false`，两条默认值正好都踩在雷上。改写只此一处：这是上游的
+/// 硬约束而不是用户的选择，让每个接入方各自去踩一遍没有意义。
+///
+/// 钉 `stream` 与钉 `store` 有个区别：`store` 改了客户端察觉不到，而 `stream` 改了会把
+/// 一个 JSON 响应变成 SSE。所以这里同时记下「客户端本来没要流」，由 [`collapse_upstream`]
+/// 把流收回成 JSON——只改体不管回程的话，客户端拿到的是一堆读不懂的 `data:` 行。
 ///
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
-fn force_store_false(path: &str, body: Bytes) -> Bytes {
+fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
-        return body;
+        return Normalized { body, collapse: false };
     }
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
-        return body;
+        return Normalized { body, collapse: false };
     };
-    if obj.get("store") == Some(&serde_json::Value::Bool(false)) {
-        return body;
+    let yes = Some(&serde_json::Value::Bool(true));
+    let no = Some(&serde_json::Value::Bool(false));
+    let collapse = obj.get("stream") != yes;
+    if !collapse && obj.get("store") == no {
+        // 两项已经都对：不重新序列化（也就不会顺手改掉字段顺序）。
+        return Normalized { body, collapse };
     }
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
+    obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
-        Ok(v) => Bytes::from(v),
+        Ok(v) => Normalized { body: Bytes::from(v), collapse },
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
-        Err(_) => body,
+        Err(_) => Normalized { body, collapse },
     }
 }
 
@@ -1320,6 +1451,36 @@ fn sse_failure(bytes: &[u8]) -> Option<(Option<String>, String)> {
     None
 }
 
+/// 在一段 SSE 里找终局的 `response` 对象（`response.completed` / `response.incomplete`）。
+///
+/// 这就是同一次请求在非流式下本该返回的那个体，所以收拢流时直接把它交出去。取最后一个：
+/// 一段流里只会有一个终局事件，但真出现两个时后者才是终值。
+///
+/// 先用一次廉价的子串判断挡掉增量文本事件，只有可能是终局的才付一次 JSON 解析——逐行解析
+/// 的话，一次长回复要解上千次。
+fn sse_final_response(bytes: &[u8]) -> Option<serde_json::Value> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = None;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if !data.contains("response.completed") && !data.contains("response.incomplete") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+        if !matches!(
+            v.get("type").and_then(|t| t.as_str()),
+            Some("response.completed") | Some("response.incomplete")
+        ) {
+            continue;
+        }
+        if let Some(resp) = v.get("response").filter(|r| r.is_object()) {
+            out = Some(resp.clone());
+        }
+    }
+    out
+}
+
 /// 错误原文截断到 [`PROBE_ERROR_MAX_LEN`] 个**字符**（不是字节——按字节切会把多字节
 /// 字符劈成半个，前端拿到的是替换符）。
 fn truncate(s: &str) -> String {
@@ -1477,33 +1638,81 @@ mod tests {
         );
     }
 
-    /// `store` 的三种来法都要落到 `false`，且别的字段一个不动。
+    fn norm(path: &str, b: &str) -> Normalized {
+        normalize_responses_body(path, Bytes::from(b.to_owned()))
+    }
+
+    /// `store`/`stream` 的三种来法都要落到上游要的值，且别的字段一个不动。
     #[test]
-    fn store_is_pinned_to_false_on_responses() {
+    fn store_and_stream_are_pinned_on_responses() {
         let pin = |b: &str| -> serde_json::Value {
-            let out = force_store_false("responses", Bytes::from(b.to_owned()));
-            serde_json::from_slice(&out).unwrap()
+            serde_json::from_slice(&norm("responses", b).body).unwrap()
         };
-        // 漏传（OpenAI 官方 API 那边默认 true）。
-        assert_eq!(pin(r#"{"model":"gpt-5.4"}"#)["store"], false);
-        // 显式 true。
-        assert_eq!(pin(r#"{"model":"gpt-5.4","store":true}"#)["store"], false);
-        // 已经是 false：原样。
-        let v = pin(r#"{"model":"gpt-5.4","store":false}"#);
+        // 漏传（OpenAI 官方 API 那边 store 默认 true、stream 默认 false，两个都是雷）。
+        let v = pin(r#"{"model":"gpt-5.4"}"#);
         assert_eq!(v["store"], false);
+        assert_eq!(v["stream"], true);
+        // 显式反着来。
+        let v = pin(r#"{"model":"gpt-5.4","store":true,"stream":false}"#);
+        assert_eq!(v["store"], false);
+        assert_eq!(v["stream"], true);
+        // 已经都对：原样，且别的字段还在。
+        let v = pin(r#"{"model":"gpt-5.4","store":false,"stream":true}"#);
+        assert_eq!(v["store"], false);
+        assert_eq!(v["stream"], true);
         assert_eq!(v["model"], "gpt-5.4");
     }
 
+    /// 「客户端本来要不要流」必须与改写分开记：钉了 `stream` 还得把回程的 SSE 收回成
+    /// JSON，漏掉这一半客户端拿到的是读不懂的 `data:` 行。
     #[test]
-    fn store_rewrite_only_touches_responses_and_valid_json() {
+    fn collapse_tracks_what_the_client_asked_for() {
+        assert!(norm("responses", r#"{"model":"m"}"#).collapse, "漏传 stream 就是要 JSON");
+        assert!(norm("responses", r#"{"stream":false}"#).collapse);
+        assert!(!norm("responses", r#"{"stream":true}"#).collapse, "自己要了流就照流回");
+        // 别的端点与解不动的体都不在这条路上，一律不收拢。
+        assert!(!norm("models", r#"{"stream":false}"#).collapse);
+        assert!(!norm("responses", "not json").collapse);
+    }
+
+    #[test]
+    fn body_rewrite_only_touches_responses_and_valid_json() {
         // 别的端点（如 models）不碰。
         let raw = Bytes::from_static(br#"{"store":true}"#);
-        assert_eq!(force_store_false("models", raw.clone()), raw);
+        assert_eq!(normalize_responses_body("models", raw.clone()).body, raw);
         // 前导斜杠仍要认出是 responses。
-        assert_eq!(force_store_false("/responses", raw.clone())[..], b"{\"store\":false}"[..]);
+        let out = normalize_responses_body("/responses", raw.clone()).body;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["store"], false);
+        assert_eq!(v["stream"], true);
         // 解不动的体原样放过，不在这里替上游拦。
         let junk = Bytes::from_static(b"not json");
-        assert_eq!(force_store_false("responses", junk.clone()), junk);
+        assert_eq!(normalize_responses_body("responses", junk.clone()).body, junk);
+    }
+
+    /// 收拢流靠的是终局事件里那个 `response` 对象；增量事件与裸的同名字符串都不能骗过它。
+    #[test]
+    fn the_final_response_object_is_what_gets_collapsed() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n",
+        );
+        let v = sse_final_response(sse.as_bytes()).expect("终局事件在这段流里");
+        assert_eq!(v["id"], "resp_1");
+        assert_eq!(v["status"], "completed");
+
+        // 只有增量事件时没有终局对象——这种流不能当成一次成功的非流式响应交出去。
+        assert!(
+            sse_final_response(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n"
+            )
+            .is_none()
+        );
+        // 未完成也是终局：客户端要的就是那个 status。
+        let inc =
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n";
+        assert_eq!(sse_final_response(inc.as_bytes()).unwrap()["status"], "incomplete");
     }
 
     fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
