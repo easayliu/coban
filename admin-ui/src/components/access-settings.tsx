@@ -1,28 +1,42 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  CableIcon, CheckIcon, CopyIcon, EyeIcon, EyeOffIcon, GaugeIcon, KeyRoundIcon,
-  LockKeyholeIcon, RefreshCwIcon, ShieldAlertIcon, TimerResetIcon,
+  CableIcon, CheckIcon, CopyIcon, EyeIcon, EyeOffIcon, GaugeIcon,
+  LockKeyholeIcon, RefreshCwIcon, SaveIcon, ShieldAlertIcon, SparklesIcon, TimerResetIcon, Trash2Icon,
 } from 'lucide-react'
-import { changePassword, getAuthState } from '@/api/auth'
-import { clearPw } from '@/api/client'
+import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
+import { clearPw, setPw } from '@/api/client'
 import {
   getSettings, setApiKey, setCooldownSecs, setDefaultRpmLimit, setQuotaPausePct,
   setRateLimitRetryMax, type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
-import { extractError } from '@/lib/utils'
-import { SettingsGroup } from '@/components/settings-group'
+import { copyText, extractError } from '@/lib/utils'
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
+import { Button, type ButtonProps } from '@/components/ui/button'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+} from '@/components/ui/input-group'
 import { Input } from '@/components/ui/input'
 import {
   NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement, NumberFieldInput,
 } from '@/components/ui/number-field'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
+import { SettingsGroup } from '@/components/settings-group'
 
 /** 设置页各分节共用的读取。所有写接口都回整份设置，故成功后直接塞进缓存即可。 */
 function useSettings() {
@@ -42,6 +56,77 @@ function useSaveToast() {
       type: 'error',
     }),
   }
+}
+
+/** Luban 设置页使用的小型复制按钮：优先走安全上下文 API，局域网 HTTP 也能回退复制。 */
+function CopyButton({
+  text,
+  label,
+  copiedLabel,
+  size = 'icon-xs',
+}: {
+  text: string
+  label: string
+  copiedLabel: string
+  size?: ButtonProps['size']
+}) {
+  const { t } = useI18n()
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef<number | null>(null)
+
+  useEffect(() => () => {
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+  }, [])
+
+  return (
+    <>
+      <Button
+        type="button"
+        aria-label={copied ? copiedLabel : label}
+        className={copied ? 'text-success' : undefined}
+        size={size}
+        title={copied ? copiedLabel : label}
+        variant="ghost"
+        onClick={async () => {
+          if (!text) return
+          if (!(await copyText(text))) {
+            toastManager.add({
+              title: t('复制失败', 'Copy failed'),
+              description: t('请手动选择并复制内容。', 'Select and copy the content manually.'),
+              type: 'error',
+            })
+            return
+          }
+          setCopied(true)
+          if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+          timerRef.current = window.setTimeout(() => {
+            setCopied(false)
+            timerRef.current = null
+          }, 1400)
+        }}
+      >
+        {copied ? <CheckIcon /> : <CopyIcon />}
+      </Button>
+      <span className="sr-only" aria-live="polite">{copied ? copiedLabel : ''}</span>
+    </>
+  )
+}
+
+/** 设置项共用的保存 mutation，保持每个控件的 loading、错误提示和缓存更新口径一致。 */
+function useSettingMutation(
+  mutationFn: (value: number) => Promise<Settings>,
+  successTitle: string,
+) {
+  const qc = useQueryClient()
+  const toast = useSaveToast()
+  return useMutation({
+    mutationFn,
+    onSuccess: (settings) => {
+      qc.setQueryData(['settings'], settings)
+      toast.ok(successTitle)
+    },
+    onError: toast.fail,
+  })
 }
 
 /**
@@ -67,10 +152,14 @@ function NumberSetting({
   useEffect(() => setDraft(value), [value])
   const dirty = draft !== value
   return (
-    <Field>
-      <FieldLabel>{label}</FieldLabel>
-      <div className="flex items-center gap-2">
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{label}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">{description}</FieldDescription>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
         <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
           value={draft}
           min={min}
           max={max}
@@ -78,9 +167,9 @@ function NumberSetting({
           onValueChange={(v) => setDraft(Math.min(max, Math.max(min, Math.floor(v ?? min))))}
         >
           <NumberFieldGroup>
-            <NumberFieldDecrement />
+            <NumberFieldDecrement aria-label={t('减少', 'Decrease')} />
             <NumberFieldInput aria-label={label} />
-            <NumberFieldIncrement />
+            <NumberFieldIncrement aria-label={t('增加', 'Increase')} />
           </NumberFieldGroup>
         </NumberField>
         <Button size="sm" disabled={!dirty || pending} onClick={() => onSave(draft)}>
@@ -88,7 +177,6 @@ function NumberSetting({
           {t('保存', 'Save')}
         </Button>
       </div>
-      <FieldDescription>{description}</FieldDescription>
     </Field>
   )
 }
@@ -97,15 +185,18 @@ function NumberSetting({
 
 export function AccessSettingsContent() {
   const { t } = useI18n()
-  const { data, put } = useSettings()
+  const settingsQuery = useSettings()
+  const { data, put } = settingsQuery
   const toast = useSaveToast()
   const [draft, setDraft] = useState('')
   const [show, setShow] = useState(false)
-  const [copied, setCopied] = useState(false)
+  const [revealedSnippetKey, setRevealedSnippetKey] = useState(false)
+  const [clearKeyOpen, setClearKeyOpen] = useState(false)
 
   useEffect(() => {
     setDraft(data?.api_key ?? '')
     setShow(false)
+    setRevealedSnippetKey(false)
   }, [data?.api_key])
 
   const save = useMutation({
@@ -127,7 +218,8 @@ export function AccessSettingsContent() {
   const generate = () => {
     const bytes = new Uint8Array(24)
     crypto.getRandomValues(bytes)
-    setDraft(`coban-${Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`)
+    const hex = Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('')
+    setDraft(`coban-${hex}`)
     setShow(true)
   }
 
@@ -142,75 +234,187 @@ export function AccessSettingsContent() {
     'wire_api = "responses"',
     ...(currentKey ? ['env_key = "COBAN_API_KEY"'] : []),
   ].join('\n')
-  const envLine = currentKey ? `export COBAN_API_KEY=${show ? currentKey : t('[已隐藏]', '[hidden]')}` : ''
+  // 单引号包住用户自填的 key；其中若真含单引号，用 POSIX shell 的标准拼接写法转义。
+  const shellKey = currentKey ? `'${currentKey.split("'").join(`'"'"'`)}'` : ''
+  const envCommand = currentKey ? `export COBAN_API_KEY=${shellKey}` : ''
+  const visibleEnvCommand = currentKey && !revealedSnippetKey
+    ? `export COBAN_API_KEY=${t('[已隐藏]', '[hidden]')}`
+    : envCommand
 
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(currentKey ? `${snippet}\n\n# ${envLine}` : snippet)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch (e) {
-      toast.fail(e)
-    }
+  if (settingsQuery.isPending) {
+    return (
+      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
+        <Spinner className="size-4" />
+        {t('正在加载设置', 'Loading settings')}
+      </div>
+    )
+  }
+
+  if (settingsQuery.isError || !data) {
+    return (
+      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
+        <p className="text-sm font-medium">
+          {t('无法读取当前设置', 'Unable to load the current settings')}
+        </p>
+        <Button
+          size="sm"
+          variant="outline"
+          loading={settingsQuery.isFetching}
+          onClick={() => settingsQuery.refetch()}
+        >
+          {t('重试', 'Retry')}
+        </Button>
+      </div>
+    )
   }
 
   return (
-    <div className="space-y-5">
-      <SettingsGroup
-        icon={KeyRoundIcon}
-        title={t('接入 Key', 'Access key')}
-        description={t(
-          '客户端调用代理时必须带上的 Key。留空则不校验来访身份——仅在可信的本机网络下这么用。',
-          'The key callers must present. Leave it empty to skip caller authentication — only do that on a trusted local network.',
-        )}
-      >
-        {envManaged && (
-          <Alert>
-            <ShieldAlertIcon />
-            <AlertTitle>{t('由环境变量接管', 'Managed by the environment')}</AlertTitle>
-            <AlertDescription>
-              {t(
-                '接入 Key 由 --api-key / COBAN_API_KEY 指定，网页上不可修改。',
-                'The access key comes from --api-key / COBAN_API_KEY and cannot be changed here.',
-              )}
-            </AlertDescription>
-          </Alert>
-        )}
-        <Form
-          onSubmit={(e) => { e.preventDefault(); save.mutate(draft.trim()) }}
-          className="flex flex-col gap-2 sm:flex-row sm:items-center"
+    <>
+      <div className="space-y-5">
+        <SettingsGroup
+          icon={CableIcon}
+          title={t('连接与认证', 'Connection & authentication')}
+          description={t(
+            '复制 Codex 接入地址，并配置代理用于验证来访请求的 Key。',
+            'Copy the Codex endpoint and configure the key used to authenticate incoming requests.',
+          )}
         >
-          <Input
-            value={draft}
-            type={show ? 'text' : 'password'}
-            disabled={envManaged}
-            placeholder={t('留空表示不校验', 'Empty means no authentication')}
-            onChange={(e) => setDraft(e.target.value)}
-            aria-label={t('接入 Key', 'Access key')}
-            className="font-mono"
-          />
-          <div className="flex items-center gap-2">
-            <Button
-              type="button"
-              size="icon"
-              variant="outline"
-              onClick={() => setShow((v) => !v)}
-              aria-label={show ? t('隐藏', 'Hide') : t('显示', 'Show')}
-            >
-              {show ? <EyeOffIcon /> : <EyeIcon />}
-            </Button>
-            <Button type="button" variant="outline" disabled={envManaged} onClick={generate}>
-              <RefreshCwIcon />
-              {t('生成', 'Generate')}
-            </Button>
-            <Button type="submit" disabled={envManaged || save.isPending || draft.trim() === currentKey}>
-              {save.isPending && <Spinner />}
-              {t('保存', 'Save')}
-            </Button>
+        <Field className="p-5">
+          <FieldLabel>
+            {t('接入地址', 'Access URL')}
+            <code className="font-mono text-xs font-normal text-muted-foreground">base_url</code>
+          </FieldLabel>
+          <InputGroup>
+            <InputGroupInput aria-label={t('接入地址', 'Access URL')} readOnly value={`${baseUrl}/v1`} />
+            <InputGroupAddon align="inline-end">
+              <CopyButton
+                text={`${baseUrl}/v1`}
+                label={t('复制接入地址', 'Copy access URL')}
+                copiedLabel={t('已复制接入地址', 'Access URL copied')}
+              />
+            </InputGroupAddon>
+          </InputGroup>
+        </Field>
+
+        <Field className="p-5">
+          <FieldLabel>
+            {t('接入 Key', 'Access key')}
+            <code className="font-mono text-xs font-normal text-muted-foreground">COBAN_API_KEY</code>
+          </FieldLabel>
+          <InputGroup>
+            <InputGroupInput
+              aria-label={t('接入 Key', 'Access key')}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder={envManaged ? '' : t('留空则不校验来访', 'Leave blank to disable caller authentication')}
+              readOnly={envManaged}
+              type={show ? 'text' : 'password'}
+              value={draft}
+            />
+            <InputGroupAddon className="gap-2" align="inline-end">
+              <Button
+                aria-label={show ? t('隐藏接入 Key', 'Hide access key') : t('显示接入 Key', 'Show access key')}
+                size="icon-sm"
+                title={show ? t('隐藏 Key', 'Hide key') : t('显示 Key', 'Show key')}
+                variant="ghost"
+                onClick={() => setShow((visible) => !visible)}
+              >
+                {show ? <EyeOffIcon /> : <EyeIcon />}
+              </Button>
+              <CopyButton
+                text={draft}
+                label={t('复制接入 Key', 'Copy access key')}
+                copiedLabel={t('已复制接入 Key', 'Access key copied')}
+                size="icon-sm"
+              />
+            </InputGroupAddon>
+          </InputGroup>
+          {!envManaged && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" variant="outline" onClick={generate}>
+                <SparklesIcon />
+                {t('生成', 'Generate')}
+              </Button>
+              <Button
+                size="sm"
+                loading={save.isPending}
+                disabled={draft.trim() === currentKey}
+                onClick={() => save.mutate(draft.trim())}
+              >
+                <SaveIcon />
+                {t('保存', 'Save')}
+              </Button>
+              {currentKey && (
+                <Button
+                  size="sm"
+                  variant="destructive-outline"
+                  disabled={save.isPending}
+                  onClick={() => setClearKeyOpen(true)}
+                >
+                  <Trash2Icon />
+                  {t('清空', 'Clear')}
+                </Button>
+              )}
+            </div>
+          )}
+          {envManaged && (
+            <FieldDescription>
+              {t('由 --api-key / COBAN_API_KEY 接管，网页只读。', 'Managed by --api-key / COBAN_API_KEY; this page is read-only.')}
+            </FieldDescription>
+          )}
+        </Field>
+
+        <Field className="p-5">
+          <div className="flex w-full min-w-0 items-center justify-between gap-2">
+            <FieldLabel>{t('Codex 配置片段', 'Codex configuration')}</FieldLabel>
+            <div className="flex shrink-0 items-center gap-2">
+              <CopyButton
+                text={snippet}
+                label={t('复制 Codex 配置', 'Copy Codex configuration')}
+                copiedLabel={t('已复制 Codex 配置', 'Codex configuration copied')}
+                size="icon"
+              />
+            </div>
           </div>
-        </Form>
+          <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 font-mono text-xs leading-5">
+            {snippet}
+          </pre>
+          <FieldDescription>
+            {t('粘贴到 ~/.codex/config.toml。', 'Paste this into ~/.codex/config.toml.')}
+          </FieldDescription>
+        </Field>
+        {currentKey && (
+          <Field className="p-5">
+            <div className="flex w-full min-w-0 items-center justify-between gap-2">
+              <FieldLabel>{t('Key 环境变量', 'Key environment variable')}</FieldLabel>
+              <div className="flex shrink-0 items-center gap-2">
+                <Button
+                  type="button"
+                  aria-label={revealedSnippetKey ? t('隐藏环境变量中的 Key', 'Hide the key in the environment command') : t('显示环境变量中的 Key', 'Show the key in the environment command')}
+                  size="icon"
+                  title={revealedSnippetKey ? t('隐藏 Key', 'Hide key') : t('显示 Key', 'Show key')}
+                  variant="ghost"
+                  onClick={() => setRevealedSnippetKey((revealed) => !revealed)}
+                >
+                  {revealedSnippetKey ? <EyeOffIcon /> : <EyeIcon />}
+                </Button>
+                <CopyButton
+                  text={envCommand}
+                  label={t('复制完整环境变量（含 Key）', 'Copy the full environment command (includes key)')}
+                  copiedLabel={t('已复制环境变量', 'Environment command copied')}
+                  size="icon"
+                />
+              </div>
+            </div>
+            <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 font-mono text-xs leading-5">
+              {visibleEnvCommand}
+            </pre>
+            <FieldDescription>
+              {t('在启动 Codex 的终端里执行。为避免截图或录屏泄露，Key 默认隐藏。', 'Run this in the terminal that starts Codex. The key stays hidden by default to avoid capture in screenshots or recordings.')}
+            </FieldDescription>
+          </Field>
+        )}
         {!currentKey && !envManaged && (
-          <Alert variant="error">
+          <Alert className="mx-5 mb-5" variant="error">
             <ShieldAlertIcon />
             <AlertTitle>{t('当前不校验来访身份', 'Callers are not authenticated')}</AlertTitle>
             <AlertDescription>
@@ -221,26 +425,27 @@ export function AccessSettingsContent() {
             </AlertDescription>
           </Alert>
         )}
-      </SettingsGroup>
-
-      <SettingsGroup
-        icon={CableIcon}
-        title={t('Codex 配置', 'Codex setup')}
-        description={t(
-          '粘进 ~/.codex/config.toml，再把 Key 导出到环境变量即可。',
-          'Paste into ~/.codex/config.toml, then export the key as an environment variable.',
-        )}
-      >
-        <pre className="overflow-x-auto rounded-lg border bg-muted/40 p-3 font-mono text-xs leading-5">
-          {snippet}
-          {envLine && `\n\n# ${envLine}`}
-        </pre>
-        <Button size="sm" variant="outline" onClick={() => void copy()}>
-          {copied ? <CheckIcon /> : <CopyIcon />}
-          {copied ? t('已复制', 'Copied') : t('复制配置片段', 'Copy setup snippet')}
-        </Button>
-      </SettingsGroup>
-    </div>
+        </SettingsGroup>
+      </div>
+      <AlertDialog open={clearKeyOpen} onOpenChange={(nextOpen) => { if (!save.isPending) setClearKeyOpen(nextOpen) }}>
+        <AlertDialogPopup className="sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('清除接入 Key', 'Clear access key')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('清除后，代理将不再校验客户端身份。', 'After clearing it, the proxy will no longer authenticate callers.')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button disabled={save.isPending} variant="ghost" />}>
+              {t('取消', 'Cancel')}
+            </AlertDialogClose>
+            <Button loading={save.isPending} variant="destructive" onClick={() => save.mutate('')}>
+              {t('确认清除', 'Clear key')}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </>
   )
 }
 
@@ -248,23 +453,34 @@ export function AccessSettingsContent() {
 
 export function LimitsSettingsContent() {
   const { t } = useI18n()
-  const { data, put } = useSettings()
-  const toast = useSaveToast()
+  const settingsQuery = useSettings()
+  const { data } = settingsQuery
+  const retry = useSettingMutation(setRateLimitRetryMax, t('已保存重试次数', 'Retry budget saved'))
+  const rpm = useSettingMutation(setDefaultRpmLimit, t('已保存默认 RPM 上限', 'Default RPM limit saved'))
+  const pause = useSettingMutation(setQuotaPausePct, t('已保存额度阈值', 'Quota threshold saved'))
+  const cooldown = useSettingMutation(setCooldownSecs, t('已保存冷却时长', 'Cooldown saved'))
 
-  const mutate = (fn: (n: number) => Promise<Settings>, title: string) =>
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    useMutation({
-      mutationFn: fn,
-      onSuccess: (settings) => { put(settings); toast.ok(title) },
-      onError: toast.fail,
-    })
+  if (settingsQuery.isPending) {
+    return (
+      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
+        <Spinner className="size-4" />
+        {t('正在加载调度设置', 'Loading scheduling settings')}
+      </div>
+    )
+  }
 
-  const retry = mutate(setRateLimitRetryMax, t('已保存重试次数', 'Retry budget saved'))
-  const rpm = mutate(setDefaultRpmLimit, t('已保存默认 RPM 上限', 'Default RPM limit saved'))
-  const pause = mutate(setQuotaPausePct, t('已保存额度阈值', 'Quota threshold saved'))
-  const cooldown = mutate(setCooldownSecs, t('已保存冷却时长', 'Cooldown saved'))
-
-  if (!data) return <Spinner />
+  if (settingsQuery.isError || !data) {
+    return (
+      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
+        <p className="text-sm font-medium">
+          {t('无法读取调度设置', 'Unable to load scheduling settings')}
+        </p>
+        <Button size="sm" variant="outline" loading={settingsQuery.isFetching} onClick={() => settingsQuery.refetch()}>
+          {t('重试', 'Retry')}
+        </Button>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-5">
@@ -352,58 +568,96 @@ export function LimitsSettingsContent() {
 // ---------- 控制台安全 ----------
 
 export function SecuritySettingsContent() {
-  const { t } = useI18n()
-  const qc = useQueryClient()
-  const toast = useSaveToast()
+  const { language, t } = useI18n()
   const authQuery = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
   const [pw, setPwDraft] = useState('')
   const [confirm, setConfirm] = useState('')
+  const [clearOpen, setClearOpen] = useState(false)
 
   const envManaged = authQuery.data?.env_managed ?? false
   const configured = authQuery.data?.configured ?? false
 
   const change = useMutation({
-    mutationFn: (password: string) => changePassword(password),
+    mutationFn: async (password: string) => {
+      if (configured) return changePassword(password)
+      return setupPassword(password)
+    },
     onSuccess: (_r, password) => {
       setPwDraft('')
       setConfirm('')
-      void qc.invalidateQueries({ queryKey: ['auth-state'] })
-      toast.ok(password ? t('管理密码已更新', 'Admin password updated') : t('管理密码已清除', 'Admin password cleared'))
-      // 密码换了，本地存的那把旧的必然对不上——留着只会让下一次请求 401 然后被强制登出，
-      // 主动清掉再让用户重新登录更干净。
-      if (password) clearPw()
+      setClearOpen(false)
+      if (password) {
+        setPw(password)
+        toastManager.add({
+          title: configured ? t('管理密码已更新', 'Admin password updated') : t('管理密码已设置', 'Admin password set'),
+          type: 'success',
+        })
+      } else {
+        clearPw()
+        toastManager.add({ title: t('管理密码已清除', 'Admin password cleared'), type: 'success' })
+      }
+      // 首次设置后立即带上新密码；清除密码后让 App 回到未鉴权状态。
+      window.location.reload()
     },
-    onError: toast.fail,
+    onError: (error) => toastManager.add({
+      title: t('操作失败', 'Operation failed'),
+      description: extractError(error, language),
+      type: 'error',
+    }),
   })
 
-  const mismatch = pw !== '' && confirm !== '' && pw !== confirm
-  const tooShort = pw !== '' && pw.trim().length < 4
+  const mismatch = pw !== confirm
+  const tooShort = pw.trim().length > 0 && pw.trim().length < 4
+  const canSave = configured
+    ? (!mismatch && !tooShort)
+    : pw.trim().length >= 4 && !mismatch
+
+  if (authQuery.isPending) {
+    return (
+      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
+        <Spinner className="size-4" />
+        {t('正在加载安全设置', 'Loading security settings')}
+      </div>
+    )
+  }
+
+  if (authQuery.isError || !authQuery.data) {
+    return (
+      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
+        <p className="text-sm font-medium">{t('无法读取登录状态', 'Unable to load sign-in status')}</p>
+        <Button size="sm" variant="outline" loading={authQuery.isFetching} onClick={() => authQuery.refetch()}>
+          {t('重试', 'Retry')}
+        </Button>
+      </div>
+    )
+  }
 
   return (
-    <div className="space-y-5">
-      {!configured && !envManaged && (
-        <Alert variant="error">
-          <ShieldAlertIcon />
-          <AlertTitle>{t('管理接口当前无需登录', 'The admin API is currently open')}</AlertTitle>
-          <AlertDescription>
-            {t(
-              '任何能访问这个端口的人都能读写设置、查看账号，也包括接入 Key 本身。设一个密码。',
-              'Anyone who can reach this port can read and change settings, view accounts, and read the access key itself. Set a password.',
-            )}
-          </AlertDescription>
-        </Alert>
-      )}
-
-      <SettingsGroup
-        icon={LockKeyholeIcon}
-        title={t('管理密码', 'Admin password')}
-        description={t(
-          '设置后，所有管理接口都需要登录。转发代理不受影响。',
-          'Once set, every admin API requires sign-in. The forwarding proxy is unaffected.',
+    <>
+      <div className="space-y-5">
+        {!configured && !envManaged && (
+          <Alert variant="error">
+            <ShieldAlertIcon />
+            <AlertTitle>{t('管理接口当前无需登录', 'The admin API is currently open')}</AlertTitle>
+            <AlertDescription>
+              {t(
+                '任何能访问这个端口的人都能读写设置、查看账号，也包括接入 Key 本身。设一个密码。',
+                'Anyone who can reach this port can read and change settings, view accounts, and read the access key itself. Set a password.',
+              )}
+            </AlertDescription>
+          </Alert>
         )}
-      >
+
+        <SettingsGroup
+          icon={LockKeyholeIcon}
+          title={t('管理密码', 'Admin password')}
+          description={t(
+            '设置后，所有管理接口都需要登录。转发代理不受影响。',
+            'Once set, every admin API requires sign-in. The forwarding proxy is unaffected.',
+          )}
+        >
         {envManaged ? (
-          <Alert>
+          <Alert className="m-5">
             <ShieldAlertIcon />
             <AlertTitle>{t('由环境变量接管', 'Managed by the environment')}</AlertTitle>
             <AlertDescription>
@@ -415,19 +669,29 @@ export function SecuritySettingsContent() {
           </Alert>
         ) : (
           <Form
-            onSubmit={(e) => { e.preventDefault(); if (!mismatch && !tooShort) change.mutate(pw.trim()) }}
-            className="space-y-3"
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (!canSave) return
+              if (configured && pw.trim() === '') setClearOpen(true)
+              else change.mutate(pw.trim())
+            }}
+            className="space-y-3 p-5"
           >
             <Field>
-              <FieldLabel>{t('新密码', 'New password')}</FieldLabel>
+              <FieldLabel>
+                {configured ? t('新密码', 'New password') : t('管理密码', 'Admin password')}
+              </FieldLabel>
               <Input
+                aria-label={configured ? t('新管理密码', 'New admin password') : t('管理密码', 'Admin password')}
                 type="password"
                 value={pw}
                 autoComplete="new-password"
                 onChange={(e) => setPwDraft(e.target.value)}
               />
               <FieldDescription>
-                {t('至少 4 位；留空并保存表示清除密码。', 'At least 4 characters. Save an empty value to clear the password.')}
+                {configured
+                  ? t('至少 4 位；留空并保存表示清除密码。', 'At least 4 characters. Save an empty value to clear the password.')
+                  : t('至少 4 位；设置后控制台将要求登录。', 'At least 4 characters. The console will require sign-in once set.')}
               </FieldDescription>
             </Field>
             <Field>
@@ -438,19 +702,38 @@ export function SecuritySettingsContent() {
                 autoComplete="new-password"
                 onChange={(e) => setConfirm(e.target.value)}
               />
-              {mismatch && (
+              {confirm !== '' && mismatch && (
                 <FieldDescription className="text-destructive">
                   {t('两次输入不一致', 'The two entries do not match')}
                 </FieldDescription>
               )}
             </Field>
-            <Button type="submit" disabled={change.isPending || mismatch || tooShort}>
+            <Button type="submit" disabled={change.isPending || !canSave}>
               {change.isPending && <Spinner />}
-              {pw.trim() === '' ? t('清除密码', 'Clear password') : t('保存密码', 'Save password')}
+              {configured && pw.trim() === '' ? t('清除密码', 'Clear password') : configured ? t('保存密码', 'Save password') : t('设置密码', 'Set password')}
             </Button>
           </Form>
         )}
-      </SettingsGroup>
-    </div>
+        </SettingsGroup>
+      </div>
+      <AlertDialog open={clearOpen} onOpenChange={(nextOpen) => { if (!change.isPending) setClearOpen(nextOpen) }}>
+        <AlertDialogPopup className="sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('清除管理密码', 'Clear admin password')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('清除后，控制台将不再要求登录。', 'After clearing it, the console will no longer require sign-in.')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button disabled={change.isPending} variant="ghost" />}>
+              {t('取消', 'Cancel')}
+            </AlertDialogClose>
+            <Button loading={change.isPending} variant="destructive" onClick={() => change.mutate('')}>
+              {t('确认清除', 'Clear password')}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </>
   )
 }

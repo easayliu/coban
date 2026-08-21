@@ -106,7 +106,7 @@ export function SettingsPage({
             <span className="min-w-0 text-left">
               <span className="block text-sm font-semibold leading-none tracking-tight">Coban</span>
               <span className="mt-1 hidden whitespace-nowrap text-xs font-normal text-muted-foreground sm:block">
-                Claude Code Gateway
+                Codex Gateway
               </span>
             </span>
           </Button>
@@ -139,8 +139,8 @@ export function SettingsPage({
             </h1>
             <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
               {t(
-                '集中管理 Coban 的客户端接入、设备绑定、转发行为与控制台安全。',
-                'Manage client access, device bindings, forwarding behaviour, and console security.',
+                '集中管理 Coban 的客户端接入、账号调度与控制台安全。',
+                'Manage Coban client access, account scheduling, and console security.',
               )}
             </p>
           </section>

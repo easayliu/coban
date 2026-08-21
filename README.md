@@ -70,6 +70,15 @@ coban logout               # 清空所有账号
 
 ## Docker
 
+一键安装（拉镜像、写 compose、起容器，并打印接入步骤）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/easayliu/coban/main/install.sh | bash
+```
+
+可用 `INSTALL_DIR` / `PORT` / `IMAGE_TAG` / `COBAN_API_KEY` / `COBAN_ADMIN_PASSWORD` /
+`AUTO_START` 覆盖默认值，国内可用 `IMAGE_REG=ghcr.nju.edu.cn`。已 clone 仓库的话直接：
+
 ```bash
 docker compose up -d
 ```
