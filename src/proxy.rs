@@ -65,7 +65,19 @@ pub async fn handle(
     let Normalized { body, collapse, chat } = match plan_request(&path, body) {
         Ok(n) => n,
         // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
+        //
+        // **这条路不产生上游请求**，于是既没有用量流水也没有额度快照——从页面上看那个号
+        // 一切照旧（额度停在上一次的读数上，从没用过的号则一直是空），而客户端只看到一句
+        // 400。所以这里必须留一行日志：它是「客户端发了什么 coban 不认」的唯一线索。
+        Err(msg) => {
+            tracing::info!(
+                path = %path,
+                ua = %ua_of(&headers).unwrap_or_default(),
+                reason = %msg,
+                "rejected an incoming request before forwarding"
+            );
+            return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", msg);
+        }
     };
     // chat 的体已经翻成 Responses 形状，那它就该打到那个端点上；其余按来访路径原样拼。
     let upstream_path: &str = if chat.is_some() { config::RESPONSES_PATH } else { &path };

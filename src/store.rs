@@ -223,6 +223,27 @@ impl QuotaSnapshot {
             && self.credits_balance.is_none()
     }
 
+    /// 把这次没报的那几项从上一份快照里补齐。
+    ///
+    /// 上游**并非每条响应都把九项报全**（见过只带 credits 那一组的）。一次响应只说明了
+    /// 它真的带回来的那几项，对没带的那些它什么也没说——整份替换会把它们抹成 `null`，
+    /// 表现是卡片上的主额度条突然空了一格，而那个号的额度其实一点没变。
+    pub fn filled_from(mut self, older: &Self) -> Self {
+        self.primary_used_pct = self.primary_used_pct.or(older.primary_used_pct);
+        self.primary_window_minutes = self.primary_window_minutes.or(older.primary_window_minutes);
+        self.primary_reset_at =
+            self.primary_reset_at.take().or_else(|| older.primary_reset_at.clone());
+        self.secondary_used_pct = self.secondary_used_pct.or(older.secondary_used_pct);
+        self.secondary_window_minutes =
+            self.secondary_window_minutes.or(older.secondary_window_minutes);
+        self.secondary_reset_at =
+            self.secondary_reset_at.take().or_else(|| older.secondary_reset_at.clone());
+        self.credits_has_credits = self.credits_has_credits.or(older.credits_has_credits);
+        self.credits_unlimited = self.credits_unlimited.or(older.credits_unlimited);
+        self.credits_balance = self.credits_balance.or(older.credits_balance);
+        self
+    }
+
     /// 两个窗口里用得最多的那个百分比——判「该不该暂停这个号」时看它。
     pub fn peak_used_pct(&self) -> Option<f64> {
         match (self.primary_used_pct, self.secondary_used_pct) {
@@ -1148,13 +1169,30 @@ impl CredentialStore {
                     rec.output_tokens.unwrap_or(0),
                 ],
             )?;
-            // 快照只在这次**真的解出了限流头**时才覆盖：一条没带头的响应（错误、非流式
-            // 的小接口）不该把上一次的额度读数抹成空。
-            if let Some(raw) = &quota_raw {
+            // 快照只在这次**真的解出了限流头**时才覆盖：一条没带头的响应（错误、翻译层
+            // 就拒掉的请求、非流式的小接口）不该把上一次的额度读数抹成空。
+            //
+            // 带了头也**只覆盖它真的报了的那几项**，其余从上一份补齐（见
+            // [`QuotaSnapshot::filled_from`]）。流水那一行仍存这次响应的原样读数——
+            // 它记的是「这条请求看到了什么」，合并会把它变成一份没有哪条响应说过的数。
+            if let Some(fresh) = rec.quota.as_ref().filter(|q| !q.is_empty()) {
+                let older: Option<QuotaSnapshot> = tx
+                    .query_row(
+                        "SELECT quota_raw FROM credential_stats WHERE cred_id = ?1",
+                        params![cred_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .and_then(|raw| serde_json::from_str(&raw).ok());
+                let merged = match &older {
+                    Some(old) => fresh.clone().filled_from(old),
+                    None => fresh.clone(),
+                };
                 tx.execute(
                     "UPDATE credential_stats SET snapshot_ts = unixepoch(), quota_raw = ?1 \
                      WHERE cred_id = ?2",
-                    params![raw, cred_id],
+                    params![serde_json::to_string(&merged)?, cred_id],
                 )?;
             }
         }
@@ -1636,6 +1674,52 @@ mod tests {
         assert_eq!(st.input_tokens_total, 400);
         assert_eq!(st.cached_tokens_total, 290);
         assert_eq!(st.output_tokens_total, 25);
+    }
+
+    /// 额度快照**只被它真的报了的那几项覆盖**。
+    ///
+    /// 三种响应轮着来：报全的、只报 credits 那一组的、一项都没报的。中间那种如果整份替换，
+    /// 主额度读数会被抹成空——卡片上那条进度条突然空了一格，而账号额度一点没变；最后那种
+    /// （翻译层就拒掉的请求、CDN 拦截页）压根不该动快照。
+    #[test]
+    fn a_partial_quota_response_does_not_wipe_what_it_did_not_report() {
+        let s = store();
+        let a = add(&s, "a");
+        let full = QuotaSnapshot {
+            primary_used_pct: Some(20.0),
+            primary_window_minutes: Some(10080),
+            primary_reset_at: Some("1787801499".into()),
+            secondary_used_pct: Some(3.0),
+            credits_balance: Some(0.0),
+            ..Default::default()
+        };
+        let log = |q: Option<QuotaSnapshot>| {
+            s.insert_usage_log(&UsageRecord { cred_id: Some(a.id), quota: q, ..Default::default() })
+                .unwrap()
+        };
+
+        log(Some(full.clone()));
+        assert_eq!(s.stats_of(a.id).unwrap().quota.unwrap().primary_used_pct, Some(20.0));
+
+        // 只带 credits 那一组：它对两个窗口什么都没说，那两项就该维持原值。
+        log(Some(QuotaSnapshot { credits_balance: Some(5.0), ..Default::default() }));
+        let q = s.stats_of(a.id).unwrap().quota.unwrap();
+        assert_eq!(q.credits_balance, Some(5.0), "报了的那项要更新");
+        assert_eq!(q.primary_used_pct, Some(20.0), "没报的那项不能被抹成空");
+        assert_eq!(q.primary_window_minutes, Some(10080));
+        assert_eq!(q.primary_reset_at.as_deref(), Some("1787801499"));
+        assert_eq!(q.secondary_used_pct, Some(3.0));
+
+        // 一项都没解出来：整份快照都不动。
+        log(None);
+        log(Some(QuotaSnapshot::default()));
+        let q = s.stats_of(a.id).unwrap().quota.unwrap();
+        assert_eq!(q.primary_used_pct, Some(20.0));
+        assert_eq!(q.credits_balance, Some(5.0));
+
+        // 报了的项即使变小也照样覆盖（窗口重置后百分比会掉回去）。
+        log(Some(QuotaSnapshot { primary_used_pct: Some(1.0), ..Default::default() }));
+        assert_eq!(s.stats_of(a.id).unwrap().quota.unwrap().primary_used_pct, Some(1.0));
     }
 
     /// 旧库（`credential_stats` 没有 token 列）要能补列并从残留流水里回填一次。
