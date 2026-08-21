@@ -12,11 +12,13 @@ import {
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
+  cacheHitRate,
   cn,
   displayCredentialLabel,
   formatCompactNumber,
   formatCountdown,
   formatFullTime,
+  formatPercent,
   formatTokens,
   formatUsd,
   relativeTime,
@@ -113,6 +115,9 @@ export const CredentialCard = memo(function CredentialCard({
   // 三个一起加会把命中缓存的会话凭空放大一倍。
   const tokens = cred.stats.input_tokens_total + cred.stats.output_tokens_total
   const tokensText = formatTokens(tokens)
+  // 这个号的终身缓存命中率：命中的输入 ÷ 输入（分母含命中部分，见 cacheHitRate 的注）。
+  // 只进悬浮提示，不在页脚另占一格——那一行的宽度是按字符数算着排的（见 footerChars）。
+  const credCacheRate = cacheHitRate(cred.stats.input_tokens_total, cred.stats.cached_tokens_total)
   // 页脚四组数字（请求数 / token 数 / 累计费用 / RPM）在窄卡片上排一行还是两行，按字符数
   // 定：都是等宽字形，字符数就是宽度。375px 的屏上实测能容下 17 个字符（`1.2k` + `931K`
   // + `$214.60` + `100/120` 就已经超了），再多才折行，否则尾巴会伸到右边的开关底下。
@@ -511,8 +516,8 @@ export const CredentialCard = memo(function CredentialCard({
               </TooltipTrigger>
               <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
                 {t(
-                  `累计 ${tokens.toLocaleString(locale)} token：输入 ${cred.stats.input_tokens_total.toLocaleString(locale)}（其中命中缓存 ${cred.stats.cached_tokens_total.toLocaleString(locale)}）+ 输出 ${cred.stats.output_tokens_total.toLocaleString(locale)}`,
-                  `${tokens.toLocaleString(locale)} tokens total: ${cred.stats.input_tokens_total.toLocaleString(locale)} input (${cred.stats.cached_tokens_total.toLocaleString(locale)} cache hits) + ${cred.stats.output_tokens_total.toLocaleString(locale)} output`,
+                  `累计 ${tokens.toLocaleString(locale)} token：输入 ${cred.stats.input_tokens_total.toLocaleString(locale)}（其中命中缓存 ${cred.stats.cached_tokens_total.toLocaleString(locale)}，命中率 ${formatPercent(credCacheRate)}）+ 输出 ${cred.stats.output_tokens_total.toLocaleString(locale)}`,
+                  `${tokens.toLocaleString(locale)} tokens total: ${cred.stats.input_tokens_total.toLocaleString(locale)} input (${cred.stats.cached_tokens_total.toLocaleString(locale)} cache hits, ${formatPercent(credCacheRate)} hit rate) + ${cred.stats.output_tokens_total.toLocaleString(locale)} output`,
                 )}
               </TooltipPopup>
             </Tooltip>

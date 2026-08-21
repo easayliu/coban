@@ -182,6 +182,14 @@ export interface UsagePage {
   /** 同一套筛选条件下的总花费（USD）。 */
   total_cost: number
   /**
+   * 同一套筛选条件下的输入 token 合计（**已含命中缓存那部分**）与其中命中缓存的部分。
+   *
+   * 用 `cacheHitRate` 算这一段流水的缓存命中率。没嗅探到 usage 的那些行按 0 计入，
+   * 于是两个数都是 0 时表示「这段流水里没有可谈的缓存率」。
+   */
+  total_input_tokens: number
+  total_cached_tokens: number
+  /**
    * 本轮翻页的锚点（Unix 秒）。
    *
    * 首次请求不传，之后每页原样带回：不钉住它的话，翻页期间新落的流水会把记录整体

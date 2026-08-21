@@ -5,10 +5,12 @@ import { listCredentialUsage, type Credential, type UsageLog } from '@/api/crede
 import { useI18n } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
+  cacheHitRate,
   cn,
   displayCredentialLabel,
   extractError,
   formatFullTime,
+  formatPercent,
   formatUsd,
 } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -127,6 +129,13 @@ export function CredentialUsageDialog({
   })
 
   const total = usage.data?.total ?? 0
+  // 这一段流水（近 30 天、锚点之内）的缓存命中率：**按 token 加权**，不是各条请求命中率的
+  // 平均——后者会让一条 300 token 的小请求与一条 17K 前缀的请求等权。分母含命中部分，
+  // 见 cacheHitRate 的注。
+  const pageCacheRate = cacheHitRate(
+    usage.data?.total_input_tokens,
+    usage.data?.total_cached_tokens,
+  )
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const rows = usage.data?.logs ?? []
   // 页码越界（改了每页条数、或刷新后记录变少）时退回最后一页，而不是显示一页空白。
@@ -185,13 +194,31 @@ export function CredentialUsageDialog({
         </DialogHeader>
 
         <DialogPanel className="space-y-3 p-4 pt-3 sm:p-5 sm:pt-3">
-          <section className="grid gap-2 rounded-xl border bg-muted/32 px-3 py-2.5 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center sm:gap-5 sm:px-4">
+          <section className="grid gap-2 rounded-xl border bg-muted/32 px-3 py-2.5 sm:grid-cols-[auto_auto_minmax(0,1fr)] sm:items-center sm:gap-5 sm:px-4">
             <div className="flex items-baseline justify-between gap-4 sm:block">
               <p className="text-2xs font-medium text-muted-foreground">
                 {t('近 30 天明细花费', 'Request cost, last 30 days')}
               </p>
               <p className="font-semibold text-sm tabular-nums sm:mt-0.5">
                 {usage.data ? formatUsd(usage.data.total_cost) : '—'}
+              </p>
+            </div>
+            {/* 缓存命中率挨着花费放：命中的输入按十分之一计价，两个数是同一件事的两面——
+                「花得少」到底是请求少还是缓存吃得好，只有并排看才分得清。 */}
+            <div className="flex items-baseline justify-between gap-4 sm:block">
+              <p className="text-2xs font-medium text-muted-foreground">
+                {t('近 30 天缓存命中率', 'Cache hit rate, last 30 days')}
+              </p>
+              <p
+                className="font-semibold text-sm tabular-nums sm:mt-0.5"
+                title={usage.data
+                  ? t(
+                      `命中缓存 ${usage.data.total_cached_tokens.toLocaleString(locale)} / 输入 ${usage.data.total_input_tokens.toLocaleString(locale)} token（按 token 加权，不是各条请求命中率的平均）`,
+                      `${usage.data.total_cached_tokens.toLocaleString(locale)} cached of ${usage.data.total_input_tokens.toLocaleString(locale)} input tokens (token-weighted, not an average of per-request rates)`,
+                    )
+                  : undefined}
+              >
+                {formatPercent(pageCacheRate)}
               </p>
             </div>
             <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">
@@ -243,7 +270,7 @@ export function CredentialUsageDialog({
             </Empty>
           ) : (
             <>
-              {/* 十列的宽表在窄屏只能横向拖着看，等于没法用；lg 以下换成一条一张的堆叠卡片。
+              {/* 十一列的宽表在窄屏只能横向拖着看，等于没法用；lg 以下换成一条一张的堆叠卡片。
                   这里用媒体查询二选一而不是 CSS 隐藏：一页最多 100 条，两套都建出来是双倍节点。 */}
               {wideEnoughForTable ? (
                 <UsageTable
@@ -402,6 +429,11 @@ function UsageCards({
               <LogFact label={t('缓存 / 推理', 'Cached / reasoning')}>
                 {num(log.cached_tokens, locale)} / {num(log.reasoning_tokens, locale)}
               </LogFact>
+              {/* 单独一格而不是缀在「缓存 / 推理」后面：那一格已经是两个数了，
+                  再塞一个百分号进去分不清它属于哪一个。 */}
+              <LogFact label={t('缓存率', 'Cache hit')}>
+                {formatPercent(cacheHitRate(log.input_tokens, log.cached_tokens))}
+              </LogFact>
               <LogFact label={t('首字 / 总耗时', 'TTFT / total')}>
                 {ms(log.ttft_ms)} / {ms(log.total_ms)}
               </LogFact>
@@ -456,7 +488,7 @@ function UsageTable({
           tabIndex={0}
         />
       )}
-      className="min-w-[72rem] table-fixed text-xs"
+      className="min-w-[76.5rem] table-fixed text-xs"
       aria-describedby={descriptionId}
     >
       <TableCaption className="sr-only">
@@ -469,6 +501,7 @@ function UsageTable({
         <col className="w-[4.25rem]" />
         <col className="w-[4.25rem]" />
         <col className="w-[6.5rem]" />
+        <col className="w-[4.5rem]" />
         <col className="w-[7.25rem]" />
         <col className="w-[5rem]" />
         <col className="w-[6.5rem]" />
@@ -477,7 +510,7 @@ function UsageTable({
       <TableHeader className="sticky top-0 z-10 bg-muted/96 backdrop-blur-sm">
         <TableRow className="bg-muted/72 [&>th]:border-b [&>th]:text-2xs">
           <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">{t('请求', 'Request')}</TableHead>
-          <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">Token</TableHead>
+          <TableHead scope="colgroup" colSpan={4} className="h-7 text-center">Token</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('性能', 'Performance')}</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('费用', 'Billing')}</TableHead>
           <TableHead scope="colgroup" colSpan={2} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
@@ -489,6 +522,15 @@ function UsageTable({
           <TableHead className="whitespace-nowrap text-right">{t('输入', 'Input')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('输出', 'Output')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('缓存 / 推理', 'Cached / reasoning')}</TableHead>
+          <TableHead
+            className="whitespace-nowrap text-right"
+            title={t(
+              '这条请求的缓存命中率：命中缓存的输入 token ÷ 输入 token。同一段会话固定落在同一个号上时它才高得起来。',
+              "This request's cache hit rate: cached input tokens over input tokens. It only gets high when a conversation keeps landing on the same account.",
+            )}
+          >
+            {t('缓存率', 'Cache hit')}
+          </TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('会话', 'Session')}</TableHead>
@@ -529,6 +571,16 @@ function UsageTable({
               </TableCell>
               <TableCell className="whitespace-nowrap text-right tabular-nums">
                 {num(log.cached_tokens, locale)} / {num(log.reasoning_tokens, locale)}
+              </TableCell>
+              {/* 命中率为 0（真的一点没命中，比如会话第一轮）与 `—`（这条请求没嗅探到
+                  usage，多半是 4xx）不能长得一样：后者转灰，免得被读成「缓存崩了」。 */}
+              <TableCell
+                className={cn(
+                  'whitespace-nowrap text-right tabular-nums',
+                  cacheHitRate(log.input_tokens, log.cached_tokens) == null && 'text-muted-foreground',
+                )}
+              >
+                {formatPercent(cacheHitRate(log.input_tokens, log.cached_tokens))}
               </TableCell>
               <TableCell className="whitespace-nowrap text-right tabular-nums">
                 {ms(log.ttft_ms)} / {ms(log.total_ms)}

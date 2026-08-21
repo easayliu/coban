@@ -367,6 +367,8 @@ queryClient.setQueryData(['metrics'], {
   in_flight: 3,
   cost_total_usd: previewCredentials.reduce((sum, c) => sum + c.stats.cost_total_usd, 0),
   requests_total: previewCredentials.reduce((sum, c) => sum + c.stats.request_total, 0),
+  input_tokens_total: previewCredentials.reduce((sum, c) => sum + c.stats.input_tokens_total, 0),
+  cached_tokens_total: previewCredentials.reduce((sum, c) => sum + c.stats.cached_tokens_total, 0),
 })
 
 const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
@@ -380,7 +382,8 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   ua: 'codex_cli_rs/0.47.0 (Mac OS 15.3; arm64)',
   status: index === 5 ? 429 : index === 9 ? 500 : 200,
   input_tokens: index === 9 ? null : 12_480 + index * 913,
-  cached_tokens: index === 9 ? null : 18_400 + index * 771,
+  // cached 是 input 的子集（约 93%，长会话的常态），不能比它大——否则命中率一律顶到 100%。
+  cached_tokens: index === 9 ? null : 11_640 + index * 805,
   output_tokens: index === 9 ? null : 840 + index * 47,
   reasoning_tokens: index === 9 ? null : 320 + index * 29,
   total_tokens: index === 9 ? null : 32_040 + index * 1760,
@@ -390,7 +393,14 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
 }))
 queryClient.setQueryData<UsagePage>(
   ['credential-usage', nearLimit.id, 0, 25],
-  { total: 37, total_cost: 1.2846, anchor: previewUsageLogs[0]?.id ?? null, logs: previewUsageLogs },
+  {
+    total: 37,
+    total_cost: 1.2846,
+    total_input_tokens: previewUsageLogs.reduce((sum, l) => sum + (l.input_tokens ?? 0), 0),
+    total_cached_tokens: previewUsageLogs.reduce((sum, l) => sum + (l.cached_tokens ?? 0), 0),
+    anchor: previewUsageLogs[0]?.id ?? null,
+    logs: previewUsageLogs,
+  },
 )
 
 function PreviewWorkspace() {

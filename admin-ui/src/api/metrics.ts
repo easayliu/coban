@@ -16,6 +16,15 @@ export interface Metrics {
   in_flight: number
   cost_total_usd: number
   requests_total: number
+  /**
+   * 全池终身累计的输入 token（**已含命中缓存那部分**）与其中命中缓存的部分。
+   *
+   * 后端只回这两个原始数、不回算好的比率：命中率作不作数取决于这两个数本身的量级
+   * （300 token 上的「命中 0%」与 17K 前缀上的「命中 94%」是两件事）。用
+   * `cacheHitRate(input_tokens_total, cached_tokens_total)` 算。
+   */
+  input_tokens_total: number
+  cached_tokens_total: number
 }
 
 export async function getMetrics(): Promise<Metrics> {

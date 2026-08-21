@@ -284,6 +284,17 @@ pub struct UsagePage {
     pub total: i64,
     /// 同一套筛选条件下的总花费（USD）。
     pub total_cost: f64,
+    /// 同一套筛选条件下的输入 token 合计（**已含命中缓存那部分**）与其中命中缓存的部分。
+    ///
+    /// 两个数一起回、由界面算缓存命中率（`cached / input`），而不是在这里算好一个百分比：
+    /// **只有这两个原始数才能让人判断那个比率作不作数**——一屏 300 token 的小请求算出来的
+    /// 「命中 0%」和 17K token 前缀上的「命中 94%」是两件事。
+    ///
+    /// 分母刻意用 `input_tokens` 而不是 `total_tokens`：输出 token 与缓存无关，掺进分母只会
+    /// 把命中率按「这一轮模型说了多少话」稀释。缺失（没嗅探到 usage）的行按 0 计入——
+    /// SQL 的 `SUM` 本来就跳过 NULL。
+    pub total_input_tokens: i64,
+    pub total_cached_tokens: i64,
     /// 本轮翻页的锚点（Unix 秒），下一页原样带回。
     pub anchor: Option<i64>,
 }
@@ -1361,8 +1372,8 @@ impl CredentialStore {
     /// 新落的流水会把记录整体往后挤，用户在第 2 页看到的正是第 1 页刚看过的那几条。
     /// 首次请求传 `None`，响应里回一个锚点，之后每页原样带回。
     ///
-    /// `total` 与 `total_cost` 按**同一套筛选条件**统计（含锚点），否则页码算出来的页数
-    /// 与实际能翻到的页数对不上。
+    /// `total`/`total_cost` 与两项 token 合计按**同一套筛选条件**统计（含锚点），否则页码
+    /// 算出来的页数与实际能翻到的页数对不上，合计也会与翻得到的那些行对不上。
     pub fn list_usage_page(
         &self,
         cred_id: Option<i64>,
@@ -1387,10 +1398,21 @@ impl CredentialStore {
             format!("WHERE {}", where_parts.join(" AND "))
         };
 
-        let (total, total_cost) = conn.query_row(
-            &format!("SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM usage_logs {where_sql}"),
+        let (total, total_cost, total_input_tokens, total_cached_tokens) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0),
+                        COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_tokens), 0)
+                   FROM usage_logs {where_sql}"
+            ),
             rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
         )?;
 
         let sql = format!(
@@ -1431,7 +1453,7 @@ impl CredentialStore {
         // 锚点取本轮最新那条的时间戳。这一页为空（越过末页）时沿用传入的锚点，
         // 免得回一个 None 让前端下一页又变成「不钉锚点」。
         let anchor = until.or_else(|| logs.first().map(|l| l.ts));
-        Ok(UsagePage { logs, total, total_cost, anchor })
+        Ok(UsagePage { logs, total, total_cost, total_input_tokens, total_cached_tokens, anchor })
     }
 
     /// 裁掉过期的用量流水，返回删了几行。终身口径在账本里，不受影响。
@@ -1787,6 +1809,11 @@ mod tests {
         assert_eq!(st.input_tokens_total, 400);
         assert_eq!(st.cached_tokens_total, 290);
         assert_eq!(st.output_tokens_total, 25);
+
+        // 流水那头的合计（缓存命中率的两个原始数）与账本对得上：分母是 input（已含 cached），
+        // 没报用量的那条按 0 计入，两个数都不能因为它变成 NULL。
+        let page = s.list_usage_page(Some(a.id), 10, 0, None).unwrap();
+        assert_eq!((page.total_input_tokens, page.total_cached_tokens), (400, 290));
     }
 
     /// 额度快照**只被它真的报了的那几项覆盖**。
@@ -1904,6 +1931,8 @@ mod tests {
         assert_eq!(page.total, 2);
         assert!((page.total_cost - 0.75).abs() < 1e-9);
         assert!(page.anchor.is_some());
+        // 两条流水都没报 token：合计是 0 而不是 NULL——界面据此显示「没有可谈的缓存率」。
+        assert_eq!((page.total_input_tokens, page.total_cached_tokens), (0, 0));
     }
 
     /// 删号要连带清掉账本与流水，否则 id 复用时新账号继承一段历史。

@@ -61,6 +61,8 @@ pub struct AppState {
     /// `/v1/models` 的清单缓存。取一次要跑一趟上游，而有一类客户端每开个会话就问一遍
     /// （见 [`crate::proxy::ModelListCache`]）。
     pub models_cache: proxy::ModelListCache,
+    /// 「这个会话捎来的加密推理在这个号上解不开」的记忆，见 [`crate::proxy::StaleReasoningMemo`]。
+    pub stale_reasoning: proxy::StaleReasoningMemo,
 }
 
 type ApiError = (StatusCode, String);
@@ -83,6 +85,7 @@ pub async fn run(
         admin_env: admin_password.map(Arc::new),
         in_flight: Arc::default(),
         models_cache: Arc::default(),
+        stale_reasoning: Arc::default(),
     };
 
     spawn_usage_pruner(state.store.clone());
@@ -856,6 +859,15 @@ struct MetricsResp {
     in_flight: i64,
     cost_total_usd: f64,
     requests_total: i64,
+    /// 全池终身累计的输入 token（**已含命中缓存那部分**）与其中命中缓存的部分。
+    ///
+    /// 两个数一起回、由界面算全池缓存命中率（`cached / input`），同 [`store::UsagePage`] 上
+    /// 那两项的取舍：先回原始数，比率与它作不作数由看的人判断。
+    ///
+    /// 各账号之和而不是另开一条 SQL：这两个数就躺在账本里，而这个接口本来已经在遍历账号
+    /// 取花费与请求数了。
+    input_tokens_total: i64,
+    cached_tokens_total: i64,
 }
 
 async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>, ApiError> {
@@ -863,10 +875,14 @@ async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>,
     let mut cost = 0.0;
     let mut requests = 0;
     let mut rpm = 0;
+    let mut input_tokens = 0;
+    let mut cached_tokens = 0;
     for c in &list {
         let s = state.store.stats_of(c.id).unwrap_or_default();
         cost += s.cost_total_usd;
         requests += s.request_total;
+        input_tokens += s.input_tokens_total;
+        cached_tokens += s.cached_tokens_total;
         rpm += state.store.current_rpm(c.id);
     }
     Ok(Json(MetricsResp {
@@ -877,6 +893,8 @@ async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>,
         in_flight: state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
         cost_total_usd: cost,
         requests_total: requests,
+        input_tokens_total: input_tokens,
+        cached_tokens_total: cached_tokens,
     }))
 }
 
@@ -1052,6 +1070,7 @@ mod tests {
             admin_env: None,
             in_flight: Arc::default(),
             models_cache: Arc::default(),
+            stale_reasoning: Arc::default(),
         };
         let a = PkceChallenge::generate();
         let b = PkceChallenge::generate();
@@ -1080,6 +1099,7 @@ mod tests {
             admin_env: None,
             in_flight: Arc::default(),
             models_cache: Arc::default(),
+            stale_reasoning: Arc::default(),
         };
         for _ in 0..PKCE_MAX_PENDING * 2 {
             remember_pkce(&state, PkceChallenge::generate());

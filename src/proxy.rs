@@ -241,31 +241,48 @@ async fn forward_once(
         fwd_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
 
-    let req = client
-        .request(wreq::Method::from_bytes(method.as_str().as_bytes())?, &url)
-        .headers(fwd_headers)
-        .body(body.clone());
+    // 这条请求最多发两遍：第一遍照客户端给的体发，上游解不开里面的加密推理时摘掉它、
+    // **同一个号**再发一遍（见 [`strip_encrypted_reasoning`]）。所以体与头都得留着重用。
+    let mut fwd_body = body.clone();
+    let mut stripped = false;
+    // 这个会话在这个号上已经吃过一次「解不开」：直接摘掉，省下那次注定 400 的往返
+    // （见 [`StaleReasoningMemo`]）。
+    if stale_reasoning_known(&state.stale_reasoning, session_key, cred.id)
+        && let Some(fixed) = strip_encrypted_reasoning(&fwd_body)
+    {
+        fwd_body = fixed;
+        stripped = true;
+    }
 
-    let up = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            // 连接层失败不算这个账号的错（除非它配了个坏代理，而那在建客户端时就报了），
-            // 换个号重试一次是有意义的——尤其逐账号代理各走各的出口。
-            return Ok(Outcome::TryNext(error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_unreachable",
-                format!("could not reach upstream: {e}"),
-            )));
+    let (up, quota) = loop {
+        let req = client
+            .request(wreq::Method::from_bytes(method.as_str().as_bytes())?, &url)
+            .headers(fwd_headers.clone())
+            .body(fwd_body.clone());
+
+        let up = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // 连接层失败不算这个账号的错（除非它配了个坏代理，而那在建客户端时就报了），
+                // 换个号重试一次是有意义的——尤其逐账号代理各走各的出口。
+                return Ok(Outcome::TryNext(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_unreachable",
+                    format!("could not reach upstream: {e}"),
+                )));
+            }
+        };
+
+        let status = StatusCode::from_u16(up.status().as_u16())?;
+        let quota = QuotaSnapshot::from_headers(up.headers());
+        // 转发路径不关心停没停：这条请求已经在飞，暂停只影响后面的选号。
+        let _ = maybe_pause_on_quota(state, cred, &quota);
+
+        if status.is_success() {
+            break (up, quota);
         }
-    };
 
-    let status = StatusCode::from_u16(up.status().as_u16())?;
-    let quota = QuotaSnapshot::from_headers(up.headers());
-    // 转发路径不关心停没停：这条请求已经在飞，暂停只影响后面的选号。
-    let _ = maybe_pause_on_quota(state, cred, &quota);
-
-    // 非 2xx：先把体读出来判一判是不是账号级问题，再决定换号还是交回客户端。
-    if !status.is_success() {
+        // 非 2xx：先把体读出来判一判是不是账号级问题，再决定换号还是交回客户端。
         let up_headers = up.headers().clone();
         let bytes = up.bytes().await.unwrap_or_default();
         log_usage(state, cred, path, headers, status.as_u16() as i64, None, &quota, started, None);
@@ -281,9 +298,29 @@ async fn forward_once(
             state.store.note_rate_limited(cred.id, secs);
             return Ok(Outcome::TryNext(error_passthrough(status, &up_headers, bytes, chat)));
         }
+        // 上游解不开客户端捎来的加密推理：摘掉再发一遍。**不换号**——密文绑在产出它的那个
+        // 号上，换到第三个号一样解不开；也不能就这么把 400 交回去——客户端下一轮还会把同一
+        // 段密文发回来，这段会话就此卡死。
+        //
+        // 重发不再占 RPM 名额（名额由调用点在选号后占过一次）：为了一个额外的修复请求把这条
+        // 客户端请求判死，换回来的只是同一句 400。
+        if !stripped
+            && detect_stale_encrypted_content(status, &bytes)
+            && let Some(fixed) = strip_encrypted_reasoning(&fwd_body)
+        {
+            tracing::info!(
+                cred_id = cred.id,
+                "upstream could not decrypt the reasoning carried by this request; \
+                 retrying on the same credential without it"
+            );
+            note_stale_reasoning(&state.stale_reasoning, session_key, cred.id);
+            fwd_body = fixed;
+            stripped = true;
+            continue;
+        }
         // 其余（400/404/422…）是这条请求本身的问题，换号也不会好，原样交回。
         return Ok(Outcome::Done(error_passthrough(status, &up_headers, bytes, chat)));
-    }
+    };
 
     if collapse {
         return Ok(Outcome::Done(
@@ -631,6 +668,86 @@ fn drop_unsupported_params(obj: &mut serde_json::Map<String, serde_json::Value>)
     dropped
 }
 
+/// 摘掉请求体里捎来的**加密推理**（`input` 里 `type: "reasoning"` 的那些项），返回改写后的
+/// 体；里面本来就没有这东西则返回 `None`——那说明这条 400 不是这个病，重发一遍白发一次。
+///
+/// 上游那串 `encrypted_content`（`gAAA…`）**绑在产出它的那个账号上**：拿到别的号上去解，回的
+/// 就是 400 `The encrypted content … could not be verified`。而这条代理天生就会换号——粘性
+/// 落点那个号一旦停用/冷却/额度暂停/RPM 打满/被这一轮重试排掉，同一段会话就落到了同档的
+/// 下一个号上（见 [`store::CredentialStore::select`]），而客户端手里攥着的还是上一个号产的
+/// 密文。客户端做过历史压缩、换了模型档位从而指纹变了，也是同一回事。
+///
+/// 丢**整项**而不是只摘掉 `encrypted_content` 字段：一个只剩 `summary` 的 reasoning 项是官方
+/// 客户端不会产生的形状，上游怎么判说不好；而「`input` 里干脆没有 reasoning 项」正是没开
+/// `include: reasoning.encrypted_content` 的客户端天天在发的东西，稳。
+///
+/// 代价是模型看不见前面几轮的思考过程（可见的消息、工具调用与结果一项不动），换来的是这段
+/// 会话还能接着往下走——而不是从这一轮起每一次都 400。
+fn strip_encrypted_reasoning(body: &Bytes) -> Option<Bytes> {
+    let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body).ok()?;
+    let mut touched = false;
+    {
+        let input = obj.get_mut("input")?.as_array_mut()?;
+        let before = input.len();
+        input.retain(|item| item.get("type").and_then(|t| t.as_str()) != Some("reasoning"));
+        touched |= input.len() != before;
+        // 别的项上万一也挂着密文，一样摘掉：判据是「上游解不开某段密文」，而不是「reasoning 项」。
+        for item in input.iter_mut() {
+            if let Some(o) = item.as_object_mut() {
+                touched |= o.remove("encrypted_content").is_some();
+            }
+        }
+    }
+    if !touched {
+        return None;
+    }
+    // `include: ["reasoning.encrypted_content"]` 刻意留着：它管的是**回程**——这一轮之后的
+    // 密文由现在这个号产出，而这段会话往后就粘在它上面了，下一轮还能接着用上。
+    serde_json::to_vec(&serde_json::Value::Object(obj)).ok().map(Bytes::from)
+}
+
+/// 「**这个会话**捎来的密文在**这个号**上解不开」的记忆：`(会话键, 凭证 id)` 的有界集合。
+///
+/// 为什么需要它：修复一次并不能一劳永逸。客户端每轮都把整段历史发回来，里面永远躺着上一个
+/// 号产的那段密文——不记住的话，从换号那一轮起**每一轮**都要先吃一个注定失败的 400 再被
+/// [`forward_once`] 摘掉重发，白搭一次上游往返，用量页上还多一条 400。记住之后就直接摘掉再
+/// 发，那次往返省掉了。
+///
+/// 只活在进程内存里（同 [`store::CredentialStore`] 的冷却/RPM 窗口）：重启后最多再交一次
+/// 那笔学费，而落库要为一个纯粹的性能优化摊上一张表与一轮清理。
+pub type StaleReasoningMemo = Arc<parking_lot::Mutex<std::collections::VecDeque<(String, i64)>>>;
+
+/// 记忆体的上限。会话有生有灭，这个集合没有别的回收时机，只能靠先进先出顶住。
+///
+/// 满了顶掉最老的那条：被顶掉的会话若还活着，下一轮再交一次学费、重新记上——退化成没有记忆
+/// 的行为，而不是出错。查找是一次线性扫（几百个 32 字符的键比一次哈希分配还便宜），故不为它
+/// 再搭一个 HashSet。
+const STALE_REASONING_MEMO_MAX: usize = 512;
+
+/// 这个会话在这个号上是不是已经吃过一次「解不开」。
+fn stale_reasoning_known(
+    memo: &StaleReasoningMemo,
+    session_key: Option<&str>,
+    cred_id: i64,
+) -> bool {
+    let Some(key) = session_key.filter(|k| !k.is_empty()) else { return false };
+    memo.lock().iter().any(|(k, id)| *id == cred_id && k == key)
+}
+
+/// 记下「这个会话在这个号上解不开」。没有会话键就不记：那时落点本来就无从固定，记了也没有
+/// 谁能对上号。
+fn note_stale_reasoning(memo: &StaleReasoningMemo, session_key: Option<&str>, cred_id: i64) {
+    let Some(key) = session_key.filter(|k| !k.is_empty()) else { return };
+    let mut memo = memo.lock();
+    if memo.iter().any(|(k, id)| *id == cred_id && k == key) {
+        return;
+    }
+    while memo.len() >= STALE_REASONING_MEMO_MAX {
+        memo.pop_front();
+    }
+    memo.push_back((key.to_owned(), cred_id));
+}
+
 /// 从（已经是 Responses 形状的）请求体里算一个**会话指纹**。
 ///
 /// 上游的 prompt cache 键是「`prompt_cache_key` + 前缀哈希」，而这条后端把
@@ -915,6 +1032,25 @@ fn detect_account_error(status: StatusCode, body: &[u8]) -> Option<String> {
             .unwrap_or_else(|| String::from_utf8_lossy(body).chars().take(200).collect());
         format!("upstream {status}: {msg}")
     })
+}
+
+/// 判断这次 400 是不是「上游解不开请求里捎来的加密推理」。命中即由 [`forward_once`] 摘掉那
+/// 几项、**同一个号**重发一遍（见 [`strip_encrypted_reasoning`]）。
+///
+/// 上游的原话：`The encrypted content gAAA…= could not be verified. Reason: Encrypted content
+/// could not be decrypted or parsed.`
+///
+/// 同时要求「主体」与「状态」两类词，同 [`detect_account_error`] 的理由：光看 `encrypted`
+/// 会把别的 400 也算进来，而算错一次就是白把客户端的推理上下文摘掉一次。
+fn detect_stale_encrypted_content(status: StatusCode, body: &[u8]) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("encrypted content")
+        && ["could not be verified", "could not be decrypted", "could not be parsed"]
+            .iter()
+            .any(|k| text.contains(k))
 }
 
 /// 从 `retry-after` 头取秒数。
@@ -2651,6 +2787,78 @@ mod tests {
 
         // 状态码不对就不判，哪怕文本命中。
         assert!(detect_account_error(StatusCode::TOO_MANY_REQUESTS, banned).is_none());
+    }
+
+    /// 上游解不开请求里捎来的加密推理时那句 400 要认出来：认不出来，这段会话从此每一轮都
+    /// 400（客户端下一轮还会把同一段密文发回来）。
+    #[test]
+    fn stale_encrypted_reasoning_is_detected() {
+        let stale = br#"{"error":{"message":"The encrypted content gAAAAABn...nZg= could not be verified. Reason: Encrypted content could not be decrypted or parsed."}}"#;
+        assert!(detect_stale_encrypted_content(StatusCode::BAD_REQUEST, stale));
+
+        // 状态码不对不判；别的 400 也不判——误判一次就是白把客户端的推理上下文摘掉一次。
+        assert!(!detect_stale_encrypted_content(StatusCode::TOO_MANY_REQUESTS, stale));
+        let other = br#"{"error":{"message":"Unsupported parameter: temperature"}}"#;
+        assert!(!detect_stale_encrypted_content(StatusCode::BAD_REQUEST, other));
+    }
+
+    /// 摘掉的只有 reasoning 项：消息、工具调用与结果（含 `call_id` 的配对关系）一项不能动，
+    /// 顺手丢掉一个 `function_call_output` 就是把这一轮的工具结果变没了。
+    #[test]
+    fn stripping_encrypted_reasoning_keeps_everything_else() {
+        let body = Bytes::from(
+            r#"{"model":"gpt-5.4","include":["reasoning.encrypted_content"],"input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAAA"},
+                {"type":"function_call","name":"shell","call_id":"c1","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"ok"}
+            ]}"#
+            .to_owned(),
+        );
+        let fixed = strip_encrypted_reasoning(&body).expect("有 reasoning 项就该改写");
+        let v: serde_json::Value = serde_json::from_slice(&fixed).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3, "只该少掉那一项 reasoning");
+        assert!(!input.iter().any(|i| i["type"] == "reasoning"));
+        assert!(!String::from_utf8_lossy(&fixed).contains("gAAAA"), "密文一个字节都不该留下");
+        assert_eq!(input[2]["call_id"], "c1", "工具结果与它的配对关系原样留着");
+        // 回程那个 include 刻意留着：往后的密文由现在这个号产，下一轮还用得上。
+        assert_eq!(v["include"][0], "reasoning.encrypted_content");
+
+        // 里面根本没有密文时返回 None：那说明这条 400 是别的原因，重发一遍白发一次。
+        let clean = Bytes::from(
+            r#"{"input":[{"type":"message","role":"user","content":"hi"}]}"#.to_owned(),
+        );
+        assert!(strip_encrypted_reasoning(&clean).is_none());
+        // 非 JSON / 没有 input 的体一样不重发。
+        assert!(strip_encrypted_reasoning(&Bytes::from_static(b"not json")).is_none());
+    }
+
+    /// 记忆按「会话 + 号」两件一起认，且有上限：只按会话认会把同一段会话在别的号上也预摘
+    /// 掉（那个号本来解得开自己产的密文），没有上限则一个长跑进程会被过期的会话键撑起来。
+    #[test]
+    fn the_stale_reasoning_memo_is_keyed_by_both_and_bounded() {
+        let memo = StaleReasoningMemo::default();
+        note_stale_reasoning(&memo, Some("sess-a"), 1);
+        assert!(stale_reasoning_known(&memo, Some("sess-a"), 1));
+        assert!(!stale_reasoning_known(&memo, Some("sess-a"), 2), "换个号是另一件事");
+        assert!(!stale_reasoning_known(&memo, Some("sess-b"), 1), "换段会话是另一件事");
+        // 没有会话键时不记也不认：那时落点本来就无从固定。
+        note_stale_reasoning(&memo, None, 1);
+        note_stale_reasoning(&memo, Some(""), 1);
+        assert!(!stale_reasoning_known(&memo, None, 1));
+        assert_eq!(memo.lock().len(), 1, "同一条记两遍也只占一个位置（重复记不该堆积）");
+        note_stale_reasoning(&memo, Some("sess-a"), 1);
+        assert_eq!(memo.lock().len(), 1);
+
+        for i in 0..STALE_REASONING_MEMO_MAX * 2 {
+            note_stale_reasoning(&memo, Some(&format!("sess-{i}")), 1);
+        }
+        assert!(memo.lock().len() <= STALE_REASONING_MEMO_MAX);
+        // 顶掉的是最老的那条：最近这些还在，被顶掉的会话若还活着，下一轮再学一次。
+        let last = format!("sess-{}", STALE_REASONING_MEMO_MAX * 2 - 1);
+        assert!(stale_reasoning_known(&memo, Some(&last), 1));
+        assert!(!stale_reasoning_known(&memo, Some("sess-a"), 1));
     }
 
     /// 取最后一个 usage：中途事件也可能带一个不完整的读数。

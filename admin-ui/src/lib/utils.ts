@@ -431,6 +431,41 @@ export function formatTokens(n: number): string {
   return String(Math.round(n))
 }
 
+/**
+ * 缓存命中率：`cached / input`，值域 0–1；算不出来时返回 `null`。
+ *
+ * 分母是**输入** token（上游报的 `input_tokens` 本来就含命中缓存那部分，见后端
+ * `CredentialStats` 的注），不是 total——输出 token 与缓存无关，掺进分母只会把命中率按
+ * 「这一轮模型说了多少话」稀释。
+ *
+ * `null` 而不是 0：一条都没跑过、或流水里没嗅探到 usage 时，「没有可谈的缓存率」与「命中
+ * 0%」是两件事，界面上必须显示成 `—` 而不是一个看着像坏消息的 0%。
+ *
+ * 上游偶发把 cached 报得比 input 大时夹回 1：显示「103%」只会让人以为是我们算错了。
+ */
+export function cacheHitRate(
+  inputTokens: number | null | undefined,
+  cachedTokens: number | null | undefined,
+): number | null {
+  if (inputTokens == null || cachedTokens == null || inputTokens <= 0) return null
+  return Math.min(1, Math.max(0, cachedTokens / inputTokens))
+}
+
+/**
+ * 比率（0–1）→ 百分比文本。整数就不带小数（`94%`），带小数时留一位（`96.2%`）。
+ *
+ * 留那一位是有用的：prompt cache 的命中率日常在 90% 以上，`96.2%` 与 `96.8%` 之间差的是
+ * 真金白银（命中部分按十分之一计价），四舍五入成同一个 `96%` 就看不出调整粘性有没有效果。
+ * 不本地化：紧挨着的 token 数也不本地化（见 {@link formatTokens}）。
+ */
+export function formatPercent(rate: number | null): string {
+  if (rate == null) return '—'
+  const pct = rate * 100
+  // 99.95% 这种别显示成 `100%`：那会让「几乎全命中」和「一字不差全命中」看起来一样。
+  const rounded = pct >= 99.95 && pct < 100 ? 99.9 : Number(pct.toFixed(1))
+  return `${rounded}%`
+}
+
 /** 美元金额格式化：极小额多留几位小数，便于看清单次费用。 */
 export function formatUsd(v: number): string {
   if (!v || v <= 0) return '$0.00'
