@@ -58,6 +58,9 @@ pub struct AppState {
     /// 由 [`crate::proxy::InFlightGuard`] 增减，随响应流一起存活——流式回复要几十秒才走完，
     /// 只在 handler 返回时减一会把这类请求算成「瞬间就结束了」。
     pub in_flight: Arc<std::sync::atomic::AtomicI64>,
+    /// `/v1/models` 的清单缓存。取一次要跑一趟上游，而有一类客户端每开个会话就问一遍
+    /// （见 [`crate::proxy::ModelListCache`]）。
+    pub models_cache: proxy::ModelListCache,
 }
 
 type ApiError = (StatusCode, String);
@@ -79,6 +82,7 @@ pub async fn run(
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
         in_flight: Arc::default(),
+        models_cache: Arc::default(),
     };
 
     spawn_usage_pruner(state.store.clone());
@@ -136,6 +140,14 @@ pub async fn run(
             "/backend-api/codex/{*path}",
             any(proxy::handle).layer(DefaultBodyLimit::max(PROXY_BODY_LIMIT)),
         )
+        // `/chat/completions`：OpenAI 兼容客户端里有一类把 base_url 配到根上（不带 `/v1`）。
+        // 带 `/v1` 的那条由上面的通配路由收，两条落到同一段逻辑。
+        .route(
+            "/chat/completions",
+            any(proxy::handle_chat).layer(DefaultBodyLimit::max(PROXY_BODY_LIMIT)),
+        )
+        // `/models`：同上，那类客户端取模型清单时打的是这条路径。
+        .route("/models", any(proxy::handle_models))
         // 个别移动端/前置层会以 POST 打开首页；用 PRG 把最终文档历史落成 GET。
         .route("/", get(admin_ui::fallback).post(admin_ui::redirect_root_post))
         .fallback_service(get(admin_ui::fallback))
@@ -1039,6 +1051,7 @@ mod tests {
             client_key: None,
             admin_env: None,
             in_flight: Arc::default(),
+            models_cache: Arc::default(),
         };
         let a = PkceChallenge::generate();
         let b = PkceChallenge::generate();
@@ -1066,6 +1079,7 @@ mod tests {
             client_key: None,
             admin_env: None,
             in_flight: Arc::default(),
+            models_cache: Arc::default(),
         };
         for _ in 0..PKCE_MAX_PENDING * 2 {
             remember_pkce(&state, PkceChallenge::generate());

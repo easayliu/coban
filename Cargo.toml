@@ -1,6 +1,6 @@
 [package]
 name = "coban"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 
 [dependencies]
@@ -19,7 +19,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order：Map 换成 IndexMap，保留 JSON 对象的原始 key 顺序。
 # 转发前若要改写请求体（注入 instructions、补 store 字段等）得原样重新序列化，默认的
 # BTreeMap 会把整个 body 的 key 按字母序重排——官方 codex 客户端不会产生的排列，
-# 一次精确比对即可判定中间有代理。见 proxy::rewrite_body。
+# 一次精确比对即可判定中间有代理。见 proxy::normalize_responses_body 与 chat::translate_request。
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }

@@ -2,6 +2,10 @@
 //!
 //! 透传请求体，只替换鉴权：校验来访 API Key 后选一个凭证，注入它的 OAuth access_token
 //! 与 `chatgpt-account-id`，响应流式原样回传，顺带从 SSE 里嗅探用量与额度。
+//!
+//! 唯一不「透传」的是 **Chat Completions** 那类接入方（`/v1/chat/completions`）：上游只讲
+//! Responses 一种线格式，故请求与响应都要翻译，见 [`crate::chat`]。选号、换号重试、限流头、
+//! 用量嗅探、落库、计价两种线格式**共用同一份代码**，翻译只是夹在最外面的一进一出。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,6 +18,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 
+use crate::chat;
 use crate::config;
 use crate::credentials::Credential;
 use crate::store::{self, CredentialStore, QuotaSnapshot, UsageRecord};
@@ -51,8 +56,19 @@ pub async fn handle(
         }
     }
 
-    // 请求体在重试间要重发多次，规范化只做一次（见 normalize_responses_body）。
-    let Normalized { body, collapse } = normalize_responses_body(&path, body);
+    // `GET models` 要在选号之前截下来：它与转发不是一回事（见 openai_model_list）。
+    if let Some(resp) = openai_model_list(&state, &path, &method, &uri).await {
+        return resp;
+    }
+
+    // 请求体在重试间要重发多次，规范化/翻译只做一次（见 plan_request）。
+    let Normalized { body, collapse, chat } = match plan_request(&path, body) {
+        Ok(n) => n,
+        // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
+    };
+    // chat 的体已经翻成 Responses 形状，那它就该打到那个端点上；其余按来访路径原样拼。
+    let upstream_path: &str = if chat.is_some() { config::RESPONSES_PATH } else { &path };
 
     let started = Instant::now();
     let retry_max = state
@@ -92,11 +108,13 @@ pub async fn handle(
             &state,
             &cred,
             &path,
+            upstream_path,
             &method,
             &uri,
             &headers,
             &body,
             collapse,
+            chat.as_ref(),
             started,
             in_flight.clone(),
         )
@@ -132,6 +150,32 @@ pub async fn handle(
     })
 }
 
+/// 根路径上的 `/models`：同 [`handle_chat`] 的理由——base_url 配到根上的那类客户端，
+/// 取模型清单时打的是这条路径。
+pub async fn handle_models(
+    State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    handle(State(state), Path(config::MODELS_PATH.to_owned()), method, uri, headers, Bytes::new())
+        .await
+}
+
+/// 根路径上的 `/chat/completions`：把 coban 当 OpenAI 兼容端点、而 base_url 里没带 `/v1`
+/// 的那种配法。`/v1/chat/completions` 由 [`handle`] 的通配路由收，两条落到同一段逻辑——
+/// 只收一条的话另一条是个 405，而客户端那头只显示「请求失败」，指不到路径上（同
+/// [`crate::web`] 里两条转发路由并存的理由）。
+pub async fn handle_chat(
+    State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle(State(state), Path(chat::PATH.to_owned()), method, uri, headers, body).await
+}
+
 /// 一次转发的结果：定局，还是「换个号再来」。
 enum Outcome {
     Done(Response),
@@ -145,23 +189,33 @@ async fn forward_once(
     state: &AppState,
     cred: &Credential,
     path: &str,
+    upstream_path: &str,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: &Bytes,
     collapse: bool,
+    chat: Option<&ChatMode>,
     started: Instant,
     in_flight: InFlightGuard,
 ) -> anyhow::Result<Outcome> {
     let client = state.clients.for_credential(cred)?;
     let token = state.store.valid_access_token(&state.clients, cred).await?;
 
-    let url = upstream_url(path, uri.query());
+    // chat 模式下**不带来访的 query**：那串是给 `/v1/chat/completions` 的，接在
+    // `responses` 后面只是往上游送一堆它不认识的参数。
+    let query = uri.query().filter(|_| chat.is_none());
+    let url = upstream_url(upstream_path, query);
     let mut fwd_headers = build_forward_headers(headers, cred, &token);
-    if collapse {
+    if collapse || chat.is_some() {
         // 体里的 `stream` 已被我们钉成 true，`accept` 得跟着说 SSE：官方客户端不存在
         // 「体里要流、头里要 JSON」这种自相矛盾的形态，别让上游去猜。
         fwd_headers.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+    }
+    if chat.is_some() {
+        // 体已经被换成我们自己序列化的 JSON，来访那头的 content-type 不再作数
+        // （有客户端发 `application/json; charset=utf-8` 之外的写法）。
+        fwd_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
 
     let req = client
@@ -195,26 +249,28 @@ async fn forward_once(
 
         if let Some(reason) = detect_account_error(status, &bytes) {
             state.store.mark_banned(cred.id, &reason)?;
-            return Ok(Outcome::TryNext(passthrough(status, &up_headers, bytes)));
+            return Ok(Outcome::TryNext(error_passthrough(status, &up_headers, bytes, chat)));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
             let secs = retry_after_secs(&up_headers).unwrap_or_else(|| {
                 state.store.get_setting_i64(store::COOLDOWN_SECS, store::DEFAULT_COOLDOWN_SECS)
             });
             state.store.note_rate_limited(cred.id, secs);
-            return Ok(Outcome::TryNext(passthrough(status, &up_headers, bytes)));
+            return Ok(Outcome::TryNext(error_passthrough(status, &up_headers, bytes, chat)));
         }
         // 其余（400/404/422…）是这条请求本身的问题，换号也不会好，原样交回。
-        return Ok(Outcome::Done(passthrough(status, &up_headers, bytes)));
+        return Ok(Outcome::Done(error_passthrough(status, &up_headers, bytes, chat)));
     }
 
     if collapse {
         return Ok(Outcome::Done(
-            collapse_upstream(state, cred, path, headers, up, quota, started).await,
+            collapse_upstream(state, cred, path, headers, chat, up, quota, started).await,
         ));
     }
 
-    Ok(Outcome::Done(stream_upstream(state, cred, path, headers, up, quota, started, in_flight)))
+    Ok(Outcome::Done(stream_upstream(
+        state, cred, path, headers, chat, up, quota, started, in_flight,
+    )))
 }
 
 /// 把上游的 SSE 收拢成一个一次性 JSON 响应。
@@ -224,11 +280,13 @@ async fn forward_once(
 /// 让它读一堆读不懂的 `data:` 行。
 ///
 /// 代价是这条路径不再是流式的：整段响应读完才回。要延迟就该在请求里写 `stream: true`。
+#[allow(clippy::too_many_arguments)]
 async fn collapse_upstream(
     state: &AppState,
     cred: &Credential,
     path: &str,
     req_headers: &HeaderMap,
+    chat: Option<&ChatMode>,
     up: wreq::Response,
     quota: QuotaSnapshot,
     started: Instant,
@@ -282,16 +340,33 @@ async fn collapse_upstream(
         );
     }
 
-    let Some(resp) = sse_final_response(&bytes) else {
-        return error_response(
-            StatusCode::BAD_GATEWAY,
-            "upstream_error",
-            "the upstream stream ended without a completed response",
-        );
+    // 两种线格式在这里、也只在这里分道：chat 客户端等的是一个 `chat.completion` 对象，
+    // Responses 客户端等的是那个 `response` 对象本身。前面读体、嗅探、落库、失败判定
+    // 那几步两者一字不差地共用。
+    let body = match chat {
+        Some(mode) => match chat::aggregate(&bytes, &mode.model) {
+            Ok(b) => b,
+            Err((etype, message)) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    etype.as_deref().unwrap_or("upstream_error"),
+                    message,
+                );
+            }
+        },
+        None => {
+            let Some(resp) = sse_final_response(&bytes) else {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "the upstream stream ended without a completed response",
+                );
+            };
+            serde_json::to_vec(&resp).unwrap_or_else(|_| {
+                error_body("internal_error", "failed to serialize the response")
+            })
+        }
     };
-
-    let body = serde_json::to_vec(&resp)
-        .unwrap_or_else(|_| error_body("internal_error", "failed to serialize the response"));
     let mut builder = Response::builder().status(status);
     for (name, value) in up_headers.iter() {
         // 逐条跳过的理由同 resp_builder；`content-type` 也不能照抄——上游说的是
@@ -321,6 +396,7 @@ fn stream_upstream(
     cred: &Credential,
     path: &str,
     req_headers: &HeaderMap,
+    chat: Option<&ChatMode>,
     up: wreq::Response,
     quota: QuotaSnapshot,
     started: Instant,
@@ -354,7 +430,30 @@ fn stream_upstream(
         chunk
     });
 
-    builder.body(Body::from_stream(stream)).unwrap_or_else(|e| internal_error_plain(&e.to_string()))
+    // chat 客户端读不懂 Responses 的事件流，得边收边翻（见 [`chat::StreamXlate`]）。
+    // **嗅探排在翻译之前**，吃到的仍是上游原始字节——用量、计价、额度那套账因此与线格式
+    // 无关，不会因为多了一种接入形态而出现两套读数。
+    let body = match chat {
+        None => Body::from_stream(stream),
+        Some(mode) => {
+            let xlate = Arc::new(parking_lot::Mutex::new(chat::StreamXlate::new(
+                mode.model.clone(),
+                mode.include_usage,
+            )));
+            let tail = xlate.clone();
+            Body::from_stream(
+                stream.map(move |chunk| chunk.map(|bytes| xlate.lock().feed(&bytes))).chain(
+                    // 上游流走完还得补收尾：`[DONE]`，或者（流断在终局事件之前时）一条
+                    // 错误事件。少了它，客户端会一直等一个不会来的结束标记。
+                    futures_util::stream::once(async move {
+                        Ok::<Bytes, wreq::Error>(tail.lock().flush())
+                    }),
+                ),
+            )
+        }
+    };
+
+    builder.body(body).unwrap_or_else(|e| internal_error_plain(&e.to_string()))
 }
 
 /// 拼上游 URL：`UPSTREAM_BASE` + 来访路径（+ 原样带上 query）。
@@ -365,6 +464,34 @@ struct Normalized {
     /// 客户端要的是一次性 JSON（体里的 `stream` 不是 `true`）。上游只出 SSE，所以这种
     /// 请求要在本层把流收拢回一个 JSON 体（见 [`collapse_upstream`]）。
     collapse: bool,
+    /// 来访用的是 Chat Completions 线格式时，回程翻译要用到的那点形态；`None` 表示
+    /// Responses 原样透传。
+    chat: Option<ChatMode>,
+}
+
+/// chat 线格式下这次请求的形态：翻请求时定下，翻响应时要用。
+struct ChatMode {
+    /// 客户端请求的模型名。上游没报模型时回显它。
+    model: String,
+    /// 流式收尾要不要补一条只带 usage 的 chunk（`stream_options.include_usage`）。
+    include_usage: bool,
+}
+
+/// 决定这条来访请求怎么送上游：翻线格式（chat），还是钉几个字段（responses）。
+///
+/// 两条路都在**换号重试之前**只做一次：重试要重发整个请求体，把翻译放进循环里等于每次
+/// 换号都重做一遍，而结果逐字节相同。
+fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
+    if path.trim_start_matches('/') == chat::PATH {
+        let t = chat::translate_request(&body)?;
+        return Ok(Normalized {
+            body: t.body,
+            // 「客户端没要流」在两种线格式里是同一件事，收拢那段代码也就共用。
+            collapse: !t.stream,
+            chat: Some(ChatMode { model: t.model, include_usage: t.include_usage }),
+        });
+    }
+    Ok(normalize_responses_body(path, body))
 }
 
 /// 把 `responses` 请求体钉成上游要的样子：`store: false`、`stream: true`。
@@ -384,24 +511,24 @@ struct Normalized {
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
 fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
-        return Normalized { body, collapse: false };
+        return Normalized { body, collapse: false, chat: None };
     }
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
-        return Normalized { body, collapse: false };
+        return Normalized { body, collapse: false, chat: None };
     };
     let yes = Some(&serde_json::Value::Bool(true));
     let no = Some(&serde_json::Value::Bool(false));
     let collapse = obj.get("stream") != yes;
     if !collapse && obj.get("store") == no {
         // 两项已经都对：不重新序列化（也就不会顺手改掉字段顺序）。
-        return Normalized { body, collapse };
+        return Normalized { body, collapse, chat: None };
     }
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
-        Ok(v) => Normalized { body: Bytes::from(v), collapse },
+        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None },
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
-        Err(_) => Normalized { body, collapse },
+        Err(_) => Normalized { body, collapse, chat: None },
     }
 }
 
@@ -499,6 +626,40 @@ fn passthrough(status: StatusCode, headers: &wreq::header::HeaderMap, body: Byte
         builder = builder.header(name.as_str(), value.as_bytes());
     }
     builder.body(Body::from(body)).unwrap_or_else(|e| internal_error_plain(&e.to_string()))
+}
+
+/// 非 2xx 的上游响应交回客户端时的形态。
+///
+/// Responses 那条原样交回。chat 那条要把错误体重塑成 OpenAI 的 `{"error":{…}}` 信封：
+/// 上游的错误形状不止一种（实测见过 `{"error":{…}}`、`{"detail":"Unsupported parameter: …"}`，
+/// CDN 的 HTML 拦截页也算一种），而 Chat Completions 客户端只认 `error.message`——拿到别的
+/// 形状它显示的是一句空错误，用户看到「请求失败」四个字，指不到病因上。
+///
+/// 已经是那个形状的原样放过：上游自己的错误体还带 `param`/`code` 这些更细的线索，
+/// 重塑一遍只会把它们丢掉。
+fn error_passthrough(
+    status: StatusCode,
+    headers: &wreq::header::HeaderMap,
+    bytes: Bytes,
+    chat: Option<&ChatMode>,
+) -> Response {
+    if chat.is_none() || is_openai_error_shape(&bytes) {
+        return passthrough(status, headers, bytes);
+    }
+    let (etype, message) = parse_upstream_error(&bytes);
+    let body = error_body(etype.as_deref().unwrap_or("upstream_error"), &truncate(&message));
+    let mut resp = passthrough(status, headers, Bytes::from(body));
+    // 体换过了，`content-type` 得跟着换——上游那头可能说的是 `text/html`。
+    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp
+}
+
+/// 这段响应体是不是已经是 OpenAI 的错误信封（`{"error":{"message":"…"}}`）。
+fn is_openai_error_shape(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v.pointer("/error/message").map(|m| m.is_string()))
+        .unwrap_or(false)
 }
 
 /// 造一个 OpenAI 形态的错误响应体。
@@ -672,13 +833,30 @@ pub struct UsageSniffer {
 }
 
 /// 一次响应报告的 token 用量。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: i64,
     pub cached_tokens: i64,
     pub output_tokens: i64,
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
+}
+
+impl Usage {
+    /// 从 Responses 的 `usage` 对象里读数。
+    ///
+    /// 嗅探（落库计价）与 chat 聚合（回给客户端的 usage）读的是同一份字段，故只留这一处：
+    /// 各写一遍的话，上游哪天改了字段名只会改到其中一处，而两边的数字从此各说各话。
+    pub fn from_json(u: &serde_json::Value) -> Self {
+        let n = |p: &str| u.pointer(p).and_then(|x| x.as_i64()).unwrap_or(0);
+        Self {
+            input_tokens: n("/input_tokens"),
+            cached_tokens: n("/input_tokens_details/cached_tokens"),
+            output_tokens: n("/output_tokens"),
+            reasoning_tokens: n("/output_tokens_details/reasoning_tokens"),
+            total_tokens: n("/total_tokens"),
+        }
+    }
 }
 
 /// 单行 SSE `data:` 的长度上限。超过就丢弃这一行——正常的事件行是几 KB 级别，
@@ -718,14 +896,7 @@ impl UsageSniffer {
             self.model = Some(m.to_owned());
         }
         if let Some(u) = resp.get("usage").filter(|u| u.is_object()) {
-            let n = |p: &str| u.pointer(p).and_then(|x| x.as_i64()).unwrap_or(0);
-            self.usage = Some(Usage {
-                input_tokens: n("/input_tokens"),
-                cached_tokens: n("/input_tokens_details/cached_tokens"),
-                output_tokens: n("/output_tokens"),
-                reasoning_tokens: n("/output_tokens_details/reasoning_tokens"),
-                total_tokens: n("/total_tokens"),
-            });
+            self.usage = Some(Usage::from_json(u));
         }
     }
 }
@@ -796,6 +967,14 @@ fn log_usage(
     started: Instant,
     usage: Option<Usage>,
 ) {
+    // 与流式那条路同一套计价（见 UsageLogGuard::drop）。非流式路径也会带回真实用量——
+    // 只在错误路径上是 None——漏了这一步，收拢与 chat 那两条路的花费会永远是空。
+    let cost = match (&model, usage) {
+        (Some(m), Some(u)) => {
+            crate::pricing::estimate_usd(m, u.input_tokens, u.cached_tokens, u.output_tokens)
+        }
+        _ => None,
+    };
     let rec = UsageRecord {
         cred_id: Some(cred.id),
         cred_label: cred.label.clone(),
@@ -812,7 +991,7 @@ fn log_usage(
         total_tokens: usage.map(|u| u.total_tokens),
         ttft_ms: None,
         total_ms: Some(started.elapsed().as_millis() as i64),
-        cost_usd: None,
+        cost_usd: cost,
         quota: Some(quota.clone()),
     };
     spawn_usage_log(state.store.clone(), rec);
@@ -964,6 +1143,201 @@ pub async fn list_models(
         "fetched the upstream model list"
     );
     Ok(models)
+}
+
+// ---------- OpenAI 形态的模型清单 ----------
+
+/// 清单缓存的有效期。
+///
+/// OpenAI 兼容客户端里有一类每开一个会话就取一次清单，而上游那份几分钟内不会变。缓存太短
+/// 等于每次都替客户端跑一趟上游，太长又会让刚上新的模型迟迟不出现。
+const MODEL_LIST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 取清单最多换几个号。
+///
+/// 一个号最多等 [`MODEL_LIST_TIMEOUT`]，而这条请求是客户端在打开模型下拉时等着——把所有号
+/// 轮一遍等于让它干等一分多钟，那头早就超时了。
+const MODEL_LIST_MAX_CREDS: usize = 3;
+
+/// `/v1/models` 的清单缓存：取到的时刻 + 模型 slug 列表。
+pub type ModelListCache = Arc<parking_lot::Mutex<Option<(Instant, Vec<String>)>>>;
+
+/// 这条请求是不是「OpenAI 兼容客户端在问有哪些模型」。判据见 [`openai_model_list`] 的注。
+fn wants_openai_model_list(path: &str, method: &Method, uri: &Uri) -> bool {
+    method == Method::GET
+        && path.trim_start_matches('/') == config::MODELS_PATH
+        && !uri.query().unwrap_or_default().contains("client_version")
+}
+
+/// `GET models` 的 OpenAI 兼容应答；不是这条路径就回 `None`，由转发照旧处理。
+///
+/// 上游的 `models` 端点讲的是 codex 自己那套：要求带 `client_version` 查询参数（缺了回 400
+/// `Field required`），返回 `{"models":[{slug,…}]}`。OpenAI 兼容客户端两头都不对——它不带那个
+/// 参数，也只认 `{"object":"list","data":[{id,…}]}`，所以原样透传的结果是一个 400 加一个空的
+/// 模型下拉。这一层把两边接上。
+///
+/// **带 `client_version` 的请求不接管**：那是 codex CLI 在取它自己缓存的那份清单
+/// （`~/.codex/models_cache.json`），要的是上游原样的形态，连每个模型几 KB 的
+/// `instructions_template` 一起。翻成 OpenAI 形态等于把它要的东西删掉，而这个参数正好是
+/// 「谁在问」的可靠判据——上游要求它必须有，所以 codex 那条一定带、别人一定不带。
+async fn openai_model_list(
+    state: &AppState,
+    path: &str,
+    method: &Method,
+    uri: &Uri,
+) -> Option<Response> {
+    if !wants_openai_model_list(path, method, uri) {
+        return None;
+    }
+
+    if let Some(slugs) = cached_model_slugs(state, MODEL_LIST_CACHE_TTL) {
+        return Some(model_list_response(&slugs));
+    }
+    Some(match fetch_model_slugs(state).await {
+        Ok(slugs) => {
+            *state.models_cache.lock() = Some((Instant::now(), slugs.clone()));
+            model_list_response(&slugs)
+        }
+        // 取不到时把上一份（哪怕已经过期）交出去：回错误的表现就是客户端那个空下拉框，
+        // 而几分钟前的清单几乎肯定还是对的。真出了状况，下一条真实请求会如实报出来。
+        Err(e) => match cached_model_slugs(state, std::time::Duration::MAX) {
+            Some(slugs) => {
+                tracing::warn!(
+                    error = %format!("{:#}", e.inner()),
+                    count = slugs.len(),
+                    "could not refresh the model list, serving the cached one"
+                );
+                model_list_response(&slugs)
+            }
+            None => {
+                tracing::warn!(
+                    error = %format!("{:#}", e.inner()),
+                    "could not fetch the model list"
+                );
+                e.into_response()
+            }
+        },
+    })
+}
+
+/// 取清单失败的两种成因。
+///
+/// 分开是因为交给客户端的形状不一样：一个号都挑不出来是 coban 这边的状态（没号、全禁用、
+/// 全在冷却），该与转发路径报同一个 503/429；号挑出来了却取不到，才是上游或出站链路的问题。
+/// 混成一种的表现是「一台还没添加账号的 coban 报 502 上游错误」——把人引去查网络。
+enum ModelListError {
+    NoCredential(anyhow::Error),
+    Upstream(anyhow::Error),
+}
+
+impl ModelListError {
+    fn inner(&self) -> &anyhow::Error {
+        match self {
+            Self::NoCredential(e) | Self::Upstream(e) => e,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        match self {
+            // 选号失败的翻译与转发路径共用一份：AllRateLimited 要带 Retry-After。
+            Self::NoCredential(e) => select_error_response(&e),
+            Self::Upstream(e) => {
+                error_response(StatusCode::BAD_GATEWAY, "upstream_error", format!("{e:#}"))
+            }
+        }
+    }
+}
+
+/// 缓存里那份清单，`ttl` 之内才算有效（传 [`std::time::Duration::MAX`] 则不论新旧都要）。
+fn cached_model_slugs(state: &AppState, ttl: std::time::Duration) -> Option<Vec<String>> {
+    let cache = state.models_cache.lock();
+    let (at, slugs) = cache.as_ref()?;
+    (at.elapsed() < ttl).then(|| slugs.clone())
+}
+
+/// 挑个号去取清单，这个号取不到就换下一个。
+///
+/// 换号的理由与转发那条路一样：清单走的是**这个账号**的出站链路与身份，一个配了坏代理或
+/// refresh_token 已废的号取不到，不代表别的号也取不到。
+///
+/// 空清单当失败：一份取回来是零个模型的清单，缓存下来就是五分钟的空下拉框，还不如换个号
+/// 再问一次。
+async fn fetch_model_slugs(state: &AppState) -> Result<Vec<String>, ModelListError> {
+    let mut tried: Vec<i64> = Vec::new();
+    let mut last: Option<anyhow::Error> = None;
+    for _ in 0..MODEL_LIST_MAX_CREDS {
+        let cred = match state.store.select(&tried) {
+            Ok(c) => c,
+            // 挑不出号时，已经试过号的话报那个更贴近真相的错，一次都没试过才报选号本身的错。
+            Err(e) => {
+                return Err(match last {
+                    Some(e) => ModelListError::Upstream(e),
+                    None => ModelListError::NoCredential(e),
+                });
+            }
+        };
+        tried.push(cred.id);
+        // 这里不占 RPM 名额：取清单是个 GET，不产生 token 也不写流水（见 list_models），
+        // 拿它去扣一个转发名额等于让客户端的模型下拉挤掉一次真实请求。
+        match list_models(state, &cred).await {
+            Ok(models) => {
+                // 只列 `visibility != hide` 的：`hide` 那些照样调得通，但会被上游解析成
+                // 别的模型（见 UpstreamModel::visibility），摆进客户端的下拉里等于列一排
+                // 选了不算的名字。字段缺失时保留——上游哪天改了字段名，宁可多列几个也不
+                // 要交出一份空清单。设置页的下拉用的是同一条规则。
+                let slugs: Vec<String> = models
+                    .into_iter()
+                    .filter(|m| m.visibility.as_deref() != Some("hide"))
+                    .map(|m| m.slug)
+                    .collect();
+                if slugs.is_empty() {
+                    last = Some(anyhow::anyhow!(
+                        "credential {} sees no usable model in the upstream list",
+                        cred.id
+                    ));
+                    continue;
+                }
+                return Ok(slugs);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    cred_id = cred.id,
+                    error = %format!("{e:#}"),
+                    "fetching the model list failed, trying the next credential"
+                );
+                last = Some(e);
+            }
+        }
+    }
+    Err(ModelListError::Upstream(
+        last.unwrap_or_else(|| anyhow::anyhow!("no credential could fetch the model list")),
+    ))
+}
+
+/// 造 `{"object":"list","data":[{id,object,created,owned_by}]}`。
+///
+/// `created` 报当下：上游不给模型的发布时间，而这个字段有客户端会显示——留 0 的话那里
+/// 写着 1970 年。
+fn model_list_response(slugs: &[String]) -> Response {
+    let now = crate::credentials::now_secs();
+    let data: Vec<serde_json::Value> = slugs
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": now,
+                "owned_by": "openai",
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({ "object": "list", "data": data }))
+        .unwrap_or_else(|_| error_body("internal_error", "failed to serialize the model list"));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|e| internal_error_plain(&e.to_string()))
 }
 
 // ---------- 连通性测试 ----------
@@ -1713,6 +2087,70 @@ mod tests {
         let inc =
             "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n";
         assert_eq!(sse_final_response(inc.as_bytes()).unwrap()["status"], "incomplete");
+    }
+
+    /// 线格式按来访路径分道：chat 的要翻译并改打 `responses`，其余走钉字段那条。
+    #[test]
+    fn the_wire_format_is_decided_by_the_incoming_path() {
+        let chat_body = Bytes::from_static(
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        );
+        // 两种路径写法（`/v1/chat/completions` 与根上的 `/chat/completions`）都要认出来。
+        for path in ["chat/completions", "/chat/completions"] {
+            let n = plan_request(path, chat_body.clone()).expect("translates");
+            assert!(n.chat.is_some(), "{path} 应走 chat 翻译");
+            assert!(!n.collapse, "客户端要了流就照流回");
+            let v: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
+            assert!(v.get("messages").is_none(), "翻完的体里不该再有 chat 的字段");
+            assert_eq!(v["input"][0]["role"], "user");
+        }
+        // 客户端没要流 → 与 responses 那条路同一个 collapse 语义。
+        let n = plan_request(
+            "chat/completions",
+            Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#),
+        )
+        .unwrap();
+        assert!(n.collapse);
+
+        // responses 那条不受影响，也不会被当成 chat。
+        let n = plan_request("responses", Bytes::from_static(br#"{"model":"m"}"#)).unwrap();
+        assert!(n.chat.is_none());
+        // 形状错误在这一层就拒，不送去上游换一句指不到原因的 400。
+        assert!(plan_request("chat/completions", Bytes::from_static(b"{}")).is_err());
+    }
+
+    /// 只有「OpenAI 兼容客户端问模型」那一种请求才接管，codex CLI 那条必须放过去。
+    #[test]
+    fn only_the_openai_shaped_model_request_is_intercepted() {
+        let want = |p: &str, m: Method, q: &str| {
+            let uri: Uri = format!("http://x/v1/{p}{q}").parse().unwrap();
+            wants_openai_model_list(p, &m, &uri)
+        };
+        assert!(want("models", Method::GET, ""));
+        // 前导斜杠仍要认出是 models。
+        assert!(want("/models", Method::GET, ""));
+        // codex CLI 取的是它自己那份缓存清单（要 instructions_template），不能翻。
+        assert!(!want("models", Method::GET, "?client_version=0.148.0"));
+        // 别的路径、别的方法都不是这条路。
+        assert!(!want("responses", Method::GET, ""));
+        assert!(!want("models", Method::POST, ""));
+    }
+
+    /// 交出去的必须是 `{"object":"list","data":[…]}`——客户端只认这个形状，别的形状
+    /// 表现就是一个空的模型下拉。
+    #[tokio::test]
+    async fn the_model_list_is_openai_shaped() {
+        let resp = model_list_response(&["gpt-5.4-codex".to_owned(), "gpt-5.4".to_owned()]);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"][0]["id"], "gpt-5.4-codex");
+        assert_eq!(v["data"][0]["object"], "model");
+        assert_eq!(v["data"][1]["id"], "gpt-5.4");
+        assert!(v["data"][0]["created"].as_i64().unwrap() > 0, "留 0 会被显示成 1970 年");
     }
 
     fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
