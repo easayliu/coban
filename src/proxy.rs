@@ -303,6 +303,9 @@ async fn forward_once(
 /// 让它读一堆读不懂的 `data:` 行。
 ///
 /// 代价是这条路径不再是流式的：整段响应读完才回。要延迟就该在请求里写 `stream: true`。
+///
+/// 终局那个对象**不能原样交出去**：它的 `output` 是空的，正文只在增量事件里
+/// （见 [`fill_missing_output`]）。
 #[allow(clippy::too_many_arguments)]
 async fn collapse_upstream(
     state: &AppState,
@@ -378,13 +381,14 @@ async fn collapse_upstream(
             }
         },
         None => {
-            let Some(resp) = sse_final_response(&bytes) else {
+            let Some(mut resp) = sse_final_response(&bytes) else {
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "upstream_error",
                     "the upstream stream ended without a completed response",
                 );
             };
+            fill_missing_output(&mut resp, &bytes);
             serde_json::to_vec(&resp).unwrap_or_else(|_| {
                 error_body("internal_error", "failed to serialize the response")
             })
@@ -1971,7 +1975,8 @@ fn sse_failure(bytes: &[u8]) -> Option<(Option<String>, String)> {
 
 /// 在一段 SSE 里找终局的 `response` 对象（`response.completed` / `response.incomplete`）。
 ///
-/// 这就是同一次请求在非流式下本该返回的那个体，所以收拢流时直接把它交出去。取最后一个：
+/// 这是同一次请求在非流式下该返回的那个体的**骨架**——id、status、model、usage、各项参数
+/// 的回显都在里面，但 `output` 是空的，还要 [`fill_missing_output`] 补一道。取最后一个：
 /// 一段流里只会有一个终局事件，但真出现两个时后者才是终值。
 ///
 /// 先用一次廉价的子串判断挡掉增量文本事件，只有可能是终局的才付一次 JSON 解析——逐行解析
@@ -1997,6 +2002,65 @@ fn sse_final_response(bytes: &[u8]) -> Option<serde_json::Value> {
         }
     }
     out
+}
+
+/// 给终局对象补上 `output`——**上游那个终局 `response` 的 `output` 是空数组**。
+///
+/// 实测：同一次请求的流里，正文只存在于 `response.output_text.delta` 与
+/// `response.output_item.done` 事件，而 `response.completed` 携带的那个 `response` 对象
+/// `"output": []`、`usage` 却记着真实的 output token 数。原样交出去的后果是**每个不开流的
+/// Responses 客户端都拿到一个 200 加一句空回答**——而 200 不会触发任何一层重试，客户端那头
+/// 看到的是「模型什么都没说」。
+///
+/// 只在 `output` 缺失或为空时补：上游哪天开始自己填了，这里就一个字都不动。
+fn fill_missing_output(resp: &mut serde_json::Value, bytes: &[u8]) {
+    let filled =
+        resp.get("output").and_then(|o| o.as_array()).is_some_and(|items| !items.is_empty());
+    if filled {
+        return;
+    }
+    let items = sse_output_items(bytes);
+    // 一条都没收集到（如流在第一个 item 之前就断了）：保持原样，不拿一个空数组去盖掉
+    // 上游本来的写法（可能是缺这个字段，也可能是 `null`）。
+    if items.is_empty() {
+        return;
+    }
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert("output".to_owned(), serde_json::Value::Array(items));
+    }
+}
+
+/// 把一段 SSE 里的 `response.output_item.done` 收成 `output` 数组，按 `output_index` 排序。
+///
+/// **取 `item.done` 而不是自己从 delta 拼**：`item` 是上游给的完整条目，`message`、
+/// `reasoning`、`function_call` 各自的形状（id、status、`content` 的注解、推理的
+/// `encrypted_content`）都一字不差地带着。照 delta 拼的话，每多一种条目类型就要多猜一次它
+/// 的形状，而猜错的表现是客户端拿到一个形状对不上的 `output`——比空数组更难查。
+///
+/// 同一个 `output_index` 出现两次时后到的排在后面（`sort_by_key` 是稳定排序）；没带
+/// `output_index` 的按到达顺序排在当前末尾。
+fn sse_output_items(bytes: &[u8]) -> Vec<serde_json::Value> {
+    const DONE: &str = "response.output_item.done";
+    let text = String::from_utf8_lossy(bytes);
+    let mut items: Vec<(i64, serde_json::Value)> = Vec::new();
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        // 同 [`sse_final_response`]：先用一次廉价的子串判断挡掉增量事件，一次长回复的
+        // delta 有上千行，逐行解 JSON 是白花的 CPU。
+        if !data.contains(DONE) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some(DONE) {
+            continue;
+        }
+        let Some(item) = v.get("item").filter(|i| i.is_object()) else { continue };
+        let idx = v.get("output_index").and_then(|i| i.as_i64()).unwrap_or(items.len() as i64);
+        items.push((idx, item.clone()));
+    }
+    items.sort_by_key(|(idx, _)| *idx);
+    items.into_iter().map(|(_, item)| item).collect()
 }
 
 /// 错误原文截断到 [`PROBE_ERROR_MAX_LEN`] 个**字符**（不是字节——按字节切会把多字节
@@ -2303,6 +2367,71 @@ mod tests {
         let inc =
             "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n";
         assert_eq!(sse_final_response(inc.as_bytes()).unwrap()["status"], "incomplete");
+    }
+
+    /// 终局对象的 `output` 是空的（上游实测就这样），得从 `output_item.done` 补回来——
+    /// 否则每个不开流的 Responses 客户端都拿到一个 200 加一句空回答。
+    #[test]
+    fn an_empty_output_is_refilled_from_the_item_events() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+            "\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[]}}\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",",
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"Hi!\"}]}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",",
+            "\"status\":\"completed\",\"output\":[],\"usage\":{\"output_tokens\":7}}}\n",
+        );
+        let mut v = sse_final_response(sse.as_bytes()).unwrap();
+        fill_missing_output(&mut v, sse.as_bytes());
+        // 补的是上游给的完整条目，不是自己从 delta 拼的一个形状。
+        assert_eq!(v["output"][0]["id"], "msg_1");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert_eq!(v["output"][0]["role"], "assistant");
+        assert_eq!(v["output"][0]["content"][0]["text"], "Hi!");
+        // 骨架上的别的字段一个不动。
+        assert_eq!(v["id"], "resp_1");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["usage"]["output_tokens"], 7);
+        // `added` 那条（`content` 还是空的）不能被当成条目收进去。
+        assert_eq!(v["output"].as_array().unwrap().len(), 1);
+    }
+
+    /// 补 `output` 是**兜底**：上游哪天自己填了，或者一条都收集不到，都不许乱动。
+    #[test]
+    fn refilling_output_only_happens_when_it_is_actually_missing() {
+        let item = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"id\":\"msg_2\",\"type\":\"message\"}}\n"
+        );
+        // 上游自己填了：一个字不动。
+        let mut v = serde_json::json!({ "output": [{ "id": "upstream" }] });
+        fill_missing_output(&mut v, item.as_bytes());
+        assert_eq!(v["output"][0]["id"], "upstream");
+        // 一条都收集不到：保持原样，不拿空数组去盖掉上游本来的写法。
+        let mut v = serde_json::json!({ "status": "completed" });
+        fill_missing_output(&mut v, b"data: {\"type\":\"response.output_text.delta\"}\n");
+        assert!(v.get("output").is_none());
+    }
+
+    /// 条目按 `output_index` 归位：推理与正文分两条出来时，顺序错了客户端读到的就是倒着的
+    /// 一段对话。
+    #[test]
+    fn output_items_are_ordered_by_their_index() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,",
+            "\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\"}}\n",
+        );
+        let items = sse_output_items(sse.as_bytes());
+        assert_eq!(items[0]["id"], "rs_1", "index 0 的排在前面，哪怕它后到");
+        assert_eq!(items[1]["id"], "msg_1");
+        // 裸的同名字符串骗不过它（子串预判之后还有一次 type 校验）。
+        let fake = "data: {\"type\":\"response.output_text.delta\",\
+                    \"delta\":\"response.output_item.done\"}\n";
+        assert!(sse_output_items(fake.as_bytes()).is_empty());
     }
 
     /// 线格式按来访路径分道：chat 的要翻译并改打 `responses`，其余走钉字段那条。
