@@ -154,10 +154,35 @@ struct Lease {
     at: Instant,
 }
 
+/// 一个会话键在租约表里的状态。给缓存未命中归因用（见 [`CredentialStore::lease_state`]）:
+/// 「这个键以前见过吗、当时在哪个号上」正是把「换号了」和「上游那边自己凉了」分开的依据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    /// 租约机制被关掉了（`session_lease_secs = 0`）——归因也就无从谈起。
+    Off,
+    /// 从没见过这个键（或者条目已经被 GC 掉了）。
+    Absent,
+    /// 见过，但租约已经过期：会话停得太久。
+    Expired(i64),
+    /// 租约有效，指向这个号。
+    Live(i64),
+}
+
 impl SessionLeases {
     fn get(&self, key: &str, ttl: Duration) -> Option<i64> {
         let map = self.map.lock();
         map.get(key).filter(|l| l.at.elapsed() < ttl).map(|l| l.cred_id)
+    }
+
+    /// 同 [`Self::get`]，但**过期与从没见过要分开报**：这两种情况在归因上是两回事，
+    /// 前者是「会话停太久」，后者是「客户端换了前缀」。
+    fn state(&self, key: &str, ttl: Duration) -> LeaseState {
+        let map = self.map.lock();
+        match map.get(key) {
+            None => LeaseState::Absent,
+            Some(l) if l.at.elapsed() < ttl => LeaseState::Live(l.cred_id),
+            Some(l) => LeaseState::Expired(l.cred_id),
+        }
     }
 
     /// 续约。顺手做惰性 GC——**只在表要涨过上限时扫**，稳态下这是每条请求都走的热路径。
@@ -260,7 +285,15 @@ pub fn effective_rpm_limit(cred_limit: i64, default_limit: i64) -> i64 {
 pub struct UsageRecord {
     pub cred_id: Option<i64>,
     pub cred_label: String,
+    /// 这条请求**实际用的会话键**：客户端自报的会话头优先，没有就是前缀指纹
+    /// （见 [`crate::proxy`] 的 `prefix_fingerprint`）。
+    ///
+    /// 原来只记客户端自报的那个头，而实测三个真实 codex 客户端一个都不发——于是这一列
+    /// 基本全空，一次缓存未命中归不到任何一条会话上。记实际用的那个键才有归因可言。
     pub session_id: Option<String>,
+    /// 这条请求的缓存结局与未命中的原因，见 [`crate::proxy`] 的 `cache_reason`。
+    /// `None` = 这条请求没有会话身份（`models` 那类）。
+    pub cache_reason: Option<&'static str>,
     pub model: Option<String>,
     pub path: String,
     /// 来访客户端自报的 UA（已截断）。
@@ -344,6 +377,33 @@ impl QuotaSnapshot {
     }
 }
 
+/// 额度重置券的一次读数（见 [`crate::quota_reset`]）。
+///
+/// 与 [`QuotaSnapshot`] 是两件事：那份是「额度用了多少」，随每条转发响应顺带更新；这份是
+/// 「还能把额度重置几次」，只有人点了查询/重置才会去问上游。所以它自带 `fetched_at`
+/// 而不是跟着 `snapshot_ts` 走——两个读数的新鲜度差得很远，共用一个时刻会把一份三天前的
+/// 张数标成「刚刚」。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ResetCredits {
+    /// 还能重置几次。
+    pub available_count: i64,
+    /// 每张券的过期时刻（上游给的原串，多为 RFC3339）。
+    ///
+    /// **原样存、原样转出，后端不解析**：格式见过带毫秒与不带的两种，而这里唯一的用途是
+    /// 显示，浏览器的 `Date` 认得比手写的解析器全。也因此**不按过期时刻自动作废**——
+    /// 界面标出读数时刻，和额度快照同一套办法（见 [`Self::fetched_at`]）。
+    pub expires_at: Vec<String>,
+    /// 这份读数是什么时候取的（Unix 秒）。界面据此说明「这是什么时候的数」。
+    pub fetched_at: u64,
+}
+
+impl ResetCredits {
+    /// 记一份「此刻取到的」读数。
+    pub fn new(available_count: i64, expires_at: Vec<String>) -> Self {
+        Self { available_count, expires_at, fetched_at: crate::credentials::now_secs() }
+    }
+}
+
 /// 一条用量流水（发给前端）。
 #[derive(Debug, serde::Serialize)]
 pub struct UsageLog {
@@ -351,7 +411,10 @@ pub struct UsageLog {
     pub ts: i64,
     pub cred_id: Option<i64>,
     pub cred_label: String,
+    /// 这条请求实际用的会话键（见 [`UsageRecord::session_id`]）。
     pub session_id: Option<String>,
+    /// 缓存结局 / 未命中原因（见 [`UsageRecord::cache_reason`]）。
+    pub cache_reason: Option<String>,
     pub model: Option<String>,
     pub path: String,
     /// 来访客户端自报的 UA（已截断）。认「谁在发」用它。
@@ -401,6 +464,21 @@ pub struct CacheBucket {
     pub cached_tokens: i64,
 }
 
+/// 一类缓存结局在某段时间里的合计。见 [`CredentialStore::cache_reasons`]。
+///
+/// **三个数一起给，而且以 `input_tokens` 为主**：按请求条数排出来的原因榜是骗人的——
+/// 一条 200K 前缀的对话未命中，和一条 2K 的小请求未命中，在账单上差一百倍，而按条数看
+/// 它们各占一条。要判断「先修哪个」，看的是这一类原因白付了多少输入 token。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheReasonStat {
+    /// 原因标识（见 [`crate::proxy`] 的 `cache_reason`）；旧行与无会话身份的行归到
+    /// `unattributed`。
+    pub reason: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub cached_tokens: i64,
+}
+
 /// 一个额度窗口的**当前周期内**已经发生了什么。
 ///
 /// 与终身账本（[`CredentialStats`] 上那几个 `*_total`）互补：账号跑了多久是一回事，
@@ -435,6 +513,9 @@ pub struct CredentialStats {
     pub output_tokens_total: i64,
     pub snapshot_ts: Option<i64>,
     pub quota: Option<QuotaSnapshot>,
+    /// 额度重置券的最新读数。`None` = 这个号还没查过（**不是「没有券」**——两者界面上
+    /// 必须分开：前者点一下就知道，后者是已知事实）。
+    pub reset_credits: Option<ResetCredits>,
     /// 主/次额度窗口**当前周期内**的用量。上游没报这个窗口（没有重置时刻或窗口长度为 0）
     /// 时为 `None`——与「这个周期里一条都没跑」（各项为 0）是两件事，界面必须分开显示。
     pub primary_window: Option<WindowUsage>,
@@ -552,7 +633,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             total_ms       INTEGER,
             cost_usd       REAL,
             -- 上游限流头的原始快照（JSON，见 QuotaSnapshot）。字段变化时仍可回看。
-            quota_raw      TEXT
+            quota_raw      TEXT,
+            -- 缓存结局 / 未命中原因（见 proxy::cache_reason）。NULL = 这条请求没有会话身份。
+            cache_reason   TEXT
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts ON usage_logs(ts);
         -- 账号列表的每一项统计都是「按 cred_id 分组、按 ts 卡窗口」。带上 ts 后这些聚合
@@ -573,11 +656,59 @@ fn init_schema(conn: &Connection) -> Result<()> {
             cached_tokens_total INTEGER NOT NULL DEFAULT 0,
             output_tokens_total INTEGER NOT NULL DEFAULT 0,
             snapshot_ts    INTEGER,
-            quota_raw      TEXT
+            quota_raw      TEXT,
+            -- 额度重置券的最新读数（JSON，见 ResetCredits）。与 quota_raw 分开存：
+            -- 那份随每条转发更新，这份只有人点查询/重置时才动，新鲜度不是一回事。
+            reset_credits_raw TEXT
         ) STRICT;",
     )
     .context("failed to initialize credential database schema")?;
     migrate_token_totals(conn)?;
+    migrate_cache_reason(conn)?;
+    migrate_reset_credits(conn)?;
+    Ok(())
+}
+
+/// 给 `credential_stats` 补上 `reset_credits_raw` 列。理由同 [`migrate_token_totals`]。
+///
+/// **不回填**：张数只有向上游问才知道，旧库里没有任何可推的痕迹。留 NULL，界面显示
+/// 「未查询」，点一次查询就有了。
+fn migrate_reset_credits(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('credential_stats') WHERE name = ?1")?
+        .exists(params!["reset_credits_raw"])?;
+    if has_column {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE credential_stats ADD COLUMN reset_credits_raw TEXT;")
+        .context("failed to add reset_credits_raw to credential_stats")?;
+    tracing::info!("schema migrated: credential_stats.reset_credits_raw added");
+    Ok(())
+}
+
+/// 给 `usage_logs` 补上 `cache_reason` 列，以及归因聚合要用的那条索引。
+///
+/// **不回填**：旧行没有归因可言（当时既没记会话键，也没有租约表可以对照），填任何值都是
+/// 编的。旧行留 NULL，聚合那头按「未归因」处理。
+///
+/// **索引也得在这里建，不能写进上面那张建表批里**：老库跑那一批时列还不存在，
+/// `CREATE INDEX ... (ts, cache_reason)` 当场报错，整个 [`init_schema`] 失败、服务起不来。
+/// 建表批里只能出现「新库与老库都成立」的语句。
+fn migrate_cache_reason(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('usage_logs') WHERE name = ?1")?
+        .exists(params!["cache_reason"])?;
+    if !has_column {
+        conn.execute_batch("ALTER TABLE usage_logs ADD COLUMN cache_reason TEXT;")
+            .context("failed to add cache_reason to usage_logs")?;
+        tracing::info!("schema migrated: usage_logs.cache_reason added");
+    }
+    // 归因聚合是「按 ts 卡窗口、按 reason 分组」（见 [`CredentialStore::cache_reasons`]）。
+    // 带上 reason 后它只扫索引，不必为了读一列原因把 30 天的流水整个回表。
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_usage_logs_ts_reason ON usage_logs(ts, cache_reason);",
+    )
+    .context("failed to create the cache_reason index")?;
     Ok(())
 }
 
@@ -1151,6 +1282,20 @@ impl CredentialStore {
         self.leases.get(key, self.lease_ttl()?)
     }
 
+    /// 这个会话键在租约表里的状态。
+    ///
+    /// **必须在选号之前取**：一次成功的转发会把租约续到这次用的号上，之后再读永远是
+    /// 「没换号」，归因就永远看不见换号这一类（见 [`crate::proxy`] 的 `cache_reason`）。
+    pub fn lease_state(&self, key: &str) -> LeaseState {
+        if key.is_empty() {
+            return LeaseState::Absent;
+        }
+        match self.lease_ttl() {
+            None => LeaseState::Off,
+            Some(ttl) => self.leases.state(key, ttl),
+        }
+    }
+
     /// 占一个 RPM 名额。已满时返回 [`RpmLimited`]。
     pub fn take_rpm_slot(&self, cred: &Credential) -> Result<()> {
         let default_rpm = self.get_setting_i64(DEFAULT_RPM_LIMIT, 0);
@@ -1329,8 +1474,8 @@ impl CredentialStore {
             "INSERT INTO usage_logs
                  (cred_id, cred_label, session_id, model, path, ua, status, has_usage,
                   input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens,
-                  ttft_ms, total_ms, cost_usd, quota_raw)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                  ttft_ms, total_ms, cost_usd, quota_raw, cache_reason)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 rec.cred_id,
                 rec.cred_label,
@@ -1349,6 +1494,7 @@ impl CredentialStore {
                 rec.total_ms,
                 rec.cost_usd,
                 quota_raw,
+                rec.cache_reason,
             ],
         )?;
         if let Some(cred_id) = rec.cred_id {
@@ -1411,7 +1557,8 @@ impl CredentialStore {
         let row = conn
             .query_row(
                 "SELECT last_used_at, cost_total_usd, request_total, snapshot_ts, quota_raw,
-                        input_tokens_total, cached_tokens_total, output_tokens_total
+                        input_tokens_total, cached_tokens_total, output_tokens_total,
+                        reset_credits_raw
                  FROM credential_stats WHERE cred_id = ?1",
                 params![cred_id],
                 |r| {
@@ -1424,6 +1571,7 @@ impl CredentialStore {
                         r.get::<_, i64>(5)?,
                         r.get::<_, i64>(6)?,
                         r.get::<_, i64>(7)?,
+                        r.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1437,6 +1585,7 @@ impl CredentialStore {
             input_tokens_total,
             cached_tokens_total,
             output_tokens_total,
+            reset_credits_raw,
         )) = row
         else {
             return Ok(CredentialStats::default());
@@ -1446,6 +1595,8 @@ impl CredentialStore {
         drop(conn);
         // 解不出来就当没有：一条坏掉的快照 JSON 不该让整个账号列表接口 500。
         let quota: Option<QuotaSnapshot> = quota_raw.and_then(|s| serde_json::from_str(&s).ok());
+        let reset_credits: Option<ResetCredits> =
+            reset_credits_raw.and_then(|s| serde_json::from_str(&s).ok());
         let (primary_window, secondary_window) = self.window_usage(cred_id, quota.as_ref())?;
         Ok(CredentialStats {
             last_used_at,
@@ -1456,9 +1607,29 @@ impl CredentialStore {
             output_tokens_total,
             snapshot_ts,
             quota,
+            reset_credits,
             primary_window,
             secondary_window,
         })
+    }
+
+    /// 记下这个号最新的重置券读数（见 [`ResetCredits`]）。
+    ///
+    /// **整份覆盖**，与 [`QuotaSnapshot`] 那种「只覆盖上游真报了的项」不同：券这一族只有
+    /// 一个来源（人点查询时现问的那一次），一次响应说的就是全部，没有「这次没提到的项」
+    /// 可言。
+    ///
+    /// 用 upsert 而不是 UPDATE：一个刚登录、还没跑过任何请求的号在 `credential_stats` 里
+    /// 压根没有行，而「先查一次券」正是这种号的常见第一步操作。
+    pub fn save_reset_credits(&self, cred_id: i64, credits: &ResetCredits) -> Result<()> {
+        let raw = serde_json::to_string(credits)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO credential_stats (cred_id, reset_credits_raw) VALUES (?1, ?2)
+             ON CONFLICT(cred_id) DO UPDATE SET reset_credits_raw = ?2",
+            params![cred_id, raw],
+        )?;
+        Ok(())
     }
 
     /// 两个额度窗口**当前周期内**的请求数 / token / 费用。
@@ -1572,7 +1743,7 @@ impl CredentialStore {
         )?;
 
         let sql = format!(
-            "SELECT id, ts, cred_id, cred_label, session_id, model, path, ua, status,
+            "SELECT id, ts, cred_id, cred_label, session_id, cache_reason, model, path, ua, status,
                     input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens,
                     ttft_ms, total_ms, cost_usd
              FROM usage_logs {where_sql} ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
@@ -1589,18 +1760,19 @@ impl CredentialStore {
                 cred_id: r.get(2)?,
                 cred_label: r.get(3)?,
                 session_id: r.get(4)?,
-                model: r.get(5)?,
-                path: r.get(6)?,
-                ua: r.get(7)?,
-                status: r.get(8)?,
-                input_tokens: r.get(9)?,
-                cached_tokens: r.get(10)?,
-                output_tokens: r.get(11)?,
-                reasoning_tokens: r.get(12)?,
-                total_tokens: r.get(13)?,
-                ttft_ms: r.get(14)?,
-                total_ms: r.get(15)?,
-                cost_usd: r.get(16)?,
+                cache_reason: r.get(5)?,
+                model: r.get(6)?,
+                path: r.get(7)?,
+                ua: r.get(8)?,
+                status: r.get(9)?,
+                input_tokens: r.get(10)?,
+                cached_tokens: r.get(11)?,
+                output_tokens: r.get(12)?,
+                reasoning_tokens: r.get(13)?,
+                total_tokens: r.get(14)?,
+                ttft_ms: r.get(15)?,
+                total_ms: r.get(16)?,
+                cost_usd: r.get(17)?,
             })
         };
         let logs: Vec<UsageLog> = stmt
@@ -1639,6 +1811,38 @@ impl CredentialStore {
         )?;
         let rows = stmt.query_map(params![since, BUCKET_SECS], |r| {
             Ok(CacheBucket { ts: r.get(0)?, input_tokens: r.get(1)?, cached_tokens: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 按「缓存结局」分组合计 `since`（Unix 秒）之后的流水，按白付的输入 token 从多到少排。
+    ///
+    /// 这是命中率那条曲线的下一个问题的答案：曲线只说得出「低了」，这里说的是**为什么低**——
+    /// 是新会话本来就该 miss，还是换号了、客户端每轮在改前缀、或者上游那边自己凉了。
+    /// 各类的含义见 [`crate::proxy`] 的 `cache_reason`。
+    ///
+    /// 排序键是 `input_tokens - cached_tokens`（白付的那部分）而不是条数，理由见
+    /// [`CacheReasonStat`]。`cache_reason` 为 NULL 的行（迁移前的旧流水、`models` 那类没有
+    /// 会话身份的请求）归到 `unattributed`,不悄悄丢掉——那会让百分比加不满 100。
+    pub fn cache_reasons(&self, since: i64) -> Result<Vec<CacheReasonStat>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(cache_reason, 'unattributed') AS reason,
+                    COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(cached_tokens), 0)
+               FROM usage_logs
+              WHERE ts >= ?1
+              GROUP BY reason
+              ORDER BY COALESCE(SUM(input_tokens), 0) - COALESCE(SUM(cached_tokens), 0) DESC",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok(CacheReasonStat {
+                reason: r.get(0)?,
+                requests: r.get(1)?,
+                input_tokens: r.get(2)?,
+                cached_tokens: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1881,6 +2085,157 @@ mod tests {
         assert_eq!(s.select(&[], Some(&key)).unwrap().id, a.id);
         std::thread::sleep(Duration::from_millis(1_100));
         assert_eq!(s.select(&[], Some(&key)).unwrap().id, hashed, "过期后该按会话键现算");
+    }
+
+    /// 租约状态要把「过期」和「从没见过」分开报——归因全靠这个区别（见 `proxy::cache_reason`）。
+    #[test]
+    fn lease_state_tells_expired_apart_from_never_seen() {
+        let s = store();
+        let a = add(&s, "a");
+
+        assert_eq!(s.lease_state("sess-1"), LeaseState::Absent);
+        s.bind_session("sess-1", a.id);
+        assert_eq!(s.lease_state("sess-1"), LeaseState::Live(a.id));
+
+        s.set_setting(SESSION_LEASE_SECS, "1").unwrap();
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert_eq!(s.lease_state("sess-1"), LeaseState::Expired(a.id), "过期不等于没见过");
+
+        // 机制关掉时明确报 Off：那时候归因分不出换号/过期/上游凉了，不该假装分得出。
+        s.set_setting(SESSION_LEASE_SECS, "0").unwrap();
+        assert_eq!(s.lease_state("sess-1"), LeaseState::Off);
+    }
+
+    /// 归因合计按**白付的输入 token**排，不按条数：一条长对话未命中比一堆小请求贵得多。
+    /// `cache_reason` 为空的行归到 `unattributed`，不能悄悄丢掉。
+    #[test]
+    fn cache_reasons_rank_by_wasted_input_tokens() {
+        let s = store();
+        let a = add(&s, "a");
+        let log = |reason: Option<&'static str>, input: i64, cached: i64| {
+            s.insert_usage_log(&UsageRecord {
+                cred_id: Some(a.id),
+                cache_reason: reason,
+                has_usage: true,
+                input_tokens: Some(input),
+                cached_tokens: Some(cached),
+                ..Default::default()
+            })
+            .unwrap();
+        };
+        // 条数最多但每条都很小：按条数排它该第一，按白付 token 排它该垫底。
+        for _ in 0..20 {
+            log(Some("first_turn"), 200, 0);
+        }
+        log(Some("new_prefix"), 180_000, 0);
+        log(Some("hit"), 100_000, 96_000);
+        log(None, 5_000, 0);
+
+        let stats = s.cache_reasons(0).unwrap();
+        let order: Vec<&str> = stats.iter().map(|r| r.reason.as_str()).collect();
+        assert_eq!(order, vec!["new_prefix", "unattributed", "hit", "first_turn"], "{stats:?}");
+
+        let churn = &stats[0];
+        assert_eq!(churn.requests, 1);
+        assert_eq!(churn.input_tokens, 180_000);
+        assert_eq!(churn.cached_tokens, 0);
+        // 只有 4 个桶：20 条 first_turn 合成一行。
+        assert_eq!(stats.len(), 4);
+        assert_eq!(stats.iter().map(|r| r.requests).sum::<i64>(), 23);
+    }
+
+    /// 旧库补 `cache_reason` 列：**不回填**（旧行没有归因可言），补完老流水仍读得出来。
+    #[test]
+    fn migration_adds_cache_reason_without_backfilling() {
+        let s = store();
+        let a = add(&s, "a");
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(a.id),
+            cache_reason: Some("hit"),
+            has_usage: true,
+            input_tokens: Some(1_000),
+            cached_tokens: Some(900),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // 退回迁移前的形状（列与索引都去掉）再跑一次建表/迁移。**索引也要去掉**：
+        // 真正的老库里它压根不存在，而留着它 DROP COLUMN 就会失败——那样测的就不是老库了。
+        {
+            let conn = s.conn.lock();
+            conn.execute_batch(
+                "DROP INDEX idx_usage_logs_ts_reason;
+                 ALTER TABLE usage_logs DROP COLUMN cache_reason;",
+            )
+            .unwrap();
+            init_schema(&conn).unwrap();
+        }
+
+        let stats = s.cache_reasons(0).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].reason, "unattributed", "旧行不该被编出一个原因来");
+        assert_eq!(stats[0].input_tokens, 1_000);
+
+        // 迁移之后新写的行照常带原因。
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(a.id),
+            cache_reason: Some("rotated"),
+            has_usage: true,
+            input_tokens: Some(2_000),
+            cached_tokens: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        let stats = s.cache_reasons(0).unwrap();
+        assert!(stats.iter().any(|r| r.reason == "rotated"), "{stats:?}");
+    }
+
+    /// 重置券读数：一个**没跑过任何请求**的号也要存得下（那种号在 credential_stats 里
+    /// 压根没有行，而「先查一次券」正是它的常见第一步），且整份覆盖。
+    #[test]
+    fn reset_credit_readings_round_trip_for_a_never_used_credential() {
+        let s = store();
+        let a = add(&s, "a");
+        assert!(s.stats_of(a.id).unwrap().reset_credits.is_none(), "没查过 ≠ 没有券");
+
+        s.save_reset_credits(a.id, &ResetCredits::new(2, vec!["2026-09-01T00:00:00Z".into()]))
+            .unwrap();
+        let read = s.stats_of(a.id).unwrap().reset_credits.unwrap();
+        assert_eq!(read.available_count, 2);
+        assert_eq!(read.expires_at, ["2026-09-01T00:00:00Z"]);
+        assert!(read.fetched_at > 0, "读数时刻要落下来，界面靠它说明新鲜度");
+
+        // 兑掉一张之后的复查：整份覆盖，旧的过期时刻不能留下来凑数。
+        s.save_reset_credits(a.id, &ResetCredits::new(1, Vec::new())).unwrap();
+        let read = s.stats_of(a.id).unwrap().reset_credits.unwrap();
+        assert_eq!(read.available_count, 1);
+        assert!(read.expires_at.is_empty());
+
+        // 账本的其他列不受影响（upsert 建的那一行用的是各自的默认值）。
+        s.insert_usage_log(&UsageRecord { cred_id: Some(a.id), ..Default::default() }).unwrap();
+        let stats = s.stats_of(a.id).unwrap();
+        assert_eq!(stats.request_total, 1);
+        assert_eq!(stats.reset_credits.unwrap().available_count, 1, "落用量不该动券读数");
+    }
+
+    /// 老库补列：`CREATE TABLE IF NOT EXISTS` 不会改已存在的表，靠 ALTER 补。
+    /// **不回填**——张数只有问上游才知道，编不出来。
+    #[test]
+    fn migration_adds_reset_credits_without_backfilling() {
+        let s = store();
+        let a = add(&s, "a");
+        s.save_reset_credits(a.id, &ResetCredits::new(3, Vec::new())).unwrap();
+
+        {
+            let conn = s.conn.lock();
+            conn.execute_batch("ALTER TABLE credential_stats DROP COLUMN reset_credits_raw;")
+                .unwrap();
+            init_schema(&conn).unwrap();
+        }
+
+        assert!(s.stats_of(a.id).unwrap().reset_credits.is_none(), "旧行留空，不编一个张数");
+        s.save_reset_credits(a.id, &ResetCredits::new(1, Vec::new())).unwrap();
+        assert_eq!(s.stats_of(a.id).unwrap().reset_credits.unwrap().available_count, 1);
     }
 
     /// 优先级压过轮换：P0 没打满之前不该碰 P1。

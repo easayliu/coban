@@ -47,6 +47,28 @@ export interface WindowUsage {
   cost_usd: number
 }
 
+/**
+ * 额度重置券的一次读数。
+ *
+ * 上游给订阅账号发的一次性券：额度撞墙之后兑一张，5h/周窗口当场归零，不用等重置时刻。
+ * 与 {@link Quota} 是两件事——那份说「用了多少」，随每条转发顺带更新；这份说「还能重置
+ * 几次」，只有点了查询/重置才去问上游，故自带 `fetched_at`。
+ */
+export interface ResetCredits {
+  /** 还能重置几次。 */
+  available_count: number
+  /**
+   * 每张券的过期时刻（上游给的原串，多为 RFC3339）。
+   *
+   * 后端不解析、原样转出，交给浏览器的 `Date` 认；也因此**不按过期时刻自动作废**，
+   * 界面显示的是「`fetched_at` 那一刻的读数」。可能比 `available_count` 短——上游只在券
+   * 清单那条接口上给过期时刻，退回 `/wham/usage` 时只有总数。
+   */
+  expires_at: string[]
+  /** 这份读数是什么时候取的（Unix 秒）。 */
+  fetched_at: number
+}
+
 /** 每个账号的终身账本。流水会被裁剪，这些数不会。 */
 export interface CredentialStats {
   last_used_at: number | null
@@ -60,6 +82,13 @@ export interface CredentialStats {
   /** 上面那份 quota 是什么时候的读数（Unix 秒）。 */
   snapshot_ts: number | null
   quota: Quota | null
+  /**
+   * 额度重置券的最新读数。
+   *
+   * `null` = **这个号还没查过**，不是「没有券」——两者界面上必须分开：前者点一下查询就
+   * 知道，后者是已知事实。
+   */
+  reset_credits: ResetCredits | null
   /**
    * 主/次额度窗口当前周期内的用量。
    *
@@ -111,7 +140,15 @@ export interface UsageLog {
   ts: number
   cred_id: number | null
   cred_label: string
+  /**
+   * 这条请求实际用的会话键：客户端自报的会话头优先，没有就是请求前缀的指纹。
+   *
+   * 实测三个真实 codex 客户端一个都不发会话头，所以这一列绝大多数是指纹——它同时也是
+   * 「同一段对话」的判据，落点与上游 session 都跟着它走。
+   */
   session_id: string | null
+  /** 这条请求的缓存结局 / 未命中原因；null = 没有会话身份（`models` 那类）。见 `CACHE_REASONS`。 */
+  cache_reason: string | null
   model: string | null
   path: string
   /** 来访客户端自报的 UA（已截断）。 */
@@ -340,6 +377,55 @@ export async function refreshCredential(id: number): Promise<Credential> {
 
 export async function clearCooldown(id: number): Promise<Credential> {
   const { data } = await api.delete(`/credentials/${id}/cooldown`)
+  return data
+}
+
+/**
+ * 查这个号还剩几张额度重置券。
+ *
+ * 后端向上游现问一趟并把读数落库，所以下次进页面卡片上就有数字了。不消耗券、不消耗额度、
+ * 不写用量流水。问不到会抛——张数只能问上游，编一个 0 会被当成「这个号没券」。
+ */
+export async function getResetCredits(id: number): Promise<ResetCredits> {
+  const { data } = await api.get<ResetCredits>(`/credentials/${id}/reset-credits`, {
+    // 后端单条上限 20 秒，两条串起来最多 40 秒；再留 5 秒给本机与代理传输。
+    timeout: 45_000,
+  })
+  return data
+}
+
+/** 一次兑换的结果。 */
+export interface ResetResult {
+  /** 上游给这次兑换的结果码（实测 `success`）。 */
+  code: string | null
+  /** 上游报的「这次重置了几个窗口」。 */
+  windows_reset: number | null
+  /** 被兑掉那张券的过期时刻。 */
+  credit_expires_at: string | null
+  /**
+   * 兑换之后重新查的张数。
+   *
+   * `null` = 复查没成功，**不代表兑换失败**（券已经花掉了）。此时界面该说「已重置，张数待
+   * 刷新」，而不是把兑换前那个旧数字继续摆着。
+   */
+  credits: ResetCredits | null
+  /** 有没有把这个号从限流暂停里放回轮转（false = 它本来就没被暂停）。 */
+  resumed: boolean
+  /** 兑换后的凭证视图：兑换会顺手解除限流暂停与冷却，列表据此立刻摘掉那枚徽章。 */
+  credential: Credential
+}
+
+/**
+ * 兑一张重置券，把这个号的额度窗口重置掉。
+ *
+ * **不可撤销**：券花掉就没有，上游不退，所以调用前要二次确认。成功后后端顺手解除限流
+ * 暂停与冷却（额度重置了却还在暂停里，等于白花一张），人工停用与封号不碰。
+ */
+export async function consumeResetCredit(id: number): Promise<ResetResult> {
+  const { data } = await api.post<ResetResult>(`/credentials/${id}/reset-credits/consume`, undefined, {
+    // 兑换 + 复查两趟上游，给的余量同 getResetCredits。
+    timeout: 45_000,
+  })
   return data
 }
 

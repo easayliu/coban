@@ -3,12 +3,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, CircleCheckIcon, CircleXIcon, GaugeIcon, GlobeIcon, PencilIcon, RefreshCwIcon,
-  ScrollTextIcon, TimerOffIcon, Trash2Icon,
+  RotateCcwIcon, ScrollTextIcon, TicketIcon, TimerOffIcon, Trash2Icon,
 } from 'lucide-react'
 import {
-  clearCooldown, deleteCredential, listCredentialModels, probeCredential, refreshCredential,
-  setDisabled, setLabel, setPriority, setProxy, setRpmLimit,
-  type Credential, type ProbeResult, type Quota, type WindowUsage,
+  clearCooldown, consumeResetCredit, deleteCredential, getResetCredits, listCredentialModels,
+  probeCredential, refreshCredential, setDisabled, setLabel, setPriority, setProxy, setRpmLimit,
+  type Credential, type ProbeResult, type Quota, type ResetCredits, type WindowUsage,
 } from '@/api/credentials'
 import {
   cn, displayCredentialLabel, extractError, formatClockTime, formatCompactNumber, formatCountdown,
@@ -620,8 +620,64 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void) {
     onSuccess: () => { toastManager.add({ title: t('已解除冷却', 'Cooldown cleared'), type: 'success' }); invalidate() },
     onError: (e) => failure(t('解除冷却失败', 'Failed to clear cooldown'), e),
   })
+  // 查重置券张数。**结果同时进 toast 和列表**：后端查到就落库，所以刷新列表之后卡片上
+  // 那枚徽章也会跟着更新；toast 只是让点下去的人当场看到数字，不必再找卡片。
+  const resetCredits = useMutation({
+    mutationFn: () => getResetCredits(cred.id),
+    onSuccess: (credits) => {
+      toastManager.add({
+        title: t(`剩余重置券 ${credits.available_count} 张`, `${credits.available_count} reset credits left`),
+        description: credits.available_count > 0
+          ? undefined
+          : t(
+            '这个号现在没有可兑的券。上游按账号发放，攒到了自会出现',
+            'This account has no redeemable credit right now. The upstream grants them per account',
+          ),
+        type: 'success',
+      })
+      invalidate()
+    },
+    onError: (e) => failure(t('查询重置券失败', 'Failed to read the reset credits'), e),
+  })
+  // 兑一张券。**成功文案要把「券已经花掉」说清楚**：兑换不可撤销，而失败与成功的差别
+  // 在这里值一张券。
+  const consumeReset = useMutation({
+    mutationFn: () => consumeResetCredit(cred.id),
+    onSuccess: (result) => {
+      const left = result.credits?.available_count
+      toastManager.add({
+        title: t('额度已重置', 'Quota reset'),
+        description: [
+          result.windows_reset != null
+            ? t(`重置了 ${result.windows_reset} 个额度窗口`, `${result.windows_reset} quota window(s) reset`)
+            : null,
+          result.resumed ? t('已放回轮转', 'back in the rotation') : null,
+          left != null
+            ? t(`还剩 ${left} 张券`, `${left} credit(s) left`)
+            : t('剩余张数待刷新', 'remaining count needs a refresh'),
+        ].filter(Boolean).join(t('；', '; ')),
+        type: 'success',
+      })
+      invalidate()
+    },
+    // **失败时要提醒「可能已经扣了券」**：兑换请求发出去之后再超时/断链，上游到底扣没扣
+    // 从这一端看不出来，而重试用的是一个新的幂等键——真扣过的话第二次点就是第二张券。
+    onError: (e) => {
+      toastManager.add({
+        title: t('重置额度失败', 'Quota reset failed'),
+        description: [
+          extractError(e, language),
+          t(
+            '若上游已经扣券，重试会再花一张——先「查询重置券」看一眼张数',
+            'If the upstream already spent the credit, retrying spends another — check the reset credits first',
+          ),
+        ].join(t('。', '. ')),
+        type: 'error',
+      })
+    },
+  })
 
-  return { rename, toggle, prio, rpmLimit, proxy, refresh, remove, cooldown }
+  return { rename, toggle, prio, rpmLimit, proxy, refresh, remove, cooldown, resetCredits, consumeReset }
 }
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
@@ -815,13 +871,13 @@ export function QuotaMeter({
 }
 
 /**
- * ⋯ 菜单内容（刷新 / 重命名 / 上限 / 代理 / 删除），卡片与列表共用。
+ * ⋯ 菜单内容（刷新 / 测试 / 重置券 / 重命名 / 上限 / 代理 / 删除），卡片与列表共用。
  *
  * 删除只往外抛意图，确认框由调用方渲染在菜单之外——菜单一关，挂在它里面的弹窗会跟着
  * 卸载，确认框根本来不及显示。
  */
 export function CredentialMenuContent({
-  cred, actions, onRename, onRpmLimit, onProxy, onUsage, onTest, onRequestDelete,
+  cred, actions, onRename, onRpmLimit, onProxy, onUsage, onTest, onRequestReset, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
@@ -830,10 +886,11 @@ export function CredentialMenuContent({
   onProxy: () => void
   onUsage: () => void
   onTest: () => void
+  onRequestReset: () => void
   onRequestDelete: () => void
 }) {
   const { t } = useI18n()
-  const { refresh, cooldown } = actions
+  const { refresh, cooldown, resetCredits } = actions
   return (
     <MenuPopup align="end">
       <MenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
@@ -850,6 +907,16 @@ export function CredentialMenuContent({
           {t('解除冷却', 'Clear cooldown')}
         </MenuItem>
       )}
+      <MenuItem onClick={() => resetCredits.mutate()} disabled={resetCredits.isPending}>
+        <TicketIcon className={resetCredits.isPending ? 'animate-pulse' : undefined} />
+        {t('查询重置券', 'Check reset credits')}
+      </MenuItem>
+      {/* 兑换要二次确认（券花掉就没有），故只抛意图——确认框由调用方渲染在菜单之外，
+          挂在菜单里的话菜单一关它就跟着卸载，根本来不及显示。 */}
+      <MenuItem onClick={onRequestReset}>
+        <RotateCcwIcon />
+        {t('用券重置额度', 'Reset quota with a credit')}
+      </MenuItem>
       <MenuItem onClick={onRename}>
         <PencilIcon />
         {t('重命名', 'Rename')}
@@ -885,6 +952,109 @@ export function DeferredMount({ open, children }: { open: boolean; children: Rea
   const mounted = useRef(false)
   if (open) mounted.current = true
   return mounted.current ? <>{children}</> : null
+}
+
+/**
+ * 重置券那枚徽章要显示什么。
+ *
+ * 三态，界面必须分得开：
+ * - `unknown`：没查过。点一下就知道，所以**不摆徽章**——给每个号挂一枚「未知」等于把
+ *   「还没问」说成一种状态，而卡片上每枚徽章都在抢注意力。
+ * - `none`：查过，确实没券。也不摆——多数订阅号常态如此（同 credits 那枚的理由）。
+ * - `available`：有券，显示张数。
+ */
+export function resetCreditsMeta(
+  credits: ResetCredits | null,
+  language: Language,
+): { count: number; state: 'unknown' | 'none' | 'available'; label: string; title: string } | null {
+  if (!credits) return null
+  const count = credits.available_count
+  const t = (zh: string, en: string) => localize(language, zh, en)
+  const read = t(`${formatFullTime(credits.fetched_at, language)} 的读数`, `read at ${formatFullTime(credits.fetched_at, language)}`)
+  if (count <= 0) {
+    return {
+      count,
+      state: 'none',
+      label: t('无重置券', 'No reset credits'),
+      title: t(`这个号没有可兑的重置券（${read}）`, `No redeemable reset credit on this account (${read})`),
+    }
+  }
+  // 过期时刻可能比张数少——退回 /wham/usage 那条路只给总数（见 ResetCredits.expires_at）。
+  const expiries = credits.expires_at
+    .map((iso) => {
+      const at = Date.parse(iso)
+      return Number.isNaN(at) ? iso : formatFullTime(Math.floor(at / 1000), language)
+    })
+    .join(t('、', ', '))
+  return {
+    count,
+    state: 'available',
+    label: t(`重置券 ${count}`, `${count} reset credits`),
+    title: [
+      t(
+        `还能重置 ${count} 次额度：兑一张，5h / 周窗口当场归零（${read}）`,
+        `${count} quota resets available: redeeming one zeroes the 5h / weekly window immediately (${read})`,
+      ),
+      expiries ? t(`券过期时刻：${expiries}`, `Credit expiry: ${expiries}`) : null,
+    ].filter(Boolean).join(t('。', '. ')),
+  }
+}
+
+/**
+ * 兑券重置额度的确认框。
+ *
+ * **要二次确认的理由只有一个：券花掉就没有**，上游不退，而这个按钮离「刷新 token」只有
+ * 两行。所以这里把代价写在正文里，而不是只问一句「确定吗」。
+ *
+ * 张数显示的是**上一次查询**落下来的读数（可能已经旧了），故一并标出读数时刻；确认按钮
+ * 不因为「本地记着 0 张」而禁用——那份读数可能是三天前的，真正的判决在上游，它会回一句
+ * 说得清楚的错误。
+ */
+export function ResetQuotaDialog({
+  cred, open, onOpenChange, onConfirm, pending,
+}: {
+  cred: Credential
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onConfirm: () => void
+  pending: boolean
+}) {
+  const { t, language } = useI18n()
+  const meta = resetCreditsMeta(cred.stats?.reset_credits ?? null, language)
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogPopup>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{t('用券重置额度', 'Reset quota with a credit')}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {t(
+              `将为「${displayCredentialLabel(cred.label)}」兑掉一张额度重置券：5h / 周窗口当场归零，这个号会立刻放回轮转。券花掉就没有，此操作不可撤销。`,
+              `Redeems one quota reset credit for "${displayCredentialLabel(cred.label)}": the 5h / weekly window is zeroed immediately and the account returns to the rotation. The credit is spent for good — this cannot be undone.`,
+            )}
+            {meta && (
+              <span className="mt-2 block">
+                {meta.state === 'available'
+                  ? t(`上次查询：还剩 ${meta.count} 张。`, `Last check: ${meta.count} credit(s) left.`)
+                  : t('上次查询：没有可兑的券。', 'Last check: no redeemable credit.')}
+                {' '}
+                {t(
+                  `读数取自 ${formatFullTime(cred.stats.reset_credits!.fetched_at, language)}，可能已经变了——最终由上游判定。`,
+                  `That reading is from ${formatFullTime(cred.stats.reset_credits!.fetched_at, language)} and may be stale — the upstream has the final say.`,
+                )}
+              </span>
+            )}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogClose>{t('取消', 'Cancel')}</AlertDialogClose>
+          <Button onClick={onConfirm} disabled={pending}>
+            {pending && <Spinner />}
+            {t('兑券重置', 'Redeem and reset')}
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogPopup>
+    </AlertDialog>
+  )
 }
 
 /** 删除确认框。删除是不可逆的（连带清掉该账号的用量历史），故要求二次确认。 */

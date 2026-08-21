@@ -94,6 +94,7 @@ function credential(
       output_tokens_total: 0,
       snapshot_ts: null,
       quota: null,
+      reset_credits: null,
       primary_window: null,
       secondary_window: null,
       ...stats,
@@ -405,12 +406,32 @@ queryClient.setQueryData(['cache-series', 24], {
 })
 queryClient.setQueryData(['cache-series', 30 * 24], previewCacheSeries)
 
+// 归因分布：预览里要能看见那几根条子，顺序按白付 token 从多到少（后端就是这么排的）。
+const previewCacheReasons = {
+  since: now - 7 * 24 * 3600,
+  reasons: [
+    { reason: 'hit', requests: 1_284, input_tokens: 18_400_000, cached_tokens: 17_120_000 },
+    { reason: 'new_prefix', requests: 46, input_tokens: 1_040_000, cached_tokens: 0 },
+    { reason: 'rotated', requests: 18, input_tokens: 612_000, cached_tokens: 0 },
+    { reason: 'lease_expired', requests: 11, input_tokens: 208_000, cached_tokens: 0 },
+    { reason: 'upstream_cold', requests: 9, input_tokens: 141_000, cached_tokens: 0 },
+    { reason: 'first_turn', requests: 63, input_tokens: 74_000, cached_tokens: 0 },
+    { reason: 'no_usage', requests: 7, input_tokens: 0, cached_tokens: 0 },
+  ],
+}
+for (const hours of [24, 7 * 24, 30 * 24]) {
+  queryClient.setQueryData(['cache-reasons', hours], previewCacheReasons)
+}
+
 const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   id: 1200 - index,
   ts: now - index * 73,
   cred_id: nearLimit.id,
   cred_label: nearLimit.label,
   session_id: `sess_${String(index % 3).padStart(2, '0')}f2c1a9`,
+  // 几种结局都摆一个：没用量的那条（index 9）必须是 no_usage，否则那一行会显示一个
+  // 「命中」却又没有任何 token 读数。
+  cache_reason: index === 9 ? 'no_usage' : index === 5 ? 'rotated' : index % 4 === 1 ? 'new_prefix' : 'hit',
   model: index % 3 === 0 ? 'gpt-5-codex' : 'gpt-5',
   path: '/backend-api/codex/responses',
   ua: 'codex_cli_rs/0.47.0 (Mac OS 15.3; arm64)',

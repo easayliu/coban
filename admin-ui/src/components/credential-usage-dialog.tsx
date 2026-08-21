@@ -13,6 +13,7 @@ import {
   formatPercent,
   formatUsd,
 } from '@/lib/utils'
+import { cacheReasonHint, cacheReasonLabel } from '@/components/cache-reason-breakdown'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
@@ -440,6 +441,15 @@ function UsageCards({
               <LogFact label={t('会话', 'Session')}>
                 <span className="font-mono" title={log.session_id ?? undefined}>{sessionShort}</span>
               </LogFact>
+              {/* 缓存结局紧跟着会话：这两个只有摆在一起才有意义——「哪一段对话」+
+                  「它这次为什么没命中」。悬浮上去是那一类该怎么处置。 */}
+              {log.cache_reason && (
+                <LogFact label={t('缓存结局', 'Cache outcome')}>
+                  <span title={cacheReasonHint(log.cache_reason, t) ?? undefined}>
+                    {cacheReasonLabel(log.cache_reason, t)}
+                  </span>
+                </LogFact>
+              )}
             </dl>
             {log.ua && (
               <p

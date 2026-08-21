@@ -63,7 +63,7 @@ pub async fn handle(
     }
 
     // 请求体在重试间要重发多次，规范化/翻译只做一次（见 plan_request）。
-    let Normalized { body, collapse, chat, sticky } = match plan_request(&path, body) {
+    let Normalized { body, collapse, chat, sticky, input_len } = match plan_request(&path, body) {
         Ok(n) => n,
         // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
         //
@@ -90,6 +90,15 @@ pub async fn handle(
     // 客户端自报的会话 id 优先——那是真的会话身份；实测三个真实 codex 客户端一个都不发，
     // 所以绝大多数请求靠的是前缀指纹那条路。
     let session_key = incoming_session_id(&headers).or(sticky);
+    // 租约状态在**选号之前**读一次并带着走：转发成功会把租约续到这次用的号上，之后再读
+    // 永远是「没换号」，归因就永远看不见换号那一类（见 cache_reason）。
+    let session = SessionCtx {
+        lease: session_key
+            .as_deref()
+            .map_or(store::LeaseState::Absent, |k| state.store.lease_state(k)),
+        key: session_key,
+        input_len,
+    };
 
     let started = Instant::now();
     let retry_max = state
@@ -102,7 +111,7 @@ pub async fn handle(
     let mut last: Option<Response> = None;
 
     for attempt in 0..MAX_ATTEMPTS {
-        let cred = match state.store.select(&tried, session_key.as_deref()) {
+        let cred = match state.store.select(&tried, session.key()) {
             Ok(c) => c,
             Err(e) => {
                 // 一个都挑不出来时：已经试过号的话把上一次的上游响应交回去（那是更贴近
@@ -140,7 +149,7 @@ pub async fn handle(
             &body,
             collapse,
             chat.as_ref(),
-            session_key.as_deref(),
+            &session,
             started,
             in_flight.clone(),
         )
@@ -153,7 +162,7 @@ pub async fn handle(
                 // 写在这里而不是选号处，是因为只有走到这一步才知道请求真的发得出去；也因此
                 // 换号重试时拿到租约的是**最后成功的那个号**——上游的 prompt cache 现在热在
                 // 它身上，而不是最初按落点选中的那个。
-                if let Some(key) = &session_key {
+                if let Some(key) = session.key() {
                     state.store.bind_session(key, cred.id);
                 }
                 return resp;
@@ -310,10 +319,11 @@ async fn forward_once(
     body: &Bytes,
     collapse: bool,
     chat: Option<&ChatMode>,
-    session_key: Option<&str>,
+    session: &SessionCtx,
     started: Instant,
     in_flight: InFlightGuard,
 ) -> anyhow::Result<Outcome> {
+    let session_key = session.key();
     let client = state.clients.for_credential(cred)?;
     let token = state.store.valid_access_token(&state.clients, cred).await?;
 
@@ -381,7 +391,18 @@ async fn forward_once(
         // 非 2xx：先把体读出来判一判是不是账号级问题，再决定换号还是交回客户端。
         let up_headers = up.headers().clone();
         let bytes = up.bytes().await.unwrap_or_default();
-        log_usage(state, cred, path, headers, status.as_u16() as i64, None, &quota, started, None);
+        log_usage(
+            state,
+            cred,
+            path,
+            headers,
+            session,
+            status.as_u16() as i64,
+            None,
+            &quota,
+            started,
+            None,
+        );
 
         if let Some(reason) = detect_account_error(status, &bytes) {
             state.store.mark_banned(cred.id, &reason)?;
@@ -429,12 +450,12 @@ async fn forward_once(
 
     if collapse {
         return Ok(Outcome::Done(
-            collapse_upstream(state, cred, path, headers, chat, up, quota, started).await,
+            collapse_upstream(state, cred, path, headers, session, chat, up, quota, started).await,
         ));
     }
 
     Ok(Outcome::Done(stream_upstream(
-        state, cred, path, headers, chat, up, quota, started, in_flight,
+        state, cred, path, headers, session, chat, up, quota, started, in_flight,
     )))
 }
 
@@ -454,6 +475,7 @@ async fn collapse_upstream(
     cred: &Credential,
     path: &str,
     req_headers: &HeaderMap,
+    session: &SessionCtx,
     chat: Option<&ChatMode>,
     up: wreq::Response,
     quota: QuotaSnapshot,
@@ -469,6 +491,7 @@ async fn collapse_upstream(
                 cred,
                 path,
                 req_headers,
+                session,
                 status.as_u16() as i64,
                 None,
                 &quota,
@@ -492,6 +515,7 @@ async fn collapse_upstream(
         cred,
         path,
         req_headers,
+        session,
         status.as_u16() as i64,
         model,
         &quota,
@@ -565,6 +589,7 @@ fn stream_upstream(
     cred: &Credential,
     path: &str,
     req_headers: &HeaderMap,
+    session: &SessionCtx,
     chat: Option<&ChatMode>,
     up: wreq::Response,
     quota: QuotaSnapshot,
@@ -581,7 +606,9 @@ fn stream_upstream(
         sniffer: sniffer.clone(),
         cred_id: cred.id,
         cred_label: cred.label.clone(),
-        session_id: incoming_session_id(req_headers),
+        session_key: session.key.clone(),
+        lease: session.lease,
+        input_len: session.input_len,
         path: path.to_owned(),
         ua: ua_of(req_headers),
         status: up.status().as_u16() as i64,
@@ -638,6 +665,8 @@ struct Normalized {
     chat: Option<ChatMode>,
     /// 这条请求的会话指纹（见 [`prefix_fingerprint`]）。解不出体时为 `None`。
     sticky: Option<String>,
+    /// `input[]` 有几项（解不出体时 0）。给缓存归因用，见 [`cache_reason`]。
+    input_len: usize,
 }
 
 /// chat 线格式下这次请求的形态：翻请求时定下，翻响应时要用。
@@ -661,6 +690,7 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
             collapse: !t.stream,
             chat: Some(ChatMode { model: t.model, include_usage: t.include_usage }),
             sticky: t.sticky,
+            input_len: t.input_len,
         });
     }
     Ok(normalize_responses_body(path, body))
@@ -689,13 +719,14 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
 fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
-        return Normalized { body, collapse: false, chat: None, sticky: None };
+        return Normalized { body, collapse: false, chat: None, sticky: None, input_len: 0 };
     }
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
-        return Normalized { body, collapse: false, chat: None, sticky: None };
+        return Normalized { body, collapse: false, chat: None, sticky: None, input_len: 0 };
     };
     // 趁体已经解开算指纹：为此再解析一遍是白花的 CPU——真实流量里这个体有几百 KB。
     let sticky = prefix_fingerprint(&obj);
+    let input_len = obj.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
     let yes = Some(&serde_json::Value::Bool(true));
     let no = Some(&serde_json::Value::Bool(false));
     let collapse = obj.get("stream") != yes;
@@ -703,14 +734,14 @@ fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     let dropped = drop_unsupported_params(&mut obj);
     if !collapse && obj.get("store") == no && !dropped {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
-        return Normalized { body, collapse, chat: None, sticky };
+        return Normalized { body, collapse, chat: None, sticky, input_len };
     }
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
-        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None, sticky },
+        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None, sticky, input_len },
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
-        Err(_) => Normalized { body, collapse, chat: None, sticky },
+        Err(_) => Normalized { body, collapse, chat: None, sticky, input_len },
     }
 }
 
@@ -851,6 +882,68 @@ fn note_stale_reasoning(memo: &StaleReasoningMemo, session_key: Option<&str>, cr
         memo.pop_front();
     }
     memo.push_back((key.to_owned(), cred_id));
+}
+
+/// 一条请求的会话身份，加上给缓存未命中归因所需的那点上下文。
+struct SessionCtx {
+    /// 实际用的会话键：客户端自报的会话头优先，没有就是前缀指纹。
+    key: Option<String>,
+    /// 请求**进来那一刻**这个键的租约状态。见 [`store::CredentialStore::lease_state`] 上
+    /// 那句「必须在选号之前取」。
+    lease: store::LeaseState,
+    /// `input[]` 有几项。
+    input_len: usize,
+}
+
+impl SessionCtx {
+    fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+}
+
+/// 这条请求的缓存结局，以及未命中时**为什么**。落进 `usage_logs.cache_reason`。
+///
+/// 命中率那条曲线只回答得了「低了」。低的原因有好几种，处置完全不同，而它们在曲线上长得
+/// 一模一样。这个函数把它们分开：
+///
+/// - `hit`：上游报了命中的输入 token。
+/// - `first_turn`：第一次见这个会话键，而 `input[]` 只有一项——新对话的第一轮，本来就该
+///   miss，不是问题。
+/// - `new_prefix`：第一次见这个键，但 `input[]` 已经好几项了。一段多轮对话以一个**从没见过
+///   的前缀身份**出现,意味着前缀本身在变——客户端每轮在改 `instructions` 或 `tools`（两者都
+///   进前缀，见 [`prefix_fingerprint`]）。这一类是纯亏：钱花了，缓存一次也命不中。
+///   （coban 刚重启、或租约条目被 GC 掉时也会落到这一类,那是它的假阳性来源。）
+/// - `rotated`：这个键有租约，但这次没落在租约那个号上——原来那个号在冷却/RPM 满/被停用。
+///   上游的 prompt cache 是按账号存的，换号就是从零开始。
+/// - `lease_expired`：租约过期了（会话停得太久），落点因此重新算过。
+/// - `upstream_cold`：租约有效、落点也没变、前缀身份也没变，上游那边就是没有。要么它自己的
+///   缓存过期了，要么这个键被**假共享**了——两条开头完全一样的对话会算出同一个指纹、共用
+///   同一个上游 session，交替请求互相踢掉对方（见 [`prefix_fingerprint`] 的注）。
+/// - `no_usage`：没嗅探到用量（错误响应、客户端提前断开）。谈不上命中与否。
+/// - `unattributed`：租约机制被关掉了（`session_lease_secs = 0`），上面那几类分不出来。
+///
+/// 返回 `None` 表示这条请求没有会话身份（`models` 那类），列留 NULL。
+fn cache_reason(
+    key: Option<&str>,
+    lease: store::LeaseState,
+    input_len: usize,
+    cred_id: i64,
+    usage: Option<Usage>,
+) -> Option<&'static str> {
+    key.filter(|k| !k.is_empty())?;
+    let Some(u) = usage else { return Some("no_usage") };
+    if u.cached_tokens > 0 {
+        return Some("hit");
+    }
+    Some(match lease {
+        store::LeaseState::Off => "unattributed",
+        // 过期与换号同时发生时报过期：那才是根因，换号是它的后果。
+        store::LeaseState::Expired(_) => "lease_expired",
+        store::LeaseState::Live(id) if id != cred_id => "rotated",
+        store::LeaseState::Live(_) => "upstream_cold",
+        store::LeaseState::Absent if input_len <= 1 => "first_turn",
+        store::LeaseState::Absent => "new_prefix",
+    })
 }
 
 /// 从（已经是 Responses 形状的）请求体里算一个**会话指纹**。
@@ -1346,7 +1439,11 @@ struct UsageLogGuard {
     sniffer: Arc<parking_lot::Mutex<UsageSniffer>>,
     cred_id: i64,
     cred_label: String,
-    session_id: Option<String>,
+    /// 这条请求实际用的会话键，以及给归因用的那两项（见 [`cache_reason`]）。
+    /// **归因只能在这里算**：它要 `cached_tokens`，而那要等流走完才嗅探得到。
+    session_key: Option<String>,
+    lease: store::LeaseState,
+    input_len: usize,
     path: String,
     ua: Option<String>,
     status: i64,
@@ -1373,7 +1470,14 @@ impl Drop for UsageLogGuard {
         let rec = UsageRecord {
             cred_id: Some(self.cred_id),
             cred_label: std::mem::take(&mut self.cred_label),
-            session_id: self.session_id.take(),
+            cache_reason: cache_reason(
+                self.session_key.as_deref(),
+                self.lease,
+                self.input_len,
+                self.cred_id,
+                usage,
+            ),
+            session_id: self.session_key.take(),
             model,
             path: std::mem::take(&mut self.path),
             ua: self.ua.take(),
@@ -1400,6 +1504,7 @@ fn log_usage(
     cred: &Credential,
     path: &str,
     req_headers: &HeaderMap,
+    session: &SessionCtx,
     status: i64,
     model: Option<String>,
     quota: &QuotaSnapshot,
@@ -1417,7 +1522,8 @@ fn log_usage(
     let rec = UsageRecord {
         cred_id: Some(cred.id),
         cred_label: cred.label.clone(),
-        session_id: incoming_session_id(req_headers),
+        cache_reason: cache_reason(session.key(), session.lease, session.input_len, cred.id, usage),
+        session_id: session.key.clone(),
         model,
         path: path.to_owned(),
         ua: ua_of(req_headers),
@@ -2176,6 +2282,9 @@ fn log_probe_usage(
         cred_id: Some(cred.id),
         cred_label: cred.label.clone(),
         session_id: None,
+        // 探测自成一类：它没有会话、也不该在上游那边留下会话，混进「未归因」会让那一桶
+        // 看着像是有一批真实请求归不了因。
+        cache_reason: Some("probe"),
         model,
         path: PROBE_PATH.to_owned(),
         ua: Some(PROBE_UA.to_owned()),
@@ -2911,6 +3020,69 @@ mod tests {
         // 没有 input 就没有会话可言（`models` 那类无体请求走的也是这一支）。
         assert!(fp(r#"{"model":"m","instructions":"i"}"#).is_none());
         assert!(fp(r#"{"model":"m","input":[]}"#).is_none());
+    }
+
+    /// 归因的每一条分支都要走到：这几类在命中率曲线上长得一模一样，而处置完全不同。
+    #[test]
+    fn cache_reason_separates_the_ways_a_miss_can_happen() {
+        use store::LeaseState;
+        const A: i64 = 7;
+        const B: i64 = 9;
+        let usage = |cached: i64| {
+            Some(Usage {
+                input_tokens: 100_000,
+                cached_tokens: cached,
+                output_tokens: 1,
+                reasoning_tokens: 0,
+                total_tokens: 100_001,
+            })
+        };
+        let r = |lease, input_len, usage| cache_reason(Some("k"), lease, input_len, A, usage);
+
+        // 命中优先于一切：上游都报了命中，前面那些原因就不必再猜。
+        assert_eq!(r(LeaseState::Absent, 1, usage(90_000)), Some("hit"));
+        assert_eq!(r(LeaseState::Live(A), 9, usage(90_000)), Some("hit"));
+
+        assert_eq!(r(LeaseState::Absent, 1, usage(0)), Some("first_turn"));
+        // 同样是「没见过这个键」，输入已经好几项就不是新对话，是前缀在变。
+        assert_eq!(r(LeaseState::Absent, 9, usage(0)), Some("new_prefix"));
+        assert_eq!(r(LeaseState::Live(B), 9, usage(0)), Some("rotated"));
+        assert_eq!(r(LeaseState::Live(A), 9, usage(0)), Some("upstream_cold"));
+        assert_eq!(r(LeaseState::Off, 9, usage(0)), Some("unattributed"));
+
+        // 过期又换了号时报过期：那是根因，换号是它的后果。
+        assert_eq!(r(LeaseState::Expired(A), 9, usage(0)), Some("lease_expired"));
+        assert_eq!(r(LeaseState::Expired(B), 9, usage(0)), Some("lease_expired"));
+
+        // 没有用量读数谈不上命中与否；没有会话身份的请求（models 那类）压根不该进这张表。
+        assert_eq!(r(LeaseState::Live(A), 9, None), Some("no_usage"));
+        assert_eq!(cache_reason(None, LeaseState::Absent, 0, A, usage(0)), None);
+        assert_eq!(cache_reason(Some(""), LeaseState::Absent, 0, A, usage(0)), None);
+    }
+
+    /// 两条线格式都要报出 `input[]` 的项数——`first_turn` 与 `new_prefix` 全靠它分开。
+    #[test]
+    fn both_wire_formats_report_the_input_length() {
+        let one = plan_request(
+            "responses",
+            Bytes::from_static(br#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#),
+        )
+        .unwrap();
+        assert_eq!(one.input_len, 1);
+
+        let grown = plan_request(
+            "chat/completions",
+            Bytes::from_static(
+                br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"},
+                     {"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}"#,
+            ),
+        )
+        .unwrap();
+        // system 进 instructions，不算一项输入；剩下三条才是。
+        assert_eq!(grown.input_len, 3);
+
+        // 解不出体（`models` 那类无体请求）时是 0，不是崩。
+        assert_eq!(plan_request("models", Bytes::new()).unwrap().input_len, 0);
     }
 
     /// 两种线格式都要拿到指纹，且**同一段对话在 chat 那条路上长大时也不能变**。

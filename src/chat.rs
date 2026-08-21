@@ -57,6 +57,9 @@ pub struct Translated {
     /// 这条请求的会话指纹（见 [`crate::proxy`] 的 `prefix_fingerprint`）。**在这里算**是因为
     /// 翻完的那份 Map 就在手上，为它把刚序列化出来的体再解析一遍是白花的 CPU。
     pub sticky: Option<String>,
+    /// 翻出来的 `input[]` 有几项。给缓存归因用：第一轮只有一项，多轮会一直长
+    /// （见 [`crate::proxy`] 的 `cache_reason`）。
+    pub input_len: usize,
 }
 
 /// 把一份 Chat Completions 请求体翻成 Responses 请求体。
@@ -122,9 +125,10 @@ pub fn translate_request(raw: &[u8]) -> Result<Translated, String> {
     out.insert("stream".into(), Value::Bool(true));
 
     let sticky = crate::proxy::prefix_fingerprint(&out);
+    let input_len = out.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
     let body = serde_json::to_vec(&Value::Object(out))
         .map_err(|e| format!("failed to build the upstream request: {e}"))?;
-    Ok(Translated { body: Bytes::from(body), stream, include_usage, model, sticky })
+    Ok(Translated { body: Bytes::from(body), stream, include_usage, model, sticky, input_len })
 }
 
 /// `messages[]` → (`instructions`, `input[]`)。

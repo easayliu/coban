@@ -1,7 +1,7 @@
 import { Fragment, useRef, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { BarChart3Icon, DatabaseZapIcon, TableIcon } from 'lucide-react'
-import { getCacheSeries, type Metrics } from '@/api/metrics'
+import { getCacheReasons, getCacheSeries, type Metrics } from '@/api/metrics'
 import { useI18n } from '@/lib/i18n'
 import {
   bucketCacheSeries,
@@ -31,6 +31,7 @@ import {
   aggregateCacheHitRate,
   cacheTotalsText,
 } from '@/components/cache-hit-chart'
+import { CacheReasonBreakdown } from '@/components/cache-reason-breakdown'
 
 /**
  * 可选的回看跨度。三档而不是一个自由输入：这张图要回答的是「最近怎么样 / 这几天怎么样 /
@@ -81,6 +82,15 @@ export function CacheHitTrendDialog({
   const [range, setRange] = useState<CacheRangeKey>(DEFAULT_CACHE_RANGE)
   const [view, setView] = useState<'chart' | 'table'>('chart')
   const { query, slots, granularity } = useCacheSeries(range, open)
+  // 归因与曲线分两个请求：曲线是 30 秒一跳的实时口径，而这份分布只在对话框开着时要，
+  // 合成一个接口会让概览那一格也跟着拉一份它不显示的数据。
+  const reasons = useQuery({
+    queryKey: ['cache-reasons', CACHE_RANGES[range].hours],
+    queryFn: () => getCacheReasons(CACHE_RANGES[range].hours),
+    enabled: open,
+    refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
+  })
   const total = aggregateCacheHitRate(slots)
   const hasTraffic = slots.some((s) => s.hasTraffic)
   const lifetime = cacheHitRate(metrics?.input_tokens_total, metrics?.cached_tokens_total)
@@ -201,6 +211,10 @@ export function CacheHitTrendDialog({
           ) : (
             <CacheHitTable slots={slots} granularity={granularity} />
           )}
+
+          {/* 归因摆在图下面：先看形状（哪几天低），再问为什么低。倒过来的话，一张原因表
+              在不知道「低不低」之前是没有参照的。读取失败不挡着上面那张图——曲线是主角。 */}
+          {hasTraffic && reasons.data && <CacheReasonBreakdown reasons={reasons.data.reasons} />}
 
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(

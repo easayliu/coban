@@ -10,6 +10,7 @@ import {
   CredentialMenuContent,
   DeferredMount,
   DeleteCredentialDialog,
+  ResetQuotaDialog,
   evaluateCredential,
   planBadgeVariant,
   planLabel,
@@ -327,10 +328,11 @@ export const CredentialRow = memo(function CredentialRow({
   const [rpmOpen, setRpmOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [confirmReset, setConfirmReset] = useState(false)
   const [testing, setTesting] = useState(false)
 
   const actions = useCredentialActions(cred)
-  const { toggle, remove, rename } = actions
+  const { toggle, remove, rename, consumeReset } = actions
   const { quota, status } = evaluateCredential(cred, now, language)
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const lastUsed = cred.stats.last_used_at
@@ -469,6 +471,7 @@ export const CredentialRow = memo(function CredentialRow({
               onProxy={() => setProxyOpen(true)}
               onUsage={() => setUsageOpen(true)}
               onTest={() => setTesting(true)}
+              onRequestReset={() => setConfirmReset(true)}
               onRequestDelete={() => setConfirmDelete(true)}
             />
           </Menu>
@@ -486,6 +489,15 @@ export const CredentialRow = memo(function CredentialRow({
       </DeferredMount>
       <DeferredMount open={testing}>
         <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
+      </DeferredMount>
+      <DeferredMount open={confirmReset}>
+        <ResetQuotaDialog
+          cred={cred}
+          open={confirmReset}
+          onOpenChange={setConfirmReset}
+          onConfirm={() => consumeReset.mutate(undefined, { onSettled: () => setConfirmReset(false) })}
+          pending={consumeReset.isPending}
+        />
       </DeferredMount>
       <DeferredMount open={confirmDelete}>
         <DeleteCredentialDialog

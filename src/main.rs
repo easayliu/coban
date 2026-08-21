@@ -12,6 +12,7 @@ mod credentials;
 mod oauth;
 mod pricing;
 mod proxy;
+mod quota_reset;
 mod store;
 mod web;
 

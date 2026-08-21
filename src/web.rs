@@ -18,6 +18,7 @@ use crate::auth;
 use crate::credentials::Credential;
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
+use crate::quota_reset;
 use crate::store::{self, CredentialStore};
 
 /// 一次登录尝试还没换 token 之前，PKCE 上下文最多留多久。
@@ -116,10 +117,13 @@ pub async fn run(
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/models", get(list_credential_models))
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
+        .route("/credentials/{id}/reset-credits", get(get_reset_credits))
+        .route("/credentials/{id}/reset-credits/consume", post(consume_reset_credit))
         .route("/credentials/{id}/usage", get(list_credential_usage))
         .route("/usage", get(list_usage))
         .route("/metrics", get(get_metrics))
         .route("/metrics/cache-series", get(get_cache_series))
+        .route("/metrics/cache-reasons", get(get_cache_reasons))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
@@ -805,6 +809,57 @@ async fn clear_cooldown(
     reload(&state, id)
 }
 
+/// 查这个号还剩几张额度重置券。
+///
+/// 向上游现问一趟并把读数落库（见 [`quota_reset::query`]）。不消耗券、不消耗额度、不写
+/// 用量流水。取不到时回 400 带原因——张数是**只能问上游**的东西，编一个 0 会让人以为
+/// 这个号没券。
+async fn get_reset_credits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<store::ResetCredits>, ApiError> {
+    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    let credits = quota_reset::query(&state, &cred).await.map_err(|e| {
+        tracing::warn!(cred_id = id, label = %cred.label, error = %format!("{e:#}"), "reading the reset-credit count failed");
+        bad_request(format!("{e:#}"))
+    })?;
+    Ok(Json(credits))
+}
+
+/// 兑一张重置券，把这个号的额度窗口重置掉。
+///
+/// **不可撤销、券花掉就没有**，所以二次确认由前端做（见 admin-ui 的 `ResetQuotaDialog`）。
+/// 停用/封禁的号也允许兑：额度与账号状态是两件事，而「先重置额度再处理停用原因」是合理
+/// 顺序，这里只校验凭证存在。
+///
+/// 成功时连带回一份最新的凭证视图：兑换会顺手解除限流暂停与冷却（见
+/// [`quota_reset::consume`]），列表要立刻把那枚「限流暂停」的徽章摘掉，而不是等下一轮轮询。
+async fn consume_reset_credit(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<ResetResp>, ApiError> {
+    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    let outcome = quota_reset::consume(&state, &cred).await.map_err(|e| {
+        tracing::warn!(cred_id = id, label = %cred.label, error = %format!("{e:#}"), "redeeming a reset credit failed");
+        bad_request(format!("{e:#}"))
+    })?;
+    // 兑换已经成功，这里再读一次库拿最新视图。读失败也不能把整次兑换报成失败——
+    // 那会让人再点一次，第二张券就这么没了；回一份重载前的视图，列表下一轮轮询自会更新。
+    let credential = match state.store.get(id) {
+        Ok(Some(c)) => view_of(&state, &c),
+        Ok(None) | Err(_) => view_of(&state, &cred),
+    };
+    Ok(Json(ResetResp { outcome, credential }))
+}
+
+/// 一次兑换的对外结果：上游那份结果 + 兑换后的凭证视图。
+#[derive(Serialize)]
+struct ResetResp {
+    #[serde(flatten)]
+    outcome: quota_reset::ResetOutcome,
+    credential: CredentialView,
+}
+
 fn reload(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let c = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     Ok(Json(view_of(state, &c)))
@@ -934,6 +989,28 @@ async fn get_cache_series(
     let since = crate::credentials::now_secs() as i64 - hours * 3600;
     let points = state.store.cache_series(since).map_err(internal)?;
     Ok(Json(CacheSeriesResp { since, bucket_secs: 3600, points }))
+}
+
+#[derive(Serialize)]
+struct CacheReasonsResp {
+    /// 同 [`CacheSeriesResp::since`]：夹过之后的真实起点。
+    since: i64,
+    reasons: Vec<store::CacheReasonStat>,
+}
+
+/// 缓存未命中的原因分布。回答命中率曲线的下一个问题:**为什么低**。
+///
+/// 比率与排序都在 [`store::CredentialStore::cache_reasons`] 那头定好（按白付的输入 token
+/// 排，不是按条数）——那个口径不该让前端各自复述一遍。
+async fn get_cache_reasons(
+    State(state): State<AppState>,
+    Query(q): Query<CacheSeriesQuery>,
+) -> Result<Json<CacheReasonsResp>, ApiError> {
+    let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
+    let hours = q.hours.clamp(1, max_hours);
+    let since = crate::credentials::now_secs() as i64 - hours * 3600;
+    let reasons = state.store.cache_reasons(since).map_err(internal)?;
+    Ok(Json(CacheReasonsResp { since, reasons }))
 }
 
 // ---------- 设置 ----------

@@ -180,3 +180,42 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "forwarded",
     "via",
 ];
+
+// ---------- 额度重置券 ----------
+
+/// 额度重置券那族端点的基址。
+///
+/// **不在 [`UPSTREAM_BASE`] 之下**：转发走的是 `backend-api/codex`，而这三条接口挂在
+/// `backend-api/wham`（Codex 桌面端「重置用量」那个按钮打的就是它们）。拼到 codex 那条
+/// 路径后面只会得到 404。
+///
+/// **来源是 sub2api 的生产实现**（`backend/internal/service/openai_quota_service.go` 的
+/// `QueryUsage` / `ResetCredit`），不是官方 CLI 的抓包——codex CLI 压根没有「重置额度」
+/// 这个命令，这一族只有桌面端会打。理由同 [`crate::oauth::PkceChallenge::authorize_url`]
+/// 那两个非标准参数：一个跑在生产上的第三方实现，比「我在二进制里搜不到」更强的证据。
+pub const WHAM_BASE: &str = "https://chatgpt.com/backend-api/wham";
+
+/// 用量与重置券张数（`WHAM_BASE` 之后那一段）。
+///
+/// 回的 JSON 里 `rate_limit_reset_credits.available_count` 就是「还能重置几次」。它与
+/// [`WHAM_RESET_CREDITS_PATH`] 的差别是：这里只有一个总数，那里还带每张券的过期时刻。
+pub const WHAM_USAGE_PATH: &str = "usage";
+
+/// 重置券清单（`WHAM_BASE` 之后那一段）。回的是张数 + 每张的 `expires_at`。
+pub const WHAM_RESET_CREDITS_PATH: &str = "rate-limit-reset-credits";
+
+/// 兑换一张重置券（`WHAM_BASE` 之后那一段）。POST，体里要带 `redeem_request_id`。
+///
+/// 那个 id 是**幂等键**：同一个 id 重发不会扣第二张券。所以它必须每次现生成一个新的
+/// （见 `crate::quota_reset::consume`），写死一个常量等于第二次点「重置」什么也不会发生。
+pub const WHAM_RESET_CONSUME_PATH: &str = "rate-limit-reset-credits/consume";
+
+/// wham 那族接口的 `originator`。
+///
+/// **与转发用的 [`ORIGINATOR`] 不同**：这一族是桌面端的接口，报 `codex_cli_rs` 等于说
+/// 「CLI 在调一个 CLI 没有的功能」。同一个账号既跑 CLI 又开着桌面端是常态，两族各报
+/// 各自的形态才对得上。
+pub const WHAM_ORIGINATOR: &str = "Codex Desktop";
+
+/// wham 那族接口的 `openai-beta`。缺了实测直接 4xx。
+pub const WHAM_OPENAI_BETA: &str = "codex-1";

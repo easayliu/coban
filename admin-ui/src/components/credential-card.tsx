@@ -23,6 +23,8 @@ import {
   CredentialMenuContent,
   DeferredMount,
   DeleteCredentialDialog,
+  ResetQuotaDialog,
+  resetCreditsMeta,
   credentialExpiryMeta,
   evaluateCredential,
   planBadgeVariant,
@@ -80,10 +82,11 @@ export const CredentialCard = memo(function CredentialCard({
   const [rpmOpen, setRpmOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [confirmReset, setConfirmReset] = useState(false)
   const [testing, setTesting] = useState(false)
 
   const actions = useCredentialActions(cred, () => setEditing(false))
-  const { rename, toggle, remove } = actions
+  const { rename, toggle, remove, consumeReset } = actions
   const { quota, status } = evaluateCredential(cred, now, language)
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const initial = credentialLabel.trim().charAt(0).toUpperCase() || '?'
@@ -114,6 +117,11 @@ export const CredentialCard = memo(function CredentialCard({
   // 所以「有效 43 分钟」对使用者不构成任何决策依据，常驻只是噪声。
   const expiry = credentialExpiryMeta(cred, language)
   const expiryUrgent = expiry.tone === 'warning'
+  // 重置券：**只有真的有券时才挂徽章**。没查过、查过没券都不摆——理由同 credits 那枚
+  // （见下一段），把「还没问」或者「常态」说成一种状态，只是在抢注意力。张数与过期时刻的
+  // 读法在 resetCreditsMeta 里，卡片和确认框共用同一份。
+  const resetCredits = resetCreditsMeta(cred.stats?.reset_credits ?? null, language)
+  const resetBadge = resetCredits?.state === 'available' ? resetCredits : null
   // credits 是「基础额度满了还能不能继续跑」。**只在真的有 credits 时才补一枚徽章**：
   // 没有额外 credits 是普通订阅的常态（见 CreditsState 的注），给每个正常账号挂一枚
   // 「无 credits」等于把默认状态说成风险，而卡片上每一枚徽章都在抢注意力。
@@ -283,6 +291,7 @@ export const CredentialCard = memo(function CredentialCard({
                   onProxy={() => setProxyOpen(true)}
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
+                  onRequestReset={() => setConfirmReset(true)}
                   onRequestDelete={() => setConfirmDelete(true)}
                 />
               </Menu>
@@ -319,6 +328,11 @@ export const CredentialCard = memo(function CredentialCard({
                 aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
               >
                 {status.label}
+              </Badge>
+            )}
+            {resetBadge && (
+              <Badge variant="success" size="sm" title={resetBadge.title}>
+                {resetBadge.label}
               </Badge>
             )}
             {creditsBadge && (
@@ -548,7 +562,7 @@ export const CredentialCard = memo(function CredentialCard({
         </CardFooter>
 
         {/* 没点开过任何一个就一个都不挂：账号一多，这些常关的对话框全是白挂的组件树。 */}
-        <DeferredMount open={proxyOpen || rpmOpen || usageOpen || confirmDelete || testing}>
+        <DeferredMount open={proxyOpen || rpmOpen || usageOpen || confirmDelete || confirmReset || testing}>
           <CredentialProxyDialog
             cred={cred}
             open={proxyOpen}
@@ -568,6 +582,13 @@ export const CredentialCard = memo(function CredentialCard({
             onOpenChange={setConfirmDelete}
             onConfirm={() => remove.mutate()}
             pending={remove.isPending}
+          />
+          <ResetQuotaDialog
+            cred={cred}
+            open={confirmReset}
+            onOpenChange={setConfirmReset}
+            onConfirm={() => consumeReset.mutate(undefined, { onSettled: () => setConfirmReset(false) })}
+            pending={consumeReset.isPending}
           />
           <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
         </DeferredMount>

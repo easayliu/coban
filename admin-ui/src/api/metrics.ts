@@ -64,3 +64,31 @@ export async function getCacheSeries(hours: number): Promise<CacheSeries> {
   const { data } = await api.get('/metrics/cache-series', { params: { hours } })
   return data
 }
+
+/**
+ * 一类缓存结局在这段时间里的合计。
+ *
+ * `input_tokens` 与 `cached_tokens` 都给，而**排序看的是两者之差**（白付的那部分）：按请求
+ * 条数排出来的原因榜是骗人的——一条 200K 前缀的对话未命中和一条 2K 小请求未命中，账单上差
+ * 一百倍，按条数看却各占一条。
+ */
+export interface CacheReasonStat {
+  /** 原因标识。含义见 `CACHE_REASONS`（前端那份对照表）。 */
+  reason: string
+  requests: number
+  input_tokens: number
+  cached_tokens: number
+}
+
+export interface CacheReasons {
+  /** 真实起点（Unix 秒），同 `CacheSeries.since`。 */
+  since: number
+  /** 已按白付 token 从多到少排好。前端不要重排——那个口径由后端定。 */
+  reasons: CacheReasonStat[]
+}
+
+/** 拉一段缓存未命中的原因分布。回答命中率曲线的下一个问题：为什么低。 */
+export async function getCacheReasons(hours: number): Promise<CacheReasons> {
+  const { data } = await api.get('/metrics/cache-reasons', { params: { hours } })
+  return data
+}
