@@ -119,10 +119,9 @@ pub async fn handle(
         .get_setting_i64(store::RATE_LIMIT_RETRY_MAX, store::DEFAULT_RATE_LIMIT_RETRY_MAX);
     // 撞限流到底换不换号。关掉时限流类一次都不换，改成在同一个号上等一等再发
     // （见 [`RateLimitWait`]）。
-    let rotate_on_rate_limit = state
-        .store
-        .get_setting_i64(store::RATE_LIMIT_ROTATE, store::DEFAULT_RATE_LIMIT_ROTATE)
-        != 0;
+    let rotate_on_rate_limit =
+        state.store.get_setting_i64(store::RATE_LIMIT_ROTATE, store::DEFAULT_RATE_LIMIT_ROTATE)
+            != 0;
     // 限流类拒绝一路换到号池走完（硬顶 MAX_ATTEMPTS），链路/上游故障由 retry_max 卡住。
     let mut budget = RotationBudget::new(retry_max, rotate_on_rate_limit);
 
@@ -378,8 +377,8 @@ impl RateLimitWait {
                 store::DEFAULT_RATE_LIMIT_WAIT_RETRY_MAX,
             )
             .clamp(0, MAX_ATTEMPTS as i64) as u32;
-        let max_wait = store
-            .get_setting_i64(store::RATE_LIMIT_WAIT_SECS, store::DEFAULT_RATE_LIMIT_WAIT_SECS);
+        let max_wait =
+            store.get_setting_i64(store::RATE_LIMIT_WAIT_SECS, store::DEFAULT_RATE_LIMIT_WAIT_SECS);
         Self { left, max_wait }
     }
 
