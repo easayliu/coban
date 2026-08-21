@@ -39,6 +39,7 @@ import {
   SORT_DIR_DEFAULT,
   evaluateCredential,
   planKey,
+  quotaWindowTitle,
   sortCreds,
   type CredentialEvaluation,
   type PlanKey,
@@ -373,20 +374,71 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     () => TIER_FILTERS.map((item) => ({ ...item, label: t(...item.label) })),
     [t],
   )
-  const sortItems = useMemo(
-    () => SORTS.map(({ key }) => ({ key, label: t(...SORT_LABELS[key]) })),
-    [t],
-  )
   const activeFilterLabel = filterItems.find((item) => item.key === filter)?.label
     ?? t(...FILTERS[0].label)
   const activeTierLabel = tierItems.find((item) => item.key === tier)?.label
     ?? t(...TIER_FILTERS[0].label)
-  const activeSortLabel = sortItems.find((item) => item.key === sort)?.label
-    ?? t(...SORT_LABELS.priority)
   const evaluatedPool = useMemo(
     () => pool.map((credential) => evaluateCredential(credential, now, language)),
     [pool, now, language],
   )
+  /**
+   * 列表那两个额度列该叫什么：拿**上游真的报了的窗口长度**算，而不是照抄「主/次额度」。
+   *
+   * 「主/次」是上游那两组头的名字，不是窗口的名字。实测（2026-08，一批 Pro 号）
+   * `x-codex-primary-*` 报的是**周**窗口（10080 分钟），`x-codex-secondary-*` 整组是空的。
+   * 所以那张表此前一列叫「主额度」实际是周额度，另一列叫「次额度」而永远显示「—」。
+   *
+   * 只有池子里所有报过这个窗口的账号**长度一致**时才敢用具体名字：不同套餐的窗口长度可以
+   * 不一样，那时任何一个具体名字都会在别的行上是错的，退回通用名。
+   */
+  const quotaTitles = useMemo(() => {
+    const titleOf = (key: 'primary' | 'secondary') => {
+      const seen = new Set(
+        evaluatedPool
+          .map((evaluation) => evaluation.quota[key])
+          .filter((w) => w.reported)
+          .map((w) => w.windowMinutes),
+      )
+      if (seen.size !== 1) return null
+      return quotaWindowTitle([...seen][0], language)
+    }
+    return { primary: titleOf('primary'), secondary: titleOf('secondary') }
+  }, [evaluatedPool, language])
+  /**
+   * 那两个额度列在不在：**上游整池都没报过的窗口，那一列每行都是「—」**，占着 8rem 什么也
+   * 没说，而这张表已经宽到要横向滚了。实测你这批 Pro 号上 `x-codex-secondary-*` 整组是空
+   * 的，于是「次额度」那一列从来只有一排破折号。
+   *
+   * 一个号的快照都还没有时**两列都留着**：那时「没报」和「还没问过」分不开，收掉列等于让人
+   * 以为这个界面不看额度。等真拿到快照、确认上游不报，再收。
+   */
+  const quotaColumns = useMemo(() => {
+    const anySnapshot = evaluatedPool.some((evaluation) => evaluation.quota.hasSnapshot)
+    const shown = (key: 'primary' | 'secondary') =>
+      !anySnapshot || evaluatedPool.some((evaluation) => evaluation.quota[key].reported)
+    return { primary: shown('primary'), secondary: shown('secondary') }
+  }, [evaluatedPool])
+  /**
+   * 排序项。两个额度项的名字跟着列名走——列头写「周」而排序菜单写「主额度使用率」，那句
+   * 「按主额度使用率排序」在表上指不到任何一列。
+   */
+  const sortItems = useMemo(
+    () => SORTS.map(({ key }) => {
+      const window = key === 'usagePrimary'
+        ? quotaTitles.primary
+        : key === 'usageSecondary'
+          ? quotaTitles.secondary
+          : null
+      if (window) {
+        return { key, label: t(`${window}额度使用率`, `${window} usage`) }
+      }
+      return { key, label: t(...SORT_LABELS[key]) }
+    }),
+    [t, quotaTitles],
+  )
+  const activeSortLabel = sortItems.find((item) => item.key === sort)?.label
+    ?? t(...SORT_LABELS.priority)
 
   const sorted = useMemo(() => {
     const match = FILTERS.find((item) => item.key === filter)?.match ?? (() => true)
@@ -431,6 +483,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     }
     let nearLimitCount = 0
     let pausedCount = 0
+    // 「需处理」那行小字的两项。**按状态种类数**，而不是复用旁边那几个计数器：
+    // `abnormal` 数的是「带封禁原因」（含已被限流盖过去的），`nearLimit` 数的是额度过线
+    // （也可能被限流/停用盖过去），拿它们去拆 `attention` 必然对不上——屏幕上就是
+    // 「需处理 2 · 1 异常 · 2 将满」。只有从同一个 status.kind 上数出来的才加得起来。
+    const attentionKinds = { banned: 0, nearLimit: 0 }
 
     for (const evaluation of evaluatedPool) {
       const credential = evaluation.credential
@@ -438,7 +495,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       tierCounts.all += 1
       tierCounts[planKey(credential.plan_type)] += 1
       if (evaluation.schedulable) filterCounts.schedulable += 1
-      if (evaluation.needsAttention) filterCounts.attention += 1
+      if (evaluation.needsAttention) {
+        filterCounts.attention += 1
+        if (evaluation.status.kind === 'banned') attentionKinds.banned += 1
+        else if (evaluation.status.kind === 'near-limit') attentionKinds.nearLimit += 1
+      }
       if (credential.disabled) filterCounts.disabled += 1
       else filterCounts.enabled += 1
       if (credential.ban_reason) filterCounts.abnormal += 1
@@ -454,6 +515,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     return {
       filterCounts,
       tierCounts,
+      attentionKinds,
       nearLimitCount,
       pausedCount,
     }
@@ -461,42 +523,67 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
   const count = pool.length
   const total = sorted.length
-  const enabledCount = metrics.filterCounts.enabled
   const schedulableCount = metrics.filterCounts.schedulable
-  const abnormalCount = metrics.filterCounts.abnormal
-  const cooldownCount = metrics.filterCounts.cooldown
   const attentionCount = metrics.filterCounts.attention
   const quotaRiskCount = metrics.filterCounts.nearLimit
   const pausedCount = metrics.pausedCount
+  /**
+   * 两个筛选按钮**静止时的**文案。
+   *
+   * 状态那个筛选的第一项在菜单里叫「全部」——放在一列状态里读得通，但搬到按钮上就成了
+   * 「什么的全部」，尤其旁边那个按钮写着「全部套餐」。所以按钮上补两个字，菜单里不动。
+   *
+   * 选中之后按钮改成「那一项的名字 + 命中数」：菜单里每项都带数，而按钮不带的话，筛完得
+   * 去翻底部分页那行才知道筛出了几个。未筛选时不带数——那个数就是右上角「24 个账号」。
+   */
+  const filterTriggerLabel = filter === 'all' ? t('全部状态', 'All statuses') : activeFilterLabel
+  const filterTriggerCount = filter === 'all' ? null : metrics.filterCounts[filter]
+  const tierTriggerCount = tier === 'all' ? null : metrics.tierCounts[tier]
   const filtering = filter !== 'all' || tier !== 'all' || debouncedQuery.trim() !== ''
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
-  // 概览卡片下面那行小字：把「为什么需要处理」拆成几项拼起来，比一个总数有用得多。
+  /**
+   * 「需处理」下面那行小字：把这个数**拆成它自己的组成部分**。
+   *
+   * 只列 `attention: true` 的那两类（异常、将满，见 credential-shared 的 statusFromQuota）。
+   * 冷却与限流暂停曾经也列在这里，但它们 `attention: false`——不需要人管，到点自己好。
+   * 于是屏幕上出现过「需处理 0 · 4 限流暂停」：小字在数一堆没被上面那个数计进去的东西，
+   * 读起来像我们算错了。限流暂停自己有一格，冷却在卡片上看得到。
+   *
+   * 「没有额外 credits」曾经也算一项，但那是普通订阅的常态而不是风险（见 CreditsState），
+   * 于是这行小字里每个账号都占一条，把真正将满的那几个淹掉了。
+   */
   const attentionStatus = [
-    abnormalCount > 0
-      ? t(`${formatNumber(abnormalCount)} 异常`, `${formatNumber(abnormalCount)} banned`)
+    metrics.attentionKinds.banned > 0
+      ? t(
+          `${formatNumber(metrics.attentionKinds.banned)} 异常`,
+          `${formatNumber(metrics.attentionKinds.banned)} banned`,
+        )
       : '',
-    cooldownCount > 0
-      ? t(`${formatNumber(cooldownCount)} 冷却`, `${formatNumber(cooldownCount)} cooling down`)
-      : '',
-    pausedCount > 0
-      ? t(`${formatNumber(pausedCount)} 限流暂停`, `${formatNumber(pausedCount)} paused`)
-      : '',
-    metrics.nearLimitCount > 0
-      ? t(`${formatNumber(metrics.nearLimitCount)} 将满`, `${formatNumber(metrics.nearLimitCount)} near limit`)
+    metrics.attentionKinds.nearLimit > 0
+      ? t(
+          `${formatNumber(metrics.attentionKinds.nearLimit)} 将满`,
+          `${formatNumber(metrics.attentionKinds.nearLimit)} near limit`,
+        )
       : '',
   ].filter(Boolean).join(' · ') || undefined
-  // 「没有额外 credits」曾经也算一项，但那是普通订阅的常态而不是风险（见 CreditsState），
-  // 于是这行小字里每个账号都占一条，把真正将满的那几个淹掉了。
-  const quotaRiskStatus = metrics.nearLimitCount > 0
-    ? t(
-        `${formatNumber(metrics.nearLimitCount)} 将满`,
-        `${formatNumber(metrics.nearLimitCount)} near limit`,
-      )
-    : undefined
 
   const clearSelection = () => actions.onSelectedChange(new Set())
+  /**
+   * 一次把搜索 + 状态 + 套餐全清掉。
+   *
+   * 三处各有各的清除入口（搜索框里的 ✕、两个菜单里的「全部」），但「我想回到全部账号」是
+   * 一个意图，让人点三次是把内部结构摊给用户看。空结果那一屏本来就有这个按钮，工具栏里
+   * 反而没有——而人是在工具栏里筛的。
+   */
+  const clearFilters = () => {
+    actions.onQueryChange('')
+    actions.onFilterChange('all')
+    actions.onTierChange('all')
+    actions.onPageChange(1)
+    clearSelection()
+  }
   const changeQuery = (value: string) => {
     actions.onQueryChange(value)
     actions.onPageChange(1)
@@ -658,8 +745,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   >
                     <ListFilterIcon />
                     <span className="min-w-0 truncate">
-                      {activeFilterLabel}
+                      {filterTriggerLabel}
                     </span>
+                    {filterTriggerCount != null && (
+                      <span className="shrink-0 tnum text-xs text-muted-foreground">
+                        {formatNumber(filterTriggerCount)}
+                      </span>
+                    )}
                   </MenuTrigger>
                   <MenuPopup align="end" className="w-52">
                     <MenuRadioGroup value={filter}>
@@ -689,6 +781,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     <span className="min-w-0 truncate">
                       {activeTierLabel}
                     </span>
+                    {tierTriggerCount != null && (
+                      <span className="shrink-0 tnum text-xs text-muted-foreground">
+                        {formatNumber(tierTriggerCount)}
+                      </span>
+                    )}
                   </MenuTrigger>
                   <MenuPopup align="end" className="w-52">
                     <MenuRadioGroup value={tier}>
@@ -705,6 +802,27 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     </MenuRadioGroup>
                   </MenuPopup>
                 </Menu>
+
+                {/* 有筛选生效时才出现，位置在两个筛选之后：它清的是筛选，不是排序。窄屏独占
+                    一整行——它是这一组里唯一一个「动作」，挤在两个下拉旁边会被当成第三个筛选。 */}
+                {filtering && (
+                  <Button
+                    variant="ghost"
+                    onClick={clearFilters}
+                    // 它连搜索一起清，但按钮上只写「清除筛选」——搜索框自己有个 ✕，写全了
+                    // 反而长。完整语义放在悬浮/读屏文案里（同空结果那一屏那个按钮）。
+                    title={t('清除筛选与搜索', 'Clear filters and search')}
+                    aria-label={t('清除筛选与搜索', 'Clear filters and search')}
+                    className="max-sm:col-span-2 max-sm:w-full"
+                  >
+                    <XIcon />
+                    {t('清除筛选', 'Clear filters')}
+                  </Button>
+                )}
+
+                {/* 排序与筛选之间加一条线：三个按钮排一起看着像三个同类，而它改的是顺序、
+                    不是集合。窄屏本来就各占一行，不必再加线。 */}
+                <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
 
                 <Menu>
                   <MenuTrigger
@@ -799,15 +917,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               className="border-r border-b lg:border-b-0"
               label={t('可调度账号', 'Schedulable accounts')}
               value={`${formatNumber(schedulableCount)}/${formatNumber(count)}`}
-              status={schedulableCount < count
-                ? t(
-                    `${formatNumber(count - schedulableCount)} 暂不可用`,
-                    `${formatNumber(count - schedulableCount)} unavailable`,
-                  )
-                : t(
-                    `${formatNumber(enabledCount)} 已启用`,
-                    `${formatNumber(enabledCount)} enabled`,
-                  )}
+              // 不放小字：`20/24` 已经把「4 个不可用」说完了，再写一遍是拿值做减法。
+              // 不可用的原因（异常/冷却/限流暂停/手动停用）在悬浮提示与卡片上。
+              statusHint={t(
+                `${formatNumber(count)} 个号里 ${formatNumber(schedulableCount)} 个现在能被调度；其余的是异常、冷却、限流暂停或手动停用。`,
+                `${formatNumber(schedulableCount)} of ${formatNumber(count)} accounts can be scheduled right now; the rest are banned, cooling down, rate-limit paused, or manually disabled.`,
+              )}
               icon={ShieldCheckIcon}
               tone={schedulableCount > 0 ? 'ok' : 'bad'}
               active={filter === 'schedulable'}
@@ -819,7 +934,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               value={formatNumber(attentionCount)}
               status={attentionStatus}
               icon={TriangleAlertIcon}
-              tone={abnormalCount > 0 ? 'bad' : attentionCount > 0 ? 'warn' : 'neutral'}
+              // 红也按同一个口径：一个「带封禁原因但正被限流盖着」的号不该让这一格变红，
+              // 而它的值里并不包含那个号。
+              tone={metrics.attentionKinds.banned > 0 ? 'bad' : attentionCount > 0 ? 'warn' : 'neutral'}
               active={filter === 'attention'}
               onClick={() => selectMetric('attention')}
             />
@@ -827,7 +944,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               className="border-r border-b lg:border-b-0"
               label={t('用量风险', 'Usage risk')}
               value={formatNumber(quotaRiskCount)}
-              status={quotaRiskStatus}
+              // 这一格的小字曾经是「N 将满」——与上面那个数一字不差，纯粹占地方。
+              // 「将满」是什么意思放进悬浮提示。
+              statusHint={t(
+                '额度已过警戒线（默认 90%）的账号数。这些号会被暂时排到候选末尾，等窗口重置。',
+                'Accounts past the quota warning threshold (90% by default). They drop to the back of the rotation until their window resets.',
+              )}
               icon={RadioIcon}
               tone={quotaRiskCount > 0 ? 'warn' : 'neutral'}
               active={filter === 'nearLimit'}
@@ -837,9 +959,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               className="border-b lg:border-r lg:border-b-0"
               label={t('限流暂停', 'Rate-limit paused')}
               value={formatNumber(pausedCount)}
-              status={pausedCount > 0
-                ? t('到点自动恢复', 'Resume automatically')
-                : t('全部在池中', 'All in rotation')}
+              // 只在真有号被暂停时说话：那句「到点自动恢复」是看到这个数之后唯一想知道的事
+              // （不用管它）。为 0 时的「全部在池中」不改变任何判断，是纯噪声。
+              status={pausedCount > 0 ? t('到点自动恢复', 'Resume automatically') : undefined}
               icon={TimerResetIcon}
               tone={pausedCount > 0 ? 'warn' : 'neutral'}
               active={filter === 'paused'}
@@ -959,9 +1081,25 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </Empty>
             </Card>
           ) : view === 'list' ? (
-            <Table variant="card" className="table-fixed xl:table-auto xl:min-w-[72rem]">
+            <Table
+              variant="card"
+              // 最小宽度跟着列数收：少一列就少 10rem。写死一个数的话 table-auto 会把省下来
+              // 的宽度摊回给其余列——那一列是收掉了，横向滚动条却还在。
+              // 额度列现在是 w-40（条子上面多了一行窗口用量，见 [QuotaMeter]），故两列全在时
+              // 是 76rem——正好是这一页的最大内容宽度（.page-frame 80rem 减去左右各 2rem）。
+              className={cn(
+                'table-fixed xl:table-auto',
+                quotaColumns.primary && quotaColumns.secondary
+                  ? 'xl:min-w-[76rem]'
+                  : quotaColumns.primary || quotaColumns.secondary
+                    ? 'xl:min-w-[66rem]'
+                    : 'xl:min-w-[56rem]',
+              )}
+            >
               <TableCaption className="sr-only">{t('账号列表', 'Account list')}</TableCaption>
               <CredentialListHeader
+                quotaTitles={quotaTitles}
+                quotaColumns={quotaColumns}
                 selectable
                 sort={sort}
                 dir={dir}
@@ -977,6 +1115,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     key={item.id}
                     cred={item}
                     now={now}
+                    quotaColumns={quotaColumns}
+                    quotaTitles={quotaTitles}
                     selectable
                     selected={selected.has(item.id)}
                     onSelectedChange={toggleSelected}

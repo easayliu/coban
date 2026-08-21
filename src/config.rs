@@ -119,13 +119,24 @@ pub const ACCEPT_ENCODING: &str = "gzip, br";
 
 // ---------- 上游限流头 ----------
 
-/// 主额度窗口（通常是 5 小时）的已用百分比。
+/// 「主」「次」是**这两组头的名字，不是窗口的名字**——别按名字猜窗口长度。
+///
+/// 实测（2026-08，一批 ChatGPT Pro 号，六次真实请求覆盖三个号）：`primary` 报的是**周**窗口
+/// （`primary-window-minutes: 10080`），而 `secondary` 整组是空的（长度 0、重置时刻空串）。
+/// 上游同时还发了另一族带代号的头（`x-codex-bengalfox-*`，自带
+/// `bengalfox-limit-name: GPT-5.3-Codex-Spark`，其 primary 是 300 分钟即 5 小时），以及一个
+/// `x-codex-active-limit: premium`——看着像是「当前生效的那一族落在通用的 primary/secondary
+/// 槽里，别的族各挂自己的代号前缀」。那一族 coban 不读：代号随时会变，而它自带的 limit-name
+/// 说明那是某个模型的限额，不是账号的。
+///
+/// 所以窗口长度**只能从 `*_WINDOW_MINUTES` 读**，界面上的列名也是这么算出来的
+/// （见 admin-ui 的 `quotaWindowTitle`）。
 pub const RL_PRIMARY_USED_PCT: &str = "x-codex-primary-used-percent";
-/// 主额度窗口的长度（分钟）。
+/// 主额度窗口的长度（分钟）。**唯一**能说出那是哪个窗口的东西，见上面那条注。
 pub const RL_PRIMARY_WINDOW_MINUTES: &str = "x-codex-primary-window-minutes";
 /// 主额度窗口的重置时刻。
 pub const RL_PRIMARY_RESET_AT: &str = "x-codex-primary-reset-at";
-/// 次额度窗口（通常是 7 天/月）的已用百分比。
+/// 次额度窗口的已用百分比。**上游可能整组不发**（见上面那条注）。
 pub const RL_SECONDARY_USED_PCT: &str = "x-codex-secondary-used-percent";
 /// 次额度窗口的长度（分钟）。
 pub const RL_SECONDARY_WINDOW_MINUTES: &str = "x-codex-secondary-window-minutes";

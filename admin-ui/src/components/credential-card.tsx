@@ -16,7 +16,6 @@ import {
   cn,
   displayCredentialLabel,
   formatCompactNumber,
-  formatCountdown,
   formatFullTime,
   formatPercent,
   formatTokens,
@@ -32,16 +31,15 @@ import {
   evaluateCredential,
   planBadgeVariant,
   planLabel,
-  quotaWindowLabel,
+  QuotaMeter,
   switchTitle,
   useCredentialActions,
-  type QuotaWindowMeta,
 } from '@/components/credential-shared'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Badge, badgeVariants, type BadgeProps } from '@/components/ui/badge'
+import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -56,13 +54,6 @@ import {
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Menu, MenuTrigger } from '@/components/ui/menu'
-import {
-  Meter,
-  MeterIndicator,
-  MeterLabel,
-  MeterTrack,
-  MeterValue,
-} from '@/components/ui/meter'
 import { Separator } from '@/components/ui/separator'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
@@ -420,6 +411,8 @@ export const CredentialCard = memo(function CredentialCard({
                     window={w}
                     snapshotTs={quota.snapshotTs}
                     now={now}
+                    usage="facts"
+                    showCountdown
                   />
                 ))}
               </div>
@@ -618,151 +611,3 @@ export const CredentialCard = memo(function CredentialCard({
     </li>
   )
 })
-
-/**
- * 窗口用量里的一个事实：一枚小徽章，值在里面、单位在后面，全称与精确值进悬浮提示。
- *
- * 用 `dt`/`dd` 而不是两个 span：标签本身在界面上是省掉的（三个数各带各的单位/符号，
- * 一眼分得清），但读屏得念得出「请求数 399」而不是光一个「399」。
- */
-function QuotaFact({
-  label,
-  value,
-  suffix,
-  hint,
-}: {
-  label: string
-  value: string
-  suffix?: string
-  /** 提示里跟在标签后面的明细（精确值、口径说明）；不传则只显示标签。 */
-  hint?: string
-}) {
-  const { t } = useI18n()
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={<div />}
-        delay={0}
-        className={cn(
-          badgeVariants({ variant: 'secondary', size: 'sm' }),
-          'min-w-0 gap-0.5 font-normal',
-        )}
-      >
-        <dt className="sr-only">{label}</dt>
-        <dd className="truncate tabular-nums">{value}</dd>
-        {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
-      </TooltipTrigger>
-      <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
-        {hint ? t(`${label}：${hint}`, `${label}: ${hint}`) : label}
-      </TooltipPopup>
-    </Tooltip>
-  )
-}
-
-/** 窗口标签的固定配色：分类色，与占用无关——主额度一色、次额度一色。 */
-const WINDOW_VARIANT: Record<QuotaWindowMeta['key'], BadgeProps['variant']> = {
-  primary: 'info',
-  secondary: 'success',
-}
-
-function QuotaMeter({
-  credentialLabel,
-  window: w,
-  snapshotTs,
-  now,
-}: {
-  credentialLabel: string
-  window: QuotaWindowMeta
-  snapshotTs: number | null
-  /** 页面时钟（30 秒一跳），倒计时靠它走，见 [formatCountdown]。 */
-  now: number
-}) {
-  const { t, language, locale } = useI18n()
-  const label = quotaWindowLabel(w, language)
-  // 窗口过了重置点，上游那份使用率就作废了（[evaluateWindow] 把 percentage 抹成 null），
-  // 此时这个窗口的用量确实归了零——直接按 0% 画，不再单独摆一句「已重置 / 暂无数据」：
-  // 那句话占着和数据一样大的地方，说的却只是「这里没什么可看」。
-  const percentage = w.percentage ?? 0
-  const indicatorClass = w.level === 'critical'
-    ? 'bg-destructive'
-    : w.level === 'warning'
-      ? 'bg-warning'
-      : 'bg-success'
-  const valueClass = w.level === 'critical'
-    ? 'text-destructive'
-    : w.level === 'warning'
-      ? 'text-warning-foreground'
-      : 'text-foreground'
-
-  return (
-    <Meter value={percentage} max={100} className="gap-1.5">
-      {/* 数据先行、进度条随后：三个事实是「这个窗口里发生了什么」，百分比是「还剩多少」。
-          分两行排而不是挤成一行——挤在一行时标签与数值交替出现，眼睛得逐个配对。 */}
-      {w.usage && (
-        <dl className="flex min-w-0 flex-wrap items-center gap-1">
-          <QuotaFact
-            label={t('请求数', 'Requests')}
-            value={formatCompactNumber(w.usage.requests, locale)}
-            hint={w.usage.requests.toLocaleString(locale)}
-            suffix="req"
-          />
-          {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：命中缓存的输入按
-              十分之一计价，重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是
-              只留其中一个。不带 `tok` 后缀：`65.7M` 的量纲一眼就是 token（隔壁一个带 req、
-              一个带 $），那三个字母只会把这行本就不宽的地方再挤掉一截。 */}
-          <QuotaFact
-            label={t('总 token', 'Total tokens')}
-            value={formatTokens(w.usage.tokens)}
-            hint={t(
-              `${w.usage.tokens.toLocaleString(locale)}（输入 + 输出，上游 usage 口径；输入已含命中缓存的部分、输出已含 reasoning，不重复计）`,
-              `${w.usage.tokens.toLocaleString(locale)} (input + output per the upstream usage fields; input already includes cache hits and output already includes reasoning, so nothing is double counted)`,
-            )}
-          />
-          <QuotaFact
-            label={t('等价费用', 'Equivalent cost')}
-            value={formatUsd(w.usage.cost_usd)}
-            hint={t(
-              '按官方 API 价目估的等价花费，不是账单——订阅模式扣的是额度。价目表认不出的模型记 0，所以这是下限',
-              'Estimated from official API rates, not a bill — a subscription spends quota. Models missing from the price table count as 0, so this is a lower bound',
-            )}
-          />
-        </dl>
-      )}
-      <div className="flex min-w-0 items-center gap-1.5">
-        {/* 窗口名做成固定色的小标签（主 / 次各一色）：它是分类而不是状态，配色跟右边那组
-            表示占用的红黄绿分开，两侧各管一件事。 */}
-        <MeterLabel
-          className={cn(
-            badgeVariants({ variant: WINDOW_VARIANT[w.key], size: 'sm' }),
-            'shrink-0 tabular-nums',
-          )}
-        >
-          <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
-          {label}
-          <span className="sr-only">{t('用量', 'usage')}</span>
-        </MeterLabel>
-        <MeterTrack className="h-1.5 min-w-6 flex-1 rounded-full">
-          <MeterIndicator className={cn(indicatorClass, 'rounded-full')} />
-        </MeterTrack>
-        <MeterValue
-          className={cn('shrink-0 font-medium text-xs', valueClass)}
-          title={snapshotTs != null
-            ? t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)
-            : undefined}
-        >
-          {() => `${percentage}%`}
-        </MeterValue>
-        {/* 距离重置还有多久。倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；
-            精确到分秒的绝对时刻放在 title 里——倒计时受本地时钟偏差影响，只适合看个大概。 */}
-        {w.resetAt != null && w.resetAt > now && (
-          <span
-            className="shrink-0 whitespace-nowrap text-2xs text-muted-foreground tabular-nums"
-            title={t(`${formatFullTime(w.resetAt, language)} 重置`, `Resets ${formatFullTime(w.resetAt, language)}`)}
-          >
-            {formatCountdown(w.resetAt, now)}
-          </span>
-        )}
-      </div>
-    </Meter>
-  )
-}

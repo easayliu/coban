@@ -11,8 +11,8 @@ import {
   type Credential, type ProbeResult, type Quota, type WindowUsage,
 } from '@/api/credentials'
 import {
-  cn, displayCredentialLabel, extractError, formatClockTime, formatFullTime,
-  localizeBackendMessage,
+  cn, displayCredentialLabel, extractError, formatClockTime, formatCompactNumber, formatCountdown,
+  formatFullTime, formatTokens, formatUsd, localizeBackendMessage,
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import {
@@ -20,7 +20,7 @@ import {
   AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Badge, type BadgeProps } from '@/components/ui/badge'
+import { Badge, badgeVariants, type BadgeProps } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Combobox, ComboboxItem, ComboboxPopup, ComboboxTrigger, ComboboxValue,
@@ -32,8 +32,12 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/u
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { MenuItem, MenuPopup, MenuSeparator } from '@/components/ui/menu'
+import {
+  Meter, MeterIndicator, MeterLabel, MeterTrack, MeterValue,
+} from '@/components/ui/meter'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /** RPM 上限输入框的初值：跟随默认→空串；明确不限→0；独立上限→数值。 */
 export function limitToInput(rpmLimit: number): string {
@@ -210,6 +214,33 @@ export function quotaWindowLabel(
   if (m % (60 * 24) === 0) return `${m / (60 * 24)}d`
   if (m % 60 === 0) return `${m / 60}h`
   return `${m}m`
+}
+
+/**
+ * 窗口长度 → **完整名**（`10080` → `周`，`300` → `5 小时`）。给表头这类有地方写全的位置用；
+ * 芯片上那种一格宽的位置继续用 {@link quotaWindowLabel} 的 `7d` / `5h`。
+ *
+ * 上游没报窗口长度时返回 `null`——调用方据此退回「主/次额度」这种通用名，而不是编一个。
+ * 写死成「主额度就是 5 小时」是错的：实测同一批 Pro 账号上，`x-codex-primary-*` 报的是
+ * **周**窗口（10080 分钟），而 5 小时那个窗口压根没出现在这一对头里。
+ */
+export function quotaWindowTitle(
+  windowMinutes: number | null | undefined,
+  language: Language,
+): string | null {
+  const m = windowMinutes
+  if (m == null || m <= 0) return null
+  // 一周单独说「周」：`7 天` 也对，但人嘴里说的是「周限制」。
+  if (m === 60 * 24 * 7) return localize(language, '周', 'Weekly')
+  if (m % (60 * 24) === 0) {
+    const d = m / (60 * 24)
+    return localize(language, `${d} 天`, `${d}-day`)
+  }
+  if (m % 60 === 0) {
+    const h = m / 60
+    return localize(language, `${h} 小时`, `${h}-hour`)
+  }
+  return localize(language, `${m} 分钟`, `${m}-minute`)
 }
 
 /** 把最新额度快照解释成当前可展示的窗口与风险。 */
@@ -594,6 +625,194 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void) {
 }
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
+
+/**
+ * 窗口用量里的一个事实：一枚小徽章，值在里面、单位在后面，全称与精确值进悬浮提示。
+ *
+ * 用 `dt`/`dd` 而不是两个 span：标签本身在界面上是省掉的（三个数各带各的单位/符号，
+ * 一眼分得清），但读屏得念得出「请求数 399」而不是光一个「399」。
+ */
+function QuotaFact({
+  label,
+  value,
+  suffix,
+  hint,
+}: {
+  label: string
+  value: string
+  suffix?: string
+  /** 提示里跟在标签后面的明细（精确值、口径说明）；不传则只显示标签。 */
+  hint?: string
+}) {
+  const { t } = useI18n()
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={<div />}
+        delay={0}
+        className={cn(
+          badgeVariants({ variant: 'secondary', size: 'sm' }),
+          'min-w-0 gap-0.5 font-normal',
+        )}
+      >
+        <dt className="sr-only">{label}</dt>
+        <dd className="truncate tabular-nums">{value}</dd>
+        {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
+        {hint ? t(`${label}：${hint}`, `${label}: ${hint}`) : label}
+      </TooltipPopup>
+    </Tooltip>
+  )
+}
+
+/** 窗口标签的固定配色：分类色，与占用无关——主额度一色、次额度一色。 */
+const WINDOW_VARIANT: Record<QuotaWindowMeta['key'], BadgeProps['variant']> = {
+  primary: 'info',
+  secondary: 'success',
+}
+
+/**
+ * 额度窗口那根条子。**卡片和列表画的是同一个组件**：分级配色、圆角与粗细、百分比的读法
+ * 都得一致——同一个 100% 在两处长得不一样，会让人以为是两个不同的量。
+ *
+ * 两边的差别只有「摆得下多少」，各用一个开关控制，其余一模一样：
+ * - `usage`：条子上方那行窗口用量（请求数 / token / 等价费用）——这三项都只算**当前这个
+ *   窗口**，与列表右边那几列的终身累计不是一回事。`facts` 是卡片的排法（三枚小徽章，各带
+ *   全称与精确值的提示）；`inline` 是表格的排法（压成一行小字：一格 140px 装不下三枚徽章，
+ *   光徽章内边距就要 18px，还会折成三行），精确值交给这一行自己的 title。
+ * - `showCountdown`：距重置还有多久。同上——整页最宽 1216px（见 .page-frame 的 80rem），
+ *   表格行内再多一段就得从账号名那列借宽度，故也收进悬浮提示。
+ * - `showWindowLabel`：`7d` / `5h` 那枚小标签。卡片没有表头，全靠它认窗口；表格的列头多数
+ *   时候已经写着窗口名（见 credential-workspace 的 `quotaTitles`），那时它是重复的，收掉。
+ *   **只收视觉**：读屏仍要念出「7d 用量 100%」，所以标签本身还在，只是变成 sr-only。
+ */
+export function QuotaMeter({
+  credentialLabel,
+  window: w,
+  snapshotTs,
+  now,
+  usage = 'none',
+  showCountdown = false,
+  showWindowLabel = true,
+  className,
+}: {
+  credentialLabel: string
+  window: QuotaWindowMeta
+  snapshotTs: number | null
+  /** 页面时钟（30 秒一跳），倒计时靠它走，见 [formatCountdown]。 */
+  now: number
+  usage?: 'none' | 'facts' | 'inline'
+  showCountdown?: boolean
+  showWindowLabel?: boolean
+  className?: string
+}) {
+  const { t, language, locale } = useI18n()
+  const label = quotaWindowLabel(w, language)
+  // 窗口过了重置点，上游那份使用率就作废了（[evaluateWindow] 把 percentage 抹成 null），
+  // 此时这个窗口的用量确实归了零——直接按 0% 画，不再单独摆一句「已重置 / 暂无数据」：
+  // 那句话占着和数据一样大的地方，说的却只是「这里没什么可看」。
+  const percentage = w.percentage ?? 0
+  const indicatorClass = w.level === 'critical'
+    ? 'bg-destructive'
+    : w.level === 'warning'
+      ? 'bg-warning'
+      : 'bg-success'
+  const valueClass = w.level === 'critical'
+    ? 'text-destructive'
+    : w.level === 'warning'
+      ? 'text-warning-foreground'
+      : 'text-foreground'
+
+  return (
+    <Meter value={percentage} max={100} className={cn('gap-1.5', className)}>
+      {/* 数据先行、进度条随后：三个事实是「这个窗口里发生了什么」，百分比是「还剩多少」。
+          分两行排而不是挤成一行——挤在一行时标签与数值交替出现，眼睛得逐个配对。 */}
+      {usage === 'facts' && w.usage && (
+        <dl className="flex min-w-0 flex-wrap items-center gap-1">
+          <QuotaFact
+            label={t('请求数', 'Requests')}
+            value={formatCompactNumber(w.usage.requests, locale)}
+            hint={w.usage.requests.toLocaleString(locale)}
+            suffix="req"
+          />
+          {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：命中缓存的输入按
+              十分之一计价，重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是
+              只留其中一个。不带 `tok` 后缀：`65.7M` 的量纲一眼就是 token（隔壁一个带 req、
+              一个带 $），那三个字母只会把这行本就不宽的地方再挤掉一截。 */}
+          <QuotaFact
+            label={t('总 token', 'Total tokens')}
+            value={formatTokens(w.usage.tokens)}
+            hint={t(
+              `${w.usage.tokens.toLocaleString(locale)}（输入 + 输出，上游 usage 口径；输入已含命中缓存的部分、输出已含 reasoning，不重复计）`,
+              `${w.usage.tokens.toLocaleString(locale)} (input + output per the upstream usage fields; input already includes cache hits and output already includes reasoning, so nothing is double counted)`,
+            )}
+          />
+          <QuotaFact
+            label={t('等价费用', 'Equivalent cost')}
+            value={formatUsd(w.usage.cost_usd)}
+            hint={t(
+              '按官方 API 价目估的等价花费，不是账单——订阅模式扣的是额度。价目表认不出的模型记 0，所以这是下限',
+              'Estimated from official API rates, not a bill — a subscription spends quota. Models missing from the price table count as 0, so this is a lower bound',
+            )}
+          />
+        </dl>
+      )}
+      {/* 表格里的同三项：同样的取数与格式化，只是换成一行小字。字号跟卡片那三枚徽章一样
+          （.625rem），11px 的 text-2xs 排下来会超出 140px 那一格。
+          分隔点用伪元素而不是插 span：`dl` 里只放 `dt`/`dd` 才是合法结构。
+          **不挂 title**：调用方（表格）整格都套在悬浮提示里，再加一个原生 title 会两层提示
+          一起冒；精确值由那份提示给（见 credential-row 的 [ListQuotaMeter]）。 */}
+      {usage === 'inline' && w.usage && (
+        <dl className="flex min-w-0 items-center gap-1 truncate text-[.625rem] text-muted-foreground tabular-nums">
+          <dt className="sr-only">{t('请求数', 'Requests')}</dt>
+          <dd className="shrink-0">
+            {formatCompactNumber(w.usage.requests, locale)}
+            <span className="ml-0.5" aria-hidden>req</span>
+          </dd>
+          <dt className="sr-only">{t('总 token', 'Total tokens')}</dt>
+          <dd className="shrink-0 before:mr-1 before:content-['·']">{formatTokens(w.usage.tokens)}</dd>
+          <dt className="sr-only">{t('等价费用', 'Equivalent cost')}</dt>
+          <dd className="truncate before:mr-1 before:content-['·']">{formatUsd(w.usage.cost_usd)}</dd>
+        </dl>
+      )}
+      <div className="flex min-w-0 items-center gap-1.5">
+        {/* 窗口名做成固定色的小标签（主 / 次各一色）：它是分类而不是状态，配色跟右边那组
+            表示占用的红黄绿分开，两侧各管一件事。 */}
+        <MeterLabel
+          className={showWindowLabel
+            ? cn(badgeVariants({ variant: WINDOW_VARIANT[w.key], size: 'sm' }), 'shrink-0 tabular-nums')
+            : 'sr-only'}
+        >
+          <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
+          {label}
+          <span className="sr-only">{t('用量', 'usage')}</span>
+        </MeterLabel>
+        <MeterTrack className="h-1.5 min-w-6 flex-1 rounded-full">
+          <MeterIndicator className={cn(indicatorClass, 'rounded-full')} />
+        </MeterTrack>
+        <MeterValue
+          className={cn('shrink-0 font-medium text-xs', valueClass)}
+          title={snapshotTs != null
+            ? t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)
+            : undefined}
+        >
+          {() => `${percentage}%`}
+        </MeterValue>
+        {/* 距离重置还有多久。倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；
+            精确到分秒的绝对时刻放在 title 里——倒计时受本地时钟偏差影响，只适合看个大概。 */}
+        {showCountdown && w.resetAt != null && w.resetAt > now && (
+          <span
+            className="shrink-0 whitespace-nowrap text-2xs text-muted-foreground tabular-nums"
+            title={t(`${formatFullTime(w.resetAt, language)} 重置`, `Resets ${formatFullTime(w.resetAt, language)}`)}
+          >
+            {formatCountdown(w.resetAt, now)}
+          </span>
+        )}
+      </div>
+    </Meter>
+  )
+}
 
 /**
  * ⋯ 菜单内容（刷新 / 重命名 / 上限 / 代理 / 删除），卡片与列表共用。
