@@ -1,0 +1,34 @@
+# Rust 构建产物
+/target
+
+# Backtrace/debug symbols
+*.pdb
+
+# 前端依赖与构建产物（构建前需在 admin-ui 执行 pnpm install && pnpm build）
+/admin-ui/node_modules
+/admin-ui/dist
+
+# pnpm 的本地内容寻址 store 与调试日志
+/.pnpm-store
+.pnpm-debug.log*
+
+# SQLite 凭证库（含 WAL/SHM）
+*.db
+*.db-wal
+*.db-shm
+/config/
+
+# env file
+.env
+
+# HTTPS 抓包（对齐官方 codex 客户端形态时的基准样本，含真实请求头与 token，不入库）
+/cap/
+
+# Editor/IDE
+.claude/
+
+# 本地调试日志
+*.log
+
+# TS 增量构建缓存
+/admin-ui/tsconfig.tsbuildinfo

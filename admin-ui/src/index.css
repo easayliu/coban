@@ -1,0 +1,361 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-heading: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-serif: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  /* 套餐档位专用色，见下面 :root 里的注释——不与状态色共用。 */
+  --color-plan: var(--plan);
+  --color-plan-foreground: var(--plan-foreground);
+  --color-plan-high: var(--plan-high);
+  --color-plan-high-foreground: var(--plan-high-foreground);
+
+  --animate-skeleton: skeleton 2s -1s infinite linear;
+  --animate-toast-success-odd: toast-success-odd 0.32s cubic-bezier(0.5, 1, 0.89, 1);
+  --animate-toast-success-even: toast-success-even 0.32s cubic-bezier(0.5, 1, 0.89, 1);
+  --animate-toast-error-odd: toast-error-odd 0.28s cubic-bezier(0.5, 1, 0.89, 1);
+  --animate-toast-error-even: toast-error-even 0.28s cubic-bezier(0.5, 1, 0.89, 1);
+
+  @keyframes skeleton {
+    to {
+      background-position: -200% 0;
+    }
+  }
+
+  @keyframes toast-success-odd {
+    0% {
+      scale: 1;
+    }
+    30% {
+      scale: 1.025;
+    }
+    60% {
+      scale: 0.99;
+    }
+    100% {
+      scale: 1;
+    }
+  }
+
+  @keyframes toast-success-even {
+    0% {
+      scale: 1;
+    }
+    30% {
+      scale: 1.025;
+    }
+    60% {
+      scale: 0.99;
+    }
+    100% {
+      scale: 1;
+    }
+  }
+
+  @keyframes toast-error-odd {
+    0%,
+    100% {
+      translate: 0 0;
+    }
+    25%,
+    75% {
+      translate: -3px 0;
+    }
+    50% {
+      translate: 3px 0;
+    }
+  }
+
+  @keyframes toast-error-even {
+    0%,
+    100% {
+      translate: 0 0;
+    }
+    25%,
+    75% {
+      translate: -3px 0;
+    }
+    50% {
+      translate: 3px 0;
+    }
+  }
+}
+
+:root {
+  --accent: --alpha(var(--color-black) / 4%);
+  --accent-foreground: var(--color-neutral-800);
+  --background: var(--color-white);
+  --border: --alpha(var(--color-black) / 8%);
+  --card: var(--color-white);
+  --card-foreground: var(--color-neutral-800);
+  --destructive: var(--color-red-500);
+  --destructive-foreground: var(--color-red-700);
+  --foreground: var(--color-neutral-800);
+  --info: var(--color-blue-500);
+  --info-foreground: var(--color-blue-700);
+  --input: --alpha(var(--color-black) / 10%);
+  --muted: --alpha(var(--color-black) / 4%);
+  --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-black));
+  /* 套餐档位。绿/琥珀/红在这套界面里全是**状态**语义（健康/风险/故障），套餐借过来就会
+     出现「绿色的 Pro」被读成「这个号很健康」。故档位单开一族紫，与状态色互不干涉；
+     档位高低靠色相往洋红推进（Pro 蓝 → Max 紫 → Max 20x 洋红），见 tierBadgeVariant。 */
+  --plan: var(--color-violet-500);
+  --plan-foreground: var(--color-violet-700);
+  --plan-high: var(--color-fuchsia-500);
+  --plan-high-foreground: var(--color-fuchsia-700);
+  --popover: var(--color-white);
+  --popover-foreground: var(--color-neutral-800);
+  --primary: var(--color-neutral-800);
+  --primary-foreground: var(--color-neutral-50);
+  --ring: var(--color-neutral-400);
+  --secondary: --alpha(var(--color-black) / 4%);
+  --secondary-foreground: var(--color-neutral-800);
+  --success: var(--color-emerald-500);
+  --success-foreground: var(--color-emerald-700);
+  --warning: var(--color-amber-500);
+  --warning-foreground: var(--color-amber-700);
+}
+
+.dark {
+  --accent: --alpha(var(--color-white) / 4%);
+  --accent-foreground: var(--color-neutral-100);
+  --background: color-mix(in srgb, var(--color-neutral-950) 95%, var(--color-white));
+  --border: --alpha(var(--color-white) / 6%);
+  --card: color-mix(in srgb, var(--background) 98%, var(--color-white));
+  --card-foreground: var(--color-neutral-100);
+  --destructive: color-mix(in srgb, var(--color-red-500) 90%, var(--color-white));
+  --destructive-foreground: var(--color-red-400);
+  --foreground: var(--color-neutral-100);
+  --info: var(--color-blue-500);
+  --info-foreground: var(--color-blue-400);
+  --input: --alpha(var(--color-white) / 8%);
+  --muted: --alpha(var(--color-white) / 4%);
+  --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-white));
+  --plan: var(--color-violet-500);
+  --plan-foreground: var(--color-violet-400);
+  --plan-high: var(--color-fuchsia-500);
+  --plan-high-foreground: var(--color-fuchsia-400);
+  --popover: color-mix(in srgb, var(--background) 98%, var(--color-white));
+  --popover-foreground: var(--color-neutral-100);
+  --primary: var(--color-neutral-100);
+  --primary-foreground: var(--color-neutral-800);
+  --ring: var(--color-neutral-500);
+  --secondary: --alpha(var(--color-white) / 4%);
+  --secondary-foreground: var(--color-neutral-100);
+  --success: var(--color-emerald-500);
+  --success-foreground: var(--color-emerald-400);
+  --warning: var(--color-amber-500);
+  --warning-foreground: var(--color-amber-400);
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--border);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--muted-foreground) 35%, transparent) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-track,
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    min-height: 40px;
+    border: 3px solid transparent;
+    border-radius: 9999px;
+    background-color: color-mix(in srgb, var(--muted-foreground) 32%, transparent);
+    background-clip: padding-box;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+  }
+
+  *::-webkit-scrollbar-thumb:active {
+    background-color: color-mix(in srgb, var(--muted-foreground) 65%, transparent);
+  }
+
+  html {
+    color-scheme: light;
+    scrollbar-gutter: stable;
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    @apply font-sans;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    position: relative;
+    min-height: 100svh;
+    @apply bg-background font-sans text-foreground antialiased;
+  }
+
+  button,
+  input,
+  optgroup,
+  select,
+  textarea,
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: inherit;
+  }
+
+  #root {
+    position: relative;
+    isolation: isolate;
+    min-height: 100svh;
+  }
+}
+
+@layer components {
+  .app-shell {
+    background: var(--muted);
+  }
+
+  .app-header {
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .settings-tabs-bar {
+    top: calc(3.5rem + env(safe-area-inset-top));
+  }
+
+  .page-frame {
+    width: 100%;
+    max-width: 80rem;
+    margin-inline: auto;
+    padding-left: max(1rem, env(safe-area-inset-left));
+    padding-right: max(1rem, env(safe-area-inset-right));
+  }
+
+  .app-footer-bar {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .brand-mark {
+    color: var(--primary-foreground);
+    background: var(--primary);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+
+  @media (min-width: 40rem) {
+    .settings-tabs-bar {
+      top: calc(4rem + env(safe-area-inset-top));
+    }
+
+    .page-frame {
+      padding-left: max(1.5rem, env(safe-area-inset-left));
+      padding-right: max(1.5rem, env(safe-area-inset-right));
+    }
+  }
+
+  @media (min-width: 80rem) {
+    .page-frame {
+      padding-left: max(2rem, env(safe-area-inset-left));
+      padding-right: max(2rem, env(safe-area-inset-right));
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+@utility tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+@utility scrollbar-dialog {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  scrollbar-gutter: stable;
+
+  &::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-track:vertical {
+    margin-block: 8px;
+  }
+
+  &::-webkit-scrollbar-track:horizontal {
+    margin-inline: 8px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    min-height: 48px;
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background-color: var(--border);
+    background-clip: padding-box;
+  }
+
+  &::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in srgb, var(--muted-foreground) 42%, transparent);
+  }
+
+  &::-webkit-scrollbar-thumb:active {
+    background-color: color-mix(in srgb, var(--muted-foreground) 58%, transparent);
+  }
+}

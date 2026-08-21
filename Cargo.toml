@@ -1,0 +1,53 @@
+[package]
+name = "coban"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+base64 = "0.22.1"
+clap = { version = "4.6.4", features = ["derive", "env"] }
+dirs = "6.0.0"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+mime_guess = "2"
+parking_lot = "0.12.5"
+rand = "0.10.2"
+rusqlite = { version = "0.34", features = ["bundled"] }
+rust-embed = "8"
+serde = { version = "1.0.229", features = ["derive"] }
+# preserve_order：Map 换成 IndexMap，保留 JSON 对象的原始 key 顺序。
+# 转发前若要改写请求体（注入 instructions、补 store 字段等）得原样重新序列化，默认的
+# BTreeMap 会把整个 body 的 key 按字母序重排——官方 codex 客户端不会产生的排列，
+# 一次精确比对即可判定中间有代理。见 proxy::rewrite_body。
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter"] }
+# wreq 取代 reqwest：**逐头指定大小写与头序**（`OrigHeaderMap`）是 hyper/reqwest 给不出的
+# 能力，而 codex CLI 发的头有固定的顺序与大小写形态（`chatgpt-account-id`/`originator`/
+# `session_id` 全小写，标准头首字母大写）。类型同源（wreq 转出 `http` crate 的
+# HeaderMap/StatusCode），故 axum 侧与 proxy 的头处理无需转换层。
+#
+# **版本必须钉死**：`"6.0.0-rc.29"` 这种写法会被解析成任意更高的 `6.0.0-rc.N`
+# （pre-release 的 caret 匹配），冒出 rc.30 就可能突然编不过。
+#
+# **`tokio-rt` 必须显式带上**：关掉 default-features 会连运行时一起关掉，报错是
+# 「`TcpConnector` 找不到 / `GaiResolver::new` 不存在」，完全指不到 feature 上。
+#
+# socks：逐账号代理要支持 `socks5://`/`socks5h://`。**不开这个 feature 不是「不支持」而是
+# 「静默走错路」**：wreq 的 socks 分支整段挂在 `#[cfg(feature = "socks")]` 下，没开时一个
+# socks5 的代理 URI 会掉到 HTTP 代理那条路上，按 CONNECT 隧道去连，最后在连接阶段失败，
+# 报错里还只字不提 socks。
+#
+# gzip/brotli/zstd/deflate：转发时按官方客户端形态声明 `accept-encoding`，上游
+# （Cloudflare）就真的会压——连几百字节的错误体都压，SSE 也不例外。不开这几个 feature
+# 的话响应体是压缩字节，用量嗅探与账号级错误判定全部拿不到数据。四个必须都开：
+# 声明了哪几种，上游就可能挑其中任意一种。解压只发生在收到字节之后，发给上游的请求
+# 逐字节不变（见 clients::upstream_client）。
+wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "gzip", "brotli", "zstd", "deflate", "socks"] }
+
+[dev-dependencies]
+# 测试 Axum 路由的实际 HTTP 方法匹配行为。
+tower = { version = "0.5", features = ["util"] }

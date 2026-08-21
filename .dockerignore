@@ -1,0 +1,41 @@
+# Rust 构建产物
+target/
+
+# 前端依赖与构建产物（Docker 内会重新构建）
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/tsconfig.tsbuildinfo
+admin-ui/.vite/
+
+# 版本控制
+.git/
+.gitignore
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude / AI
+.claude/
+CLAUDE.md
+AGENTS.md
+
+# CI/部署文件（不进构建上下文镜像层）
+.github/
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# 文档
+*.md
+
+# 本地运行时数据
+config/
+.env
+
+# OS
+.DS_Store
+Thumbs.db

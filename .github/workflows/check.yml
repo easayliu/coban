@@ -1,0 +1,62 @@
+# 排版与测试门禁。
+#
+# fmt 刻意与 test 分开：`cargo fmt --check` 不需要编译，也就不需要 admin-ui/dist
+#（rust-embed 在编译期读取该目录），十几秒即可完成，能最快挡住风格漂移。
+name: Check
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: 排版检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # 排版规则由 rustfmt.toml 的 style_edition 冻结，故不必 pin toolchain 版本。
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # rust-embed 编译期要读 admin-ui/dist。测试不关心前端内容，给个占位目录即可，
+      # 省掉一次几十秒的前端构建。
+      - name: Stub admin-ui/dist
+        run: mkdir -p admin-ui/dist && echo '<!doctype html><title>coban</title>' > admin-ui/dist/index.html
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # wreq 走 BoringSSL(btls-sys)，源码编译需要 cmake；runner 一般自带，
+      # 先探测再装，且卡上时限，不让整个 job 被 apt 拖住。
+      - name: Ensure cmake (BoringSSL 需要)
+        timeout-minutes: 5
+        run: |
+          if command -v cmake >/dev/null 2>&1; then cmake --version; exit 0; fi
+          export DEBIAN_FRONTEND=noninteractive
+          sudo -E apt-get update
+          sudo -E apt-get install -y --no-install-recommends cmake
+      - run: cargo test --locked
+
+  frontend:
+    name: 前端类型检查与构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - working-directory: admin-ui
+        run: pnpm install --frozen-lockfile && pnpm build

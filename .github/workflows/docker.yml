@@ -1,0 +1,49 @@
+name: Docker
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: 构建并推送镜像到 GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.v.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          # 缓存放 registry 而不是 type=gha：GHA 缓存按 ref 隔离，而本工作流只在 v* tag 上
+          # 触发，于是每个 tag 各写各的 scope、永远读不到上一个 tag 的（GitHub 文档：
+          # 「Workflow runs also cannot restore caches created for different tag names.」）。
+          # registry 后端没有这条限制，tag 之间可互读；目标不存在时只是导入失败、构建照常继续。
+          #
+          # **mode=max 必须保留**：默认的 min 只导出最终阶段的层，而依赖预编译层在 builder
+          # 这个中间阶段里，min 模式下它根本不会进缓存。
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}

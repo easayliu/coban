@@ -1,0 +1,48 @@
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    name: Linux x86_64 二进制
+    runs-on: ubuntu-latest
+    # 默认 360 分钟意味着一次卡死就白烧 6 小时额度，收紧到 25 分钟。
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      # 必须在 cargo build 之前：rust-embed 在编译期读取 admin-ui/dist。
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile && pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ensure cmake (BoringSSL 需要)
+        timeout-minutes: 5
+        run: |
+          if command -v cmake >/dev/null 2>&1; then cmake --version; exit 0; fi
+          export DEBIAN_FRONTEND=noninteractive
+          sudo -E apt-get update
+          sudo -E apt-get install -y --no-install-recommends cmake
+
+      - run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coban-linux-x64
+          path: target/release/coban
+          if-no-files-found: error

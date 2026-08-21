@@ -1,0 +1,9 @@
+# 排版对齐 luban 的宽风格：默认配置会把单行 if-else、结构体字面量、链式调用统统拆成
+# 多行（默认阈值 50/18/60 字符），与本仓库贴近 100 列的紧凑写法冲突。`Max` 把这些阈值
+# 放宽到 max_width。
+max_width = 100
+use_small_heuristics = "Max"
+
+# 冻结排版规则的版本。不写这行时 rustfmt 跟随 crate 的 edition 走，将来 Rust 换了默认
+# 风格就会莫名其妙重排全仓；写死之后升级 toolchain 也不会动排版。
+style_edition = "2024"

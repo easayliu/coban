@@ -1,0 +1,19 @@
+services:
+  coban:
+    image: ghcr.io/${IMAGE_OWNER:-easayliu}/coban:${IMAGE_TAG:-latest}
+    container_name: coban
+    # 用 tini 当 PID 1：转发信号并回收僵尸进程，配合应用内优雅关闭让重启秒停。
+    init: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PORT:-4700}:4700"
+    environment:
+      # 接入 Key：留空则改由网页「客户端接入」页管理
+      - COBAN_API_KEY=${COBAN_API_KEY:-}
+      # 管理密码：留空则改由网页「控制台安全」页管理
+      - COBAN_ADMIN_PASSWORD=${COBAN_ADMIN_PASSWORD:-}
+    volumes:
+      # 凭证库(SQLite)持久化到宿主机 ./config（容器内 COBAN_HOME=/app/config）
+      - ./config/:/app/config/
+    restart: unless-stopped
