@@ -417,6 +417,9 @@ const previewCacheReasons = {
     { reason: 'upstream_cold', requests: 9, input_tokens: 141_000, cached_tokens: 0 },
     { reason: 'first_turn', requests: 63, input_tokens: 74_000, cached_tokens: 0 },
     { reason: 'no_usage', requests: 7, input_tokens: 0, cached_tokens: 0 },
+    // 升级前的旧流水：条数最多、体量最大，但**不进条子也不进分母**，只在脚注里说一句。
+    // 预览里留着它，是为了那行脚注也能被看到。
+    { reason: 'legacy', requests: 15_231, input_tokens: 792_000_000, cached_tokens: 0 },
   ],
 }
 for (const hours of [24, 7 * 24, 30 * 24]) {

@@ -483,8 +483,8 @@ pub struct CacheBucket {
 /// 它们各占一条。要判断「先修哪个」，看的是这一类原因白付了多少输入 token。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CacheReasonStat {
-    /// 原因标识（见 [`crate::proxy`] 的 `cache_reason`）；旧行与无会话身份的行归到
-    /// `unattributed`。
+    /// 原因标识（见 [`crate::proxy`] 的 `cache_reason`）。列为空的行——**只可能是归因上线
+    /// 之前写下的旧流水**——归到 `legacy`。
     pub reason: String,
     pub requests: i64,
     pub input_tokens: i64,
@@ -1834,12 +1834,20 @@ impl CredentialStore {
     /// 各类的含义见 [`crate::proxy`] 的 `cache_reason`。
     ///
     /// 排序键是 `input_tokens - cached_tokens`（白付的那部分）而不是条数，理由见
-    /// [`CacheReasonStat`]。`cache_reason` 为 NULL 的行（迁移前的旧流水、`models` 那类没有
-    /// 会话身份的请求）归到 `unattributed`,不悄悄丢掉——那会让百分比加不满 100。
+    /// [`CacheReasonStat`]。
+    ///
+    /// `cache_reason` 为 NULL 的行归到 **`legacy`**，而不是跟「分不出来」混在一起：这一列
+    /// 留空只有一个来源，就是归因上线之前写下的旧流水（迁移刻意不回填）。活着的请求一律带
+    /// 一个值，连「没有会话身份」都有 `no_session`，见 [`crate::proxy`] 的 `cache_reason`。
+    ///
+    /// 分清这件事很要紧：`legacy` 是会随保留期自己老化掉的历史包袱，而 `unattributed`
+    /// （租约被关掉）是当下的配置问题。混成一桶的话，升级后头几周那一大坨旧流水会把所有
+    /// 百分比压到读不出来——排错时最需要看清的恰好是新数据那一小段。**旧行仍然回出来**，
+    /// 只是自成一类，界面据此把它从分母里摘掉并单独说明（不悄悄丢掉，那会让人以为自己数错了）。
     pub fn cache_reasons(&self, since: i64) -> Result<Vec<CacheReasonStat>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT COALESCE(cache_reason, 'unattributed') AS reason,
+            "SELECT COALESCE(cache_reason, 'legacy') AS reason,
                     COUNT(*),
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(cached_tokens), 0)
@@ -2119,7 +2127,8 @@ mod tests {
     }
 
     /// 归因合计按**白付的输入 token**排，不按条数：一条长对话未命中比一堆小请求贵得多。
-    /// `cache_reason` 为空的行归到 `unattributed`，不能悄悄丢掉。
+    /// `cache_reason` 为空的行归到 `legacy`（升级前的旧流水），不能悄悄丢掉，也不能跟
+    /// 「分不出来」混成一桶。
     #[test]
     fn cache_reasons_rank_by_wasted_input_tokens() {
         let s = store();
@@ -2145,7 +2154,7 @@ mod tests {
 
         let stats = s.cache_reasons(0).unwrap();
         let order: Vec<&str> = stats.iter().map(|r| r.reason.as_str()).collect();
-        assert_eq!(order, vec!["new_prefix", "unattributed", "hit", "first_turn"], "{stats:?}");
+        assert_eq!(order, vec!["new_prefix", "legacy", "hit", "first_turn"], "{stats:?}");
 
         let churn = &stats[0];
         assert_eq!(churn.requests, 1);
@@ -2185,7 +2194,7 @@ mod tests {
 
         let stats = s.cache_reasons(0).unwrap();
         assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].reason, "unattributed", "旧行不该被编出一个原因来");
+        assert_eq!(stats[0].reason, "legacy", "旧行不该被编出一个原因来，也不该混进「分不出来」");
         assert_eq!(stats[0].input_tokens, 1_000);
 
         // 迁移之后新写的行照常带原因。

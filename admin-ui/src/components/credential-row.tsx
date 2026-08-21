@@ -15,6 +15,7 @@ import {
   planBadgeVariant,
   planLabel,
   QuotaMeter,
+  quotaCapacityEstimate,
   quotaWindowLabel,
   quotaWindowTitle,
   switchTitle,
@@ -106,6 +107,7 @@ function ListQuotaMeter({
     )
   }
   const windowTitle = quotaWindowTitle(w.windowMinutes, language)
+  const estimate = quotaCapacityEstimate(w)
   // 通用名而不是列头那个名字：这句要在「列头写着周、这一行其实是 5 小时」时也读得对。
   const generic = w.key === 'primary' ? t('主额度', 'Primary') : t('次额度', 'Secondary')
   const scope = windowTitle
@@ -140,6 +142,14 @@ function ListQuotaMeter({
             {t(
               `窗口内 ${w.usage.requests.toLocaleString(locale)} 条请求 · ${w.usage.tokens.toLocaleString(locale)} token · 等价 ${formatUsd(w.usage.cost_usd)}（按官方 API 价目估，不是账单）`,
               `This window: ${w.usage.requests.toLocaleString(locale)} requests · ${w.usage.tokens.toLocaleString(locale)} tokens · ${formatUsd(w.usage.cost_usd)} equivalent (estimated from official API rates, not a bill)`,
+            )}
+          </span>
+        )}
+        {estimate && (
+          <span className="block">
+            {t(
+              `预估周期总额约 ${estimate.tokens != null ? `${estimate.tokens.toLocaleString(locale)} token` : '—'} / ${estimate.costUsd != null ? formatUsd(estimate.costUsd) : '—'}（按 ${estimate.usedPercentage}% 使用率反推；仅统计本服务记录，供参考）`,
+              `Estimated cycle total: about ${estimate.tokens != null ? `${estimate.tokens.toLocaleString(locale)} tokens` : '—'} / ${estimate.costUsd != null ? formatUsd(estimate.costUsd) : '—'} (inferred from ${estimate.usedPercentage}% used; only this service's recorded traffic, for reference)`,
             )}
           </span>
         )}

@@ -86,6 +86,14 @@ export interface QuotaWindowMeta {
   reported: boolean
 }
 
+/** 根据当前周期已记录用量反推的周期总量；它是估算值，不是上游公布的套餐额度。 */
+export interface QuotaCapacityEstimate {
+  tokens: number | null
+  costUsd: number | null
+  usedPercentage: number
+}
+
+
 /**
  * credits 状态：基础额度满了之后还能不能继续跑，以及烧的是不是按量计费的钱。
  *
@@ -193,6 +201,30 @@ function evaluateWindow(
     // （万一哪天上游只报使用率、不报窗口元数据）。
     reported: (windowMinutes ?? 0) > 0 || resetAt != null || (usedPct ?? 0) > 0,
   }
+}
+
+/**
+ * 用「当前周期已记录用量 ÷ 上游使用率」估算完整周期容量。
+ *
+ * 使用率很低时舍弃结果：百分比本身有取整/误差，1% 的误差在 1% 用量处会把结果放大百倍。
+ * 这里只统计 Coban 自己记录到的请求，且上游可能按模型、缓存等因素加权，所以只能作为参考。
+ */
+export function quotaCapacityEstimate(w: QuotaWindowMeta): QuotaCapacityEstimate | null {
+  const pct = w.rawPercentage
+  if (
+    w.freshness !== 'current' ||
+    pct == null ||
+    !Number.isFinite(pct) ||
+    pct < 5 ||
+    pct > 100 ||
+    w.usage == null
+  ) return null
+
+  const scale = 100 / pct
+  const tokens = w.usage.tokens > 0 ? Math.round(w.usage.tokens * scale) : null
+  const costUsd = w.usage.cost_usd > 0 ? w.usage.cost_usd * scale : null
+  if (tokens == null && costUsd == null) return null
+  return { tokens, costUsd, usedPercentage: pct }
 }
 
 /**
@@ -693,12 +725,14 @@ function QuotaFact({
   value,
   suffix,
   hint,
+  variant = 'secondary',
 }: {
   label: string
   value: string
   suffix?: string
   /** 提示里跟在标签后面的明细（精确值、口径说明）；不传则只显示标签。 */
   hint?: string
+  variant?: BadgeProps['variant']
 }) {
   const { t } = useI18n()
   return (
@@ -707,7 +741,7 @@ function QuotaFact({
         render={<div />}
         delay={0}
         className={cn(
-          badgeVariants({ variant: 'secondary', size: 'sm' }),
+          badgeVariants({ variant, size: 'sm' }),
           'min-w-0 gap-0.5 font-normal',
         )}
       >
@@ -734,11 +768,10 @@ const WINDOW_VARIANT: Record<QuotaWindowMeta['key'], BadgeProps['variant']> = {
  *
  * 两边的差别只有「摆得下多少」，各用一个开关控制，其余一模一样：
  * - `usage`：条子上方那行窗口用量（请求数 / token / 等价费用）——这三项都只算**当前这个
- *   窗口**，与列表右边那几列的终身累计不是一回事。`facts` 是卡片的排法（三枚小徽章，各带
- *   全称与精确值的提示）；`inline` 是表格的排法（压成一行小字：一格 140px 装不下三枚徽章，
- *   光徽章内边距就要 18px，还会折成三行），精确值交给这一行自己的 title。
- * - `showCountdown`：距重置还有多久。同上——整页最宽 1216px（见 .page-frame 的 80rem），
- *   表格行内再多一段就得从账号名那列借宽度，故也收进悬浮提示。
+ *   窗口**，与列表右边那几列的终身累计不是一回事。`facts` 是卡片的排法（带完整提示的徽章）；
+ *   `inline` 是表格的排法（压成小字，精确值交给这一行自己的悬浮提示）。
+ * - `showCountdown`：距重置还有多久。卡片与列表都可直接显示；精确到分秒的绝对时刻仍放在
+ *   悬浮提示里，避免把窄列撑得过宽。
  * - `showWindowLabel`：`7d` / `5h` 那枚小标签。卡片没有表头，全靠它认窗口；表格的列头多数
  *   时候已经写着窗口名（见 credential-workspace 的 `quotaTitles`），那时它是重复的，收掉。
  *   **只收视觉**：读屏仍要念出「7d 用量 100%」，所以标签本身还在，只是变成 sr-only。
@@ -769,6 +802,7 @@ export function QuotaMeter({
   // 此时这个窗口的用量确实归了零——直接按 0% 画，不再单独摆一句「已重置 / 暂无数据」：
   // 那句话占着和数据一样大的地方，说的却只是「这里没什么可看」。
   const percentage = w.percentage ?? 0
+  const estimate = quotaCapacityEstimate(w)
   const indicatorClass = w.level === 'critical'
     ? 'bg-destructive'
     : w.level === 'warning'
@@ -812,13 +846,24 @@ export function QuotaMeter({
               'Estimated from official API rates, not a bill — a subscription spends quota. Models missing from the price table count as 0, so this is a lower bound',
             )}
           />
+          {estimate?.costUsd != null && (
+            <QuotaFact
+              label={t('预估周期费用', 'Estimated cycle cost')}
+              value={formatUsd(estimate.costUsd)}
+              variant="warning"
+              hint={t(
+                `按 ${estimate.usedPercentage}% 使用率反推的完整周期费用，仅统计本服务记录，供参考。`,
+                `Estimated full-cycle cost inferred from ${estimate.usedPercentage}% used; based only on this service's recorded traffic, for reference only.`,
+              )}
+            />
+          )}
         </dl>
       )}
       {/* 表格里的同三项：同样的取数与格式化，只是换成一行小字。字号跟卡片那三枚徽章一样
           （.625rem），11px 的 text-2xs 排下来会超出 140px 那一格。
           分隔点用伪元素而不是插 span：`dl` 里只放 `dt`/`dd` 才是合法结构。
-          **不挂 title**：调用方（表格）整格都套在悬浮提示里，再加一个原生 title 会两层提示
-          一起冒；精确值由那份提示给（见 credential-row 的 [ListQuotaMeter]）。 */}
+          请求数、token 和费用的精确值由调用方（表格）整格悬浮提示给；预估费用徽标保留
+          自己的简短口径提示。 */}
       {usage === 'inline' && w.usage && (
         <dl className="flex min-w-0 items-center gap-1 truncate text-[.625rem] text-muted-foreground tabular-nums">
           <dt className="sr-only">{t('请求数', 'Requests')}</dt>
@@ -830,6 +875,21 @@ export function QuotaMeter({
           <dd className="shrink-0 before:mr-1 before:content-['·']">{formatTokens(w.usage.tokens)}</dd>
           <dt className="sr-only">{t('等价费用', 'Equivalent cost')}</dt>
           <dd className="truncate before:mr-1 before:content-['·']">{formatUsd(w.usage.cost_usd)}</dd>
+          {estimate?.costUsd != null && (
+            <dd className="shrink-0 before:mr-1 before:content-['·']">
+              <Badge
+                variant="warning"
+                size="sm"
+                className="px-1.5 text-2xs tabular-nums"
+                title={t(
+                  `预估周期费用 ${formatUsd(estimate.costUsd)}（按 ${estimate.usedPercentage}% 使用率反推，仅统计本服务记录）`,
+                  `Estimated cycle cost ${formatUsd(estimate.costUsd)} (inferred from ${estimate.usedPercentage}% used; this service's recorded traffic only)`,
+                )}
+              >
+                {formatUsd(estimate.costUsd)}
+              </Badge>
+            </dd>
+          )}
         </dl>
       )}
       <div className="flex min-w-0 items-center gap-1.5">

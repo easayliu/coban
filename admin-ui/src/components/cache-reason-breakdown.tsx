@@ -74,20 +74,45 @@ export const CACHE_REASONS: Record<
   probe: {
     label: ['连通性测试', 'Connectivity test'],
     hint: [
-      '账号页上手动发的那种探测。它没有会话，单独一类免得混进「未归因」。',
-      'The manual probe from the accounts page. It has no session, and is kept separate so it does not muddy "unattributed".',
+      '账号页上手动发的那种探测。它没有会话，单独一类免得混进别的桶里。',
+      'The manual probe from the accounts page. It has no session, and is kept separate so it does not muddy the other buckets.',
+    ],
+    tone: 'neutral',
+  },
+  no_session: {
+    label: ['没有会话身份', 'No session'],
+    hint: [
+      '这条请求的体里没有 input，认不出属于哪段对话（models 那类）。谈不上前缀缓存。',
+      'The request body carried no input, so it cannot be tied to a conversation (the models endpoint and friends). Prefix caching does not apply.',
     ],
     tone: 'neutral',
   },
   unattributed: {
-    label: ['未归因', 'Unattributed'],
+    label: ['分不出来', 'Not attributable'],
     hint: [
-      '落点租约被关掉了（调度设置里那项），或者这是升级之前的旧流水。归因要靠租约表对照「上次在哪个号上」。',
-      'The placement lease is switched off (see scheduling settings), or these are request logs from before the upgrade. Attribution needs the lease table to compare against the previous placement.',
+      '落点租约被关掉了（调度设置里那项）。归因要靠租约表对照「这个键上次在哪个号上」，关了就分不出换号、过期、上游凉了这三种。想排错就把它打开。',
+      'The placement lease is switched off (see scheduling settings). Attribution compares against the previous placement recorded in the lease table; with it off, rotation, expiry, and a cold upstream become indistinguishable. Turn it on to troubleshoot.',
+    ],
+    tone: 'neutral',
+  },
+  legacy: {
+    label: ['升级前的旧流水', 'Logged before the upgrade'],
+    hint: [
+      '归因功能上线之前写下的请求，那时还没有这一列。旧行刻意不回填——填什么都是编的。它们会随流水的 30 天保留期自己老化掉，不参与上面的占比。',
+      'Requests logged before attribution existed, when this column did not. Old rows are deliberately not backfilled — any value would be invented. They age out with the 30-day log retention and are excluded from the shares above.',
     ],
     tone: 'neutral',
   },
 }
+
+/**
+ * 不参与占比的那些桶。
+ *
+ * 只有 `legacy`：它是**升级前根本没有归因可言**的历史行，把它算进分母，升级后头几周那一大坨
+ * 旧流水会把所有百分比压到读不出来——而排错时最需要看清的恰好是新数据那一小段。其余每一类
+ * 都是当下的事实，一个都不摘。
+ */
+const EXCLUDED_FROM_SHARE = new Set(['legacy'])
 
 function reasonMeta(reason: string) {
   return CACHE_REASONS[reason]
@@ -117,16 +142,26 @@ function wasted(r: CacheReasonStat): number {
  *
  * 条子的长度是「这一类占全部白付的多少」而不是「这一类自己的未命中率」：后者对每个未命中
  * 类别恒等于 100%，画出来是一排等长的条子，什么也没说。
+ *
+ * `legacy`（升级前的旧流水）**不进这张表，也不进分母**，只在脚注里说一句它有多少——它不是
+ * 一个可以「修」的原因，而算进去会把新数据那几行压成 0.x%（见 [`EXCLUDED_FROM_SHARE`]）。
  */
 export function CacheReasonBreakdown({ reasons }: { reasons: CacheReasonStat[] }) {
   const { t, locale } = useI18n()
-  const total = reasons.reduce((sum, r) => sum + wasted(r), 0)
-  const rows = reasons.filter((r) => r.requests > 0)
+  const rows = reasons.filter((r) => r.requests > 0 && !EXCLUDED_FROM_SHARE.has(r.reason))
+  const total = rows.reduce((sum, r) => sum + wasted(r), 0)
+  const legacy = reasons.filter((r) => r.requests > 0 && EXCLUDED_FROM_SHARE.has(r.reason))
+  const legacyRequests = legacy.reduce((sum, r) => sum + r.requests, 0)
 
   if (rows.length === 0) {
     return (
       <p className="text-2xs leading-4 text-muted-foreground">
-        {t('这段时间没有可归因的请求。', 'No attributable requests in this period.')}
+        {legacyRequests > 0
+          ? t(
+              `这段时间里的 ${legacyRequests.toLocaleString(locale)} 条请求都是归因上线之前记下的，分不出原因。跑几条新请求，或把跨度调短。`,
+              `All ${legacyRequests.toLocaleString(locale)} requests in this period were logged before attribution existed, so they carry no reason. Send some new requests, or shorten the range.`,
+            )
+          : t('这段时间没有可归因的请求。', 'No attributable requests in this period.')}
       </p>
     )
   }
@@ -188,6 +223,16 @@ export function CacheReasonBreakdown({ reasons }: { reasons: CacheReasonStat[] }
           'Ranked by input tokens paid uncached rather than by request count — one long conversation missing costs far more than ten small requests. The darker bars are the ones worth fixing (hover a name for what to do); the pale ones were always going to miss.',
         )}
       </p>
+      {/* 旧流水只说一句，不占一行条子：它不是一个能「修」的原因，而算进分母会把新数据
+          那几行压成 0.x%。说出来是为了让人对得上总条数，不至于以为自己数错了。 */}
+      {legacyRequests > 0 && (
+        <p className="text-2xs leading-4 text-muted-foreground">
+          {t(
+            `另有 ${legacyRequests.toLocaleString(locale)} 条是归因上线之前记下的，没有原因可分，未计入上面的占比；它们会随流水的 30 天保留期自己老化掉。想看干净的读数就把跨度调到 24h。`,
+            `A further ${legacyRequests.toLocaleString(locale)} requests were logged before attribution existed and carry no reason, so they are excluded from the shares above; they age out with the 30-day log retention. Switch to the 24h range for a clean read.`,
+          )}
+        </p>
+      )}
     </section>
   )
 }

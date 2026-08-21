@@ -968,21 +968,27 @@ impl SessionCtx {
 ///   同一个上游 session，交替请求互相踢掉对方（见 [`prefix_fingerprint`] 的注）。
 /// - `no_usage`：没嗅探到用量（错误响应、客户端提前断开）。谈不上命中与否。
 /// - `unattributed`：租约机制被关掉了（`session_lease_secs = 0`），上面那几类分不出来。
+/// - `no_session`：这条请求压根没有会话身份（体里没有 `input`，`models` 那类）。
 ///
-/// 返回 `None` 表示这条请求没有会话身份（`models` 那类），列留 NULL。
+/// **一定回一个值，绝不回 `None`**：这一列留空的含义已经被占掉了——`NULL` 专指
+/// 「归因上线之前写下的旧流水」（迁移不回填，见 `store::migrate_cache_reason`）。让活着的
+/// 请求也写 NULL，就会把「那时还没有这个功能」和「这条请求没有会话」混成同一桶，而前者是
+/// 会自己老化掉的历史包袱、后者是当下的事实，混在一起两个都读不出来。
 fn cache_reason(
     key: Option<&str>,
     lease: store::LeaseState,
     input_len: usize,
     cred_id: i64,
     usage: Option<Usage>,
-) -> Option<&'static str> {
-    key.filter(|k| !k.is_empty())?;
-    let Some(u) = usage else { return Some("no_usage") };
-    if u.cached_tokens > 0 {
-        return Some("hit");
+) -> &'static str {
+    if key.is_none_or(str::is_empty) {
+        return "no_session";
     }
-    Some(match lease {
+    let Some(u) = usage else { return "no_usage" };
+    if u.cached_tokens > 0 {
+        return "hit";
+    }
+    match lease {
         store::LeaseState::Off => "unattributed",
         // 过期与换号同时发生时报过期：那才是根因，换号是它的后果。
         store::LeaseState::Expired(_) => "lease_expired",
@@ -990,7 +996,7 @@ fn cache_reason(
         store::LeaseState::Live(_) => "upstream_cold",
         store::LeaseState::Absent if input_len <= 1 => "first_turn",
         store::LeaseState::Absent => "new_prefix",
-    })
+    }
 }
 
 /// 从（已经是 Responses 形状的）请求体里算一个**会话指纹**。
@@ -1517,13 +1523,13 @@ impl Drop for UsageLogGuard {
         let rec = UsageRecord {
             cred_id: Some(self.cred_id),
             cred_label: std::mem::take(&mut self.cred_label),
-            cache_reason: cache_reason(
+            cache_reason: Some(cache_reason(
                 self.session_key.as_deref(),
                 self.lease,
                 self.input_len,
                 self.cred_id,
                 usage,
-            ),
+            )),
             session_id: self.session_key.take(),
             model,
             path: std::mem::take(&mut self.path),
@@ -1569,7 +1575,13 @@ fn log_usage(
     let rec = UsageRecord {
         cred_id: Some(cred.id),
         cred_label: cred.label.clone(),
-        cache_reason: cache_reason(session.key(), session.lease, session.input_len, cred.id, usage),
+        cache_reason: Some(cache_reason(
+            session.key(),
+            session.lease,
+            session.input_len,
+            cred.id,
+            usage,
+        )),
         session_id: session.key.clone(),
         model,
         path: path.to_owned(),
@@ -3088,24 +3100,27 @@ mod tests {
         let r = |lease, input_len, usage| cache_reason(Some("k"), lease, input_len, A, usage);
 
         // 命中优先于一切：上游都报了命中，前面那些原因就不必再猜。
-        assert_eq!(r(LeaseState::Absent, 1, usage(90_000)), Some("hit"));
-        assert_eq!(r(LeaseState::Live(A), 9, usage(90_000)), Some("hit"));
+        assert_eq!(r(LeaseState::Absent, 1, usage(90_000)), "hit");
+        assert_eq!(r(LeaseState::Live(A), 9, usage(90_000)), "hit");
 
-        assert_eq!(r(LeaseState::Absent, 1, usage(0)), Some("first_turn"));
+        assert_eq!(r(LeaseState::Absent, 1, usage(0)), "first_turn");
         // 同样是「没见过这个键」，输入已经好几项就不是新对话，是前缀在变。
-        assert_eq!(r(LeaseState::Absent, 9, usage(0)), Some("new_prefix"));
-        assert_eq!(r(LeaseState::Live(B), 9, usage(0)), Some("rotated"));
-        assert_eq!(r(LeaseState::Live(A), 9, usage(0)), Some("upstream_cold"));
-        assert_eq!(r(LeaseState::Off, 9, usage(0)), Some("unattributed"));
+        assert_eq!(r(LeaseState::Absent, 9, usage(0)), "new_prefix");
+        assert_eq!(r(LeaseState::Live(B), 9, usage(0)), "rotated");
+        assert_eq!(r(LeaseState::Live(A), 9, usage(0)), "upstream_cold");
+        assert_eq!(r(LeaseState::Off, 9, usage(0)), "unattributed");
 
         // 过期又换了号时报过期：那是根因，换号是它的后果。
-        assert_eq!(r(LeaseState::Expired(A), 9, usage(0)), Some("lease_expired"));
-        assert_eq!(r(LeaseState::Expired(B), 9, usage(0)), Some("lease_expired"));
+        assert_eq!(r(LeaseState::Expired(A), 9, usage(0)), "lease_expired");
+        assert_eq!(r(LeaseState::Expired(B), 9, usage(0)), "lease_expired");
 
-        // 没有用量读数谈不上命中与否；没有会话身份的请求（models 那类）压根不该进这张表。
-        assert_eq!(r(LeaseState::Live(A), 9, None), Some("no_usage"));
-        assert_eq!(cache_reason(None, LeaseState::Absent, 0, A, usage(0)), None);
-        assert_eq!(cache_reason(Some(""), LeaseState::Absent, 0, A, usage(0)), None);
+        // 没有用量读数谈不上命中与否。
+        assert_eq!(r(LeaseState::Live(A), 9, None), "no_usage");
+
+        // 没有会话身份的请求自成一类，**不能回 None**：那一列留空专指升级前的旧流水，
+        // 让活着的请求也写 NULL 就把两件事混成了一桶。
+        assert_eq!(cache_reason(None, LeaseState::Absent, 0, A, usage(0)), "no_session");
+        assert_eq!(cache_reason(Some(""), LeaseState::Absent, 0, A, usage(0)), "no_session");
     }
 
     /// 排 tools 的三件事：顺序被排定、指纹**跟着排完的顺序算**、已经有序时不动手。
