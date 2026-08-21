@@ -62,7 +62,7 @@ pub async fn handle(
     }
 
     // 请求体在重试间要重发多次，规范化/翻译只做一次（见 plan_request）。
-    let Normalized { body, collapse, chat } = match plan_request(&path, body) {
+    let Normalized { body, collapse, chat, sticky } = match plan_request(&path, body) {
         Ok(n) => n,
         // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
         //
@@ -82,6 +82,14 @@ pub async fn handle(
     // chat 的体已经翻成 Responses 形状，那它就该打到那个端点上；其余按来访路径原样拼。
     let upstream_path: &str = if chat.is_some() { config::RESPONSES_PATH } else { &path };
 
+    // 会话键。同时决定两件事：这条请求落在**哪个号**上，以及对上游呈现**哪个 `session_id`**
+    // ——后者就是上游 prompt cache 的键（见 prefix_fingerprint）。两件事必须用同一个键：
+    // 落点变了而 session_id 没变（或反之），缓存照样丢。
+    //
+    // 客户端自报的会话 id 优先——那是真的会话身份；实测三个真实 codex 客户端一个都不发，
+    // 所以绝大多数请求靠的是前缀指纹那条路。
+    let session_key = incoming_session_id(&headers).or(sticky);
+
     let started = Instant::now();
     let retry_max = state
         .store
@@ -93,7 +101,7 @@ pub async fn handle(
     let mut last: Option<Response> = None;
 
     for attempt in 0..budget {
-        let cred = match state.store.select(&tried) {
+        let cred = match state.store.select(&tried, session_key.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 // 一个都挑不出来时：已经试过号的话把上一次的上游响应交回去（那是更贴近
@@ -127,6 +135,7 @@ pub async fn handle(
             &body,
             collapse,
             chat.as_ref(),
+            session_key.as_deref(),
             started,
             in_flight.clone(),
         )
@@ -208,6 +217,7 @@ async fn forward_once(
     body: &Bytes,
     collapse: bool,
     chat: Option<&ChatMode>,
+    session_key: Option<&str>,
     started: Instant,
     in_flight: InFlightGuard,
 ) -> anyhow::Result<Outcome> {
@@ -218,7 +228,8 @@ async fn forward_once(
     // `responses` 后面只是往上游送一堆它不认识的参数。
     let query = uri.query().filter(|_| chat.is_none());
     let url = upstream_url(upstream_path, query);
-    let mut fwd_headers = build_forward_headers(headers, cred, &token);
+    let mut fwd_headers =
+        build_forward_headers(headers, cred, &token, session_key.unwrap_or_default());
     if collapse || chat.is_some() {
         // 体里的 `stream` 已被我们钉成 true，`accept` 得跟着说 SSE：官方客户端不存在
         // 「体里要流、头里要 JSON」这种自相矛盾的形态，别让上游去猜。
@@ -479,6 +490,8 @@ struct Normalized {
     /// 来访用的是 Chat Completions 线格式时，回程翻译要用到的那点形态；`None` 表示
     /// Responses 原样透传。
     chat: Option<ChatMode>,
+    /// 这条请求的会话指纹（见 [`prefix_fingerprint`]）。解不出体时为 `None`。
+    sticky: Option<String>,
 }
 
 /// chat 线格式下这次请求的形态：翻请求时定下，翻响应时要用。
@@ -501,6 +514,7 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
             // 「客户端没要流」在两种线格式里是同一件事，收拢那段代码也就共用。
             collapse: !t.stream,
             chat: Some(ChatMode { model: t.model, include_usage: t.include_usage }),
+            sticky: t.sticky,
         });
     }
     Ok(normalize_responses_body(path, body))
@@ -523,25 +537,70 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
 fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
-        return Normalized { body, collapse: false, chat: None };
+        return Normalized { body, collapse: false, chat: None, sticky: None };
     }
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
-        return Normalized { body, collapse: false, chat: None };
+        return Normalized { body, collapse: false, chat: None, sticky: None };
     };
+    // 趁体已经解开算指纹：为此再解析一遍是白花的 CPU——真实流量里这个体有几百 KB。
+    let sticky = prefix_fingerprint(&obj);
     let yes = Some(&serde_json::Value::Bool(true));
     let no = Some(&serde_json::Value::Bool(false));
     let collapse = obj.get("stream") != yes;
     if !collapse && obj.get("store") == no {
         // 两项已经都对：不重新序列化（也就不会顺手改掉字段顺序）。
-        return Normalized { body, collapse, chat: None };
+        return Normalized { body, collapse, chat: None, sticky };
     }
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
-        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None },
+        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None, sticky },
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
-        Err(_) => Normalized { body, collapse, chat: None },
+        Err(_) => Normalized { body, collapse, chat: None, sticky },
     }
+}
+
+/// 从（已经是 Responses 形状的）请求体里算一个**会话指纹**。
+///
+/// 上游的 prompt cache 键是「`prompt_cache_key` + 前缀哈希」，而这条后端把
+/// `prompt_cache_key` 换成了**从 `session_id` 头派生**的值——实测：body 里传的那个被忽略
+/// （响应回显的是另一个 UUID），前缀一字不差、只把 `session_id` 头换掉，17K token 的命中
+/// 直接从 94% 归零。所以我们要的不是「对齐上游那个前缀哈希」——那是它自己算的——而是一个
+/// 能认出「这是同一个会话」的东西，好让同一个会话固定落在同一个号上（[`store::CredentialStore::select`]）
+/// 并对上游呈现同一个 `session_id`（[`Credential::session_id`]）。
+///
+/// 只取**不随轮次变化**的那几段：`model`、`instructions`、`tools`（含顺序）、`input` 的头
+/// 一项。**整段 `input` 绝不能进**——它每轮都在长，哈出来的键每轮都变，等于没有粘性。
+/// 官方文档里进入前缀的正是这几类（消息、工具定义与顺序、图片与其顺序、结构化输出 schema）。
+///
+/// 取 `input` 头一项而不是只取前三样：后者在同一台机器上的所有 codex 会话之间完全相同，
+/// 会把所有会话钉到同一个号、同一个 cache key 上（官方建议单个 key 的流量控制在 15
+/// 请求/分钟左右）。会话开头那条才是把会话彼此分开的东西，而它整段会话不会被改写——
+/// 真实流量 96.2% 的命中率就是这个前缀逐字节稳定的证据。
+///
+/// 客户端做过历史压缩（改写了开头那条）时指纹会变，落点也跟着变——那时上游的前缀哈希
+/// 同样已经变了，缓存本来就丢了，跟着换号不多亏什么。
+pub fn prefix_fingerprint(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    // 没有 input 就没有会话可言（`models` 那类无体请求走到这里也是这一支）。
+    let head = obj.get("input")?.as_array()?.first()?;
+    let mut h = Sha256::new();
+    let mut feed = |label: &[u8], v: Option<&serde_json::Value>| {
+        h.update(label);
+        h.update([0u8]); // 分隔符：不同字段的内容不能因为拼接而串味
+        // 序列化而不是取 as_str：`tools` 是结构，嵌套与顺序都要进哈希。
+        if let Some(Ok(bytes)) = v.map(serde_json::to_vec) {
+            h.update(&bytes);
+        }
+        h.update([0u8]);
+    };
+    feed(b"model", obj.get("model"));
+    feed(b"instructions", obj.get("instructions"));
+    feed(b"tools", obj.get("tools"));
+    feed(b"head", Some(head));
+    // 取前 16 字节：它只用来当键，不做任何密码学承诺。
+    Some(crate::credentials::hex_lower(&h.finalize()[..16]))
 }
 
 fn upstream_url(path: &str, query: Option<&str>) -> String {
@@ -553,10 +612,15 @@ fn upstream_url(path: &str, query: Option<&str>) -> String {
 }
 
 /// 构造发往上游的头：来访头去掉逐跳/鉴权项后照抄，再补上这个凭证的身份。
+///
+/// `fingerprint` 是这条请求的会话键（见 [`prefix_fingerprint`]）。它决定派生出来的
+/// `session_id`，而那正是上游 prompt cache 的键——**不能在这里就地从头里取**：绝大多数
+/// 客户端不发会话头，那样算出来的指纹恒为空，于是一个号上所有会话共用同一个 cache key。
 fn build_forward_headers(
     incoming: &HeaderMap,
     cred: &Credential,
     token: &str,
+    fingerprint: &str,
 ) -> wreq::header::HeaderMap {
     let mut out = wreq::header::HeaderMap::new();
     for (name, value) in incoming.iter() {
@@ -575,9 +639,8 @@ fn build_forward_headers(
     // 这个头与 access_token 是一对：上游认的是两件一起，缺任何一半都是 401。
     set(&mut out, "chatgpt-account-id", &cred.account_id);
     set(&mut out, "originator", config::ORIGINATOR);
-    // 会话 id 按账号 + 来访会话派生，见 Credential::session_id 的注。
-    let fingerprint = incoming_session_id(incoming).unwrap_or_default();
-    set(&mut out, "session_id", &cred.session_id(&fingerprint));
+    // 会话 id 按账号 + 会话键派生，见 Credential::session_id 的注。
+    set(&mut out, "session_id", &cred.session_id(fingerprint));
     // 解压 feature 开着，声明什么就可能收到什么压缩形态；这一项要与官方客户端一致。
     set(&mut out, "accept-encoding", config::ACCEPT_ENCODING);
     if !out.contains_key(header::USER_AGENT.as_str()) {
@@ -1278,7 +1341,8 @@ async fn fetch_model_slugs(state: &AppState) -> Result<Vec<String>, ModelListErr
     let mut tried: Vec<i64> = Vec::new();
     let mut last: Option<anyhow::Error> = None;
     for _ in 0..MODEL_LIST_MAX_CREDS {
-        let cred = match state.store.select(&tried) {
+        // 取清单与会话无关，不带粘性键：让它按 LRU 轮着问，别把它钉在某个会话的号上。
+        let cred = match state.store.select(&tried, None) {
             Ok(c) => c,
             // 挑不出号时，已经试过号的话报那个更贴近真相的错，一次都没试过才报选号本身的错。
             Err(e) => {
@@ -1669,7 +1733,8 @@ fn synthetic_headers(
     token: &str,
     accept: &'static str,
 ) -> wreq::header::HeaderMap {
-    let mut headers = build_forward_headers(&HeaderMap::new(), cred, token);
+    // 合成请求没有来访会话，指纹留空——它们也不该去蹭真实会话的 prompt cache。
+    let mut headers = build_forward_headers(&HeaderMap::new(), cred, token, "");
     headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
     headers
 }
@@ -2165,6 +2230,88 @@ mod tests {
         assert!(v["data"][0]["created"].as_i64().unwrap() > 0, "留 0 会被显示成 1970 年");
     }
 
+    fn fp(body: &str) -> Option<String> {
+        let serde_json::Value::Object(obj) = serde_json::from_str(body).unwrap() else {
+            panic!("object")
+        };
+        prefix_fingerprint(&obj)
+    }
+
+    /// 指纹**必须在会话长大时保持不变**——整个粘性机制就架在这一条上：codex 每轮把历史
+    /// 全量重传，如果指纹跟着变，落点与 session_id 每轮都变，缓存等于没有。
+    #[test]
+    fn the_fingerprint_survives_a_growing_conversation() {
+        let turn1 = r#"{"model":"gpt-5.6-sol","instructions":"base prompt",
+            "tools":[{"type":"function","name":"shell"}],
+            "input":[{"role":"user","content":[{"type":"input_text","text":"first"}]}]}"#;
+        // 第二轮：开头那条一字不变，后面又接了两项（助手回复 + 新提问）。
+        let turn2 = r#"{"model":"gpt-5.6-sol","instructions":"base prompt",
+            "tools":[{"type":"function","name":"shell"}],
+            "input":[{"role":"user","content":[{"type":"input_text","text":"first"}]},
+                     {"role":"assistant","content":[{"type":"output_text","text":"ok"}]},
+                     {"role":"user","content":[{"type":"input_text","text":"second"}]}]}"#;
+        assert_eq!(fp(turn1), fp(turn2));
+        assert!(fp(turn1).is_some());
+    }
+
+    /// 前缀里任何一样变了，指纹就该变——上游那头的缓存也正是在这几样上失效的
+    /// （官方文档：消息、工具定义与**顺序**、图片与其顺序、结构化输出 schema 都进前缀）。
+    #[test]
+    fn the_fingerprint_moves_when_the_prefix_moves() {
+        let base = fp(r#"{"model":"m","instructions":"i","tools":[{"name":"a"},{"name":"b"}],
+            "input":[{"role":"user","content":"one"}]}"#);
+        let cases = [
+            // 换模型：上游的缓存本来就不跨模型。
+            r#"{"model":"OTHER","instructions":"i","tools":[{"name":"a"},{"name":"b"}],
+                "input":[{"role":"user","content":"one"}]}"#,
+            r#"{"model":"m","instructions":"OTHER","tools":[{"name":"a"},{"name":"b"}],
+                "input":[{"role":"user","content":"one"}]}"#,
+            // 只是把两个工具换了个顺序：官方明说顺序进前缀。
+            r#"{"model":"m","instructions":"i","tools":[{"name":"b"},{"name":"a"}],
+                "input":[{"role":"user","content":"one"}]}"#,
+            // 开头那条被改写（客户端做了历史压缩）。
+            r#"{"model":"m","instructions":"i","tools":[{"name":"a"},{"name":"b"}],
+                "input":[{"role":"user","content":"OTHER"}]}"#,
+        ];
+        for c in cases {
+            assert_ne!(base, fp(c), "前缀变了指纹却没变: {c}");
+        }
+        // 没有 input 就没有会话可言（`models` 那类无体请求走的也是这一支）。
+        assert!(fp(r#"{"model":"m","instructions":"i"}"#).is_none());
+        assert!(fp(r#"{"model":"m","input":[]}"#).is_none());
+    }
+
+    /// 两种线格式都要拿到指纹，且**同一段对话在 chat 那条路上长大时也不能变**。
+    #[test]
+    fn both_wire_formats_produce_a_session_key() {
+        let n = plan_request(
+            "responses",
+            Bytes::from_static(
+                br#"{"model":"m","instructions":"i","input":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .unwrap();
+        assert!(n.sticky.is_some());
+
+        let turn1 = plan_request(
+            "chat/completions",
+            Bytes::from_static(
+                br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .unwrap();
+        let turn2 = plan_request(
+            "chat/completions",
+            Bytes::from_static(
+                br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"},
+                     {"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}"#,
+            ),
+        )
+        .unwrap();
+        assert!(turn1.sticky.is_some());
+        assert_eq!(turn1.sticky, turn2.sticky, "chat 那条路上会话长大也不能换落点");
+    }
+
     fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
@@ -2214,7 +2361,7 @@ mod tests {
             ("chatgpt-account-id", "spoofed"),
             ("content-type", "application/json"),
         ]);
-        let out = build_forward_headers(&incoming, &cred, "fresh-token");
+        let out = build_forward_headers(&incoming, &cred, "fresh-token", "fp");
         assert_eq!(out.get("authorization").unwrap(), "Bearer fresh-token");
         assert_eq!(out.get("chatgpt-account-id").unwrap(), "acct-9");
         assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR);

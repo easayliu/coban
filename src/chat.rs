@@ -54,6 +54,9 @@ pub struct Translated {
     pub include_usage: bool,
     /// 客户端请求的模型名。上游没报模型时用它回显。
     pub model: String,
+    /// 这条请求的会话指纹（见 [`crate::proxy`] 的 `prefix_fingerprint`）。**在这里算**是因为
+    /// 翻完的那份 Map 就在手上，为它把刚序列化出来的体再解析一遍是白花的 CPU。
+    pub sticky: Option<String>,
 }
 
 /// 把一份 Chat Completions 请求体翻成 Responses 请求体。
@@ -118,9 +121,10 @@ pub fn translate_request(raw: &[u8]) -> Result<Translated, String> {
     out.insert("store".into(), Value::Bool(false));
     out.insert("stream".into(), Value::Bool(true));
 
+    let sticky = crate::proxy::prefix_fingerprint(&out);
     let body = serde_json::to_vec(&Value::Object(out))
         .map_err(|e| format!("failed to build the upstream request: {e}"))?;
-    Ok(Translated { body: Bytes::from(body), stream, include_usage, model })
+    Ok(Translated { body: Bytes::from(body), stream, include_usage, model, sticky })
 }
 
 /// `messages[]` → (`instructions`, `input[]`)。

@@ -514,6 +514,29 @@ fn load_settings(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
+/// 会话键 → 档内固定的那一个号（HRW / rendezvous 选择）。
+///
+/// **不用「哈希取模」**：候选集一变（某个号进冷却、被额度暂停、这次已经试过），取模会把几乎
+/// 所有键重新打乱一遍，而每一次改落点都是一整段前缀的缓存未命中——真实流量里那是十几万
+/// token 一次。HRW 只让原本落在消失那个号上的键（约 1/N）改主，其余不动。
+///
+/// 同分按 id 定序：选号必须可复现，否则同一个会话在两条并发请求上会分到两个号。
+fn sticky_pick(ids: &[i64], key: &str) -> Option<i64> {
+    use sha2::{Digest, Sha256};
+    ids.iter()
+        .max_by_key(|id| {
+            let mut h = Sha256::new();
+            h.update(key.as_bytes());
+            h.update([0u8]); // 分隔符，避免拼接歧义
+            h.update(id.to_be_bytes());
+            let d = h.finalize();
+            let mut head = [0u8; 8];
+            head.copy_from_slice(&d[..8]);
+            (u64::from_be_bytes(head), **id)
+        })
+        .copied()
+}
+
 /// 一行 → [`Credential`]。列序必须与 [`COLS`] 一致。
 fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
     Ok(Credential {
@@ -900,7 +923,14 @@ impl CredentialStore {
     ///
     /// 全被限流时返回 [`AllRateLimited`]（带最短等待秒数），调用点据此回一个带
     /// `retry-after` 的 429，而不是一句没有下文的「没有可用账号」。
-    pub fn select(&self, exclude: &[i64]) -> Result<Credential> {
+    ///
+    /// `sticky` 是这条请求的会话键（见 [`crate::proxy`] 的 `prefix_fingerprint`）。给了就在
+    /// **最优优先级档内**按它固定落点，没给则按档内 LRU 轮换。
+    ///
+    /// 只在档内粘：跨档粘会让一个低优先级的号因为哈希落点抢在高优先级前面，那是把分档这件
+    /// 事本身推翻了。而档内那个号一旦不可用（停用/冷却/额度暂停/RPM 满/已试过），它压根
+    /// 不在候选里，落点自然移到同档的下一个——降级不需要额外分支。
+    pub fn select(&self, exclude: &[i64], sticky: Option<&str>) -> Result<Credential> {
         self.resume_due()?;
         let all = self.list()?;
         anyhow::ensure!(!all.is_empty(), "no credentials saved yet; add an account in the web UI");
@@ -942,7 +972,15 @@ impl CredentialStore {
             );
         }
         candidates.sort_unstable();
-        let id = candidates[0].2;
+        let id = match sticky.filter(|k| !k.is_empty()) {
+            Some(key) => {
+                let top = candidates[0].0;
+                let tier: Vec<i64> =
+                    candidates.iter().filter(|c| c.0 == top).map(|c| c.2).collect();
+                sticky_pick(&tier, key).unwrap_or(candidates[0].2)
+            }
+            None => candidates[0].2,
+        };
         all.into_iter().find(|c| c.id == id).context("selected credential vanished")
     }
 
@@ -1459,9 +1497,84 @@ mod tests {
         let a = add(&s, "a");
         let b = add(&s, "b");
         // 两个都没用过时按 id 定序（last_used_at 皆为 0）。
-        assert_eq!(s.select(&[]).unwrap().id, a.id);
+        assert_eq!(s.select(&[], None).unwrap().id, a.id);
         s.insert_usage_log(&UsageRecord { cred_id: Some(a.id), ..Default::default() }).unwrap();
-        assert_eq!(s.select(&[]).unwrap().id, b.id, "least-recently-used should win");
+        assert_eq!(s.select(&[], None).unwrap().id, b.id, "least-recently-used should win");
+    }
+
+    /// 带了会话键就固定落在同档的同一个号上——那是 prompt cache 能命中的前提。
+    #[test]
+    fn a_session_key_pins_to_one_credential() {
+        let s = store();
+        let ids: Vec<i64> = ["a", "b", "c", "d"].iter().map(|n| add(&s, n).id).collect();
+
+        let pick = s.select(&[], Some("sess-1")).unwrap().id;
+        assert!(ids.contains(&pick));
+        // 反复选、以及中间有别的号被用过（LRU 会变），落点都不能动。
+        for _ in 0..5 {
+            assert_eq!(s.select(&[], Some("sess-1")).unwrap().id, pick);
+        }
+        for id in &ids {
+            s.insert_usage_log(&UsageRecord { cred_id: Some(*id), ..Default::default() }).unwrap();
+        }
+        assert_eq!(s.select(&[], Some("sess-1")).unwrap().id, pick, "LRU 不该动粘性落点");
+
+        // 不同会话要摊开到不同号上，否则粘性就成了「全钉在一个号上」。
+        let spread: std::collections::HashSet<i64> =
+            (0..40).map(|i| s.select(&[], Some(&format!("sess-{i}"))).unwrap().id).collect();
+        assert!(spread.len() > 1, "40 个会话键全落在同一个号上: {spread:?}");
+    }
+
+    /// 粘性落点不可用时降级，且**只有落在它上面的键换主**——这就是不用哈希取模的理由：
+    /// 每一次改落点都是一整段前缀的缓存未命中。
+    #[test]
+    fn losing_one_credential_only_remaps_the_keys_that_lived_on_it() {
+        let s = store();
+        for n in ["a", "b", "c", "d", "e"] {
+            add(&s, n);
+        }
+        let keys: Vec<String> = (0..40).map(|i| format!("sess-{i}")).collect();
+        let before: Vec<i64> = keys.iter().map(|k| s.select(&[], Some(k)).unwrap().id).collect();
+
+        // 挑一个真的承载了键的号，把它打进冷却（额度暂停、被 exclude 是同一个效果）。
+        let victim = before[0];
+        s.note_rate_limited(victim, 60);
+        let after: Vec<i64> = keys.iter().map(|k| s.select(&[], Some(k)).unwrap().id).collect();
+
+        for (i, k) in keys.iter().enumerate() {
+            if before[i] == victim {
+                assert_ne!(after[i], victim, "{k} 的落点该让出去");
+            } else {
+                assert_eq!(after[i], before[i], "{k} 没落在出问题的号上，不该被打乱");
+            }
+        }
+        // 让出去的键换到哪个号也必须是确定的，否则同一会话的并发请求会分到两个号。
+        assert_eq!(
+            keys.iter().map(|k| s.select(&[], Some(k)).unwrap().id).collect::<Vec<_>>(),
+            after
+        );
+    }
+
+    /// 粘性只在档内生效：跨档粘会让低优先级的号因为哈希落点抢在高优先级前面。
+    #[test]
+    fn stickiness_never_crosses_a_priority_tier() {
+        let s = store();
+        let top = add(&s, "top");
+        let rest: Vec<i64> = ["b", "c", "d"].iter().map(|n| add(&s, n).id).collect();
+        s.set_priority(top.id, -1).unwrap();
+
+        for i in 0..30 {
+            assert_eq!(
+                s.select(&[], Some(&format!("sess-{i}"))).unwrap().id,
+                top.id,
+                "P-1 还能用时不该碰下面那一档"
+            );
+        }
+        // 上面那档不可用了才落到下面，且落点仍然是固定的。
+        s.note_rate_limited(top.id, 60);
+        let pick = s.select(&[], Some("sess-7")).unwrap().id;
+        assert!(rest.contains(&pick));
+        assert_eq!(s.select(&[], Some("sess-7")).unwrap().id, pick);
     }
 
     /// 优先级压过轮换：P0 没打满之前不该碰 P1。
@@ -1472,8 +1585,8 @@ mod tests {
         let b = add(&s, "b");
         s.set_priority(b.id, -1).unwrap();
         s.insert_usage_log(&UsageRecord { cred_id: Some(b.id), ..Default::default() }).unwrap();
-        assert_eq!(s.select(&[]).unwrap().id, b.id);
-        assert_eq!(s.select(&[b.id]).unwrap().id, a.id, "exclude should fall through to P0");
+        assert_eq!(s.select(&[], None).unwrap().id, b.id);
+        assert_eq!(s.select(&[b.id], None).unwrap().id, a.id, "exclude should fall through to P0");
     }
 
     /// 冷却中的号跳过；全都在冷却时报 AllRateLimited 并带上最短等待秒数。
@@ -1483,9 +1596,9 @@ mod tests {
         let a = add(&s, "a");
         let b = add(&s, "b");
         s.note_rate_limited(a.id, 30);
-        assert_eq!(s.select(&[]).unwrap().id, b.id);
+        assert_eq!(s.select(&[], None).unwrap().id, b.id);
         s.note_rate_limited(b.id, 10);
-        let err = s.select(&[]).unwrap_err();
+        let err = s.select(&[], None).unwrap_err();
         let rl = err.downcast_ref::<AllRateLimited>().expect("should be AllRateLimited");
         assert!(rl.retry_after_secs <= 10, "should report the soonest: {}", rl.retry_after_secs);
     }
@@ -1516,7 +1629,7 @@ mod tests {
             .lock()
             .execute("UPDATE credentials SET resume_at = 1 WHERE id = ?1", params![a.id])
             .unwrap();
-        assert_eq!(s.select(&[]).unwrap().id, a.id);
+        assert_eq!(s.select(&[], None).unwrap().id, a.id);
         assert!(s.get(b.id).unwrap().unwrap().disabled, "manual disable must survive");
     }
 
