@@ -241,6 +241,18 @@ pub const DEFAULT_QUOTA_PAUSE_PCT: i64 = 90;
 pub const COOLDOWN_SECS: &str = "cooldown_secs";
 /// 同上的默认值。
 pub const DEFAULT_COOLDOWN_SECS: i64 = 60;
+/// 转发前把 `tools[]` 按名字排序（`1` = 开）。见 [`crate::proxy`] 的 `normalize_tool_order`。
+pub const NORMALIZE_TOOL_ORDER: &str = "normalize_tool_order";
+/// 同上的默认值。
+///
+/// **默认关**。它只对「每轮把工具列表顺序打乱」的客户端有用，而那种客户端不是常态；
+/// 官方 codex CLI 的顺序是固定的，那时排序一分不赚，还会让发上去的数组顺序变成官方客户端
+/// 永远不会产生的那一种——与 `Cargo.toml` 里 `preserve_order` 那条注防的是同一类指纹。
+///
+/// 要不要开，看归因里 `new_prefix` 那一桶占多少（见 [`CredentialStore::cache_reasons`]）:
+/// 那一桶大就是前缀在变，开它才有意义。
+pub const DEFAULT_NORMALIZE_TOOL_ORDER: i64 = 0;
+
 /// 会话落点的租约时长（秒，`0` = 关掉租约、退回纯 HRW 现算）。见 [`SessionLeases`]。
 pub const SESSION_LEASE_SECS: &str = "session_lease_secs";
 /// 同上的默认值。

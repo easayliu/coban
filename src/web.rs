@@ -131,6 +131,7 @@ pub async fn run(
         .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
         .route("/settings/cooldown-secs", post(set_cooldown_secs))
         .route("/settings/session-lease-secs", post(set_session_lease_secs))
+        .route("/settings/normalize-tool-order", post(set_normalize_tool_order))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
@@ -1034,6 +1035,8 @@ struct SettingsResp {
     cooldown_secs: i64,
     /// 会话落点的租约时长（秒，0 = 关闭）。
     session_lease_secs: i64,
+    /// 转发前是否把 `tools[]` 按名字排序。
+    normalize_tool_order: bool,
     /// 管理鉴权是否已开启（前端据此决定要不要显示「导出」这类高危操作）。
     admin_configured: bool,
     version: &'static str,
@@ -1055,6 +1058,9 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
         cooldown_secs: s.get_setting_i64(store::COOLDOWN_SECS, store::DEFAULT_COOLDOWN_SECS),
         session_lease_secs: s
             .get_setting_i64(store::SESSION_LEASE_SECS, store::DEFAULT_SESSION_LEASE_SECS),
+        normalize_tool_order: s
+            .get_setting_i64(store::NORMALIZE_TOOL_ORDER, store::DEFAULT_NORMALIZE_TOOL_ORDER)
+            != 0,
         admin_configured: auth::admin_configured(&state),
         version: env!("CARGO_PKG_VERSION"),
     })
@@ -1127,6 +1133,17 @@ async fn set_cooldown_secs(
     Json(req): Json<IntReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     set_int_setting(state, store::COOLDOWN_SECS, req.value, 1..=86_400).await
+}
+
+/// 开关：转发前要不要把 `tools[]` 按名字排一遍（见 `proxy::normalize_tool_order`）。
+///
+/// 布尔项走 `IntReq` 的 0/1 而不是另立一个请求体类型：设置那一族的写接口形状统一，
+/// 前端也就只有一套调用方式。
+async fn set_normalize_tool_order(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::NORMALIZE_TOOL_ORDER, req.value, 0..=1).await
 }
 
 /// 0 是合法值：把会话租约整个关掉，落点退回按会话键现算（见 `store::SessionLeases`）。

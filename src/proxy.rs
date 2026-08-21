@@ -63,23 +63,29 @@ pub async fn handle(
     }
 
     // 请求体在重试间要重发多次，规范化/翻译只做一次（见 plan_request）。
-    let Normalized { body, collapse, chat, sticky, input_len } = match plan_request(&path, body) {
-        Ok(n) => n,
-        // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
-        //
-        // **这条路不产生上游请求**，于是既没有用量流水也没有额度快照——从页面上看那个号
-        // 一切照旧（额度停在上一次的读数上，从没用过的号则一直是空），而客户端只看到一句
-        // 400。所以这里必须留一行日志：它是「客户端发了什么 coban 不认」的唯一线索。
-        Err(msg) => {
-            tracing::info!(
-                path = %path,
-                ua = %ua_of(&headers).unwrap_or_default(),
-                reason = %msg,
-                "rejected an incoming request before forwarding"
-            );
-            return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", msg);
-        }
-    };
+    // 工具顺序要不要排，见 normalize_tool_order。默认不排。
+    let sort_tools = state
+        .store
+        .get_setting_i64(store::NORMALIZE_TOOL_ORDER, store::DEFAULT_NORMALIZE_TOOL_ORDER)
+        != 0;
+    let Normalized { body, collapse, chat, sticky, input_len } =
+        match plan_request(&path, body, sort_tools) {
+            Ok(n) => n,
+            // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
+            //
+            // **这条路不产生上游请求**，于是既没有用量流水也没有额度快照——从页面上看那个号
+            // 一切照旧（额度停在上一次的读数上，从没用过的号则一直是空），而客户端只看到一句
+            // 400。所以这里必须留一行日志：它是「客户端发了什么 coban 不认」的唯一线索。
+            Err(msg) => {
+                tracing::info!(
+                    path = %path,
+                    ua = %ua_of(&headers).unwrap_or_default(),
+                    reason = %msg,
+                    "rejected an incoming request before forwarding"
+                );
+                return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", msg);
+            }
+        };
     // chat 的体已经翻成 Responses 形状，那它就该打到那个端点上；其余按来访路径原样拼。
     let upstream_path: &str = if chat.is_some() { config::RESPONSES_PATH } else { &path };
 
@@ -681,9 +687,9 @@ struct ChatMode {
 ///
 /// 两条路都在**换号重试之前**只做一次：重试要重发整个请求体，把翻译放进循环里等于每次
 /// 换号都重做一遍，而结果逐字节相同。
-fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
+fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized, String> {
     if path.trim_start_matches('/') == chat::PATH {
-        let t = chat::translate_request(&body)?;
+        let t = chat::translate_request(&body, sort_tools)?;
         return Ok(Normalized {
             body: t.body,
             // 「客户端没要流」在两种线格式里是同一件事，收拢那段代码也就共用。
@@ -693,7 +699,7 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
             input_len: t.input_len,
         });
     }
-    Ok(normalize_responses_body(path, body))
+    Ok(normalize_responses_body(path, body, sort_tools))
 }
 
 /// 把 `responses` 请求体钉成上游要的样子：`store: false`、`stream: true`。
@@ -717,7 +723,7 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
 /// 就带一个）。
 ///
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
-fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
+fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
         return Normalized { body, collapse: false, chat: None, sticky: None, input_len: 0 };
     }
@@ -725,6 +731,9 @@ fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
         return Normalized { body, collapse: false, chat: None, sticky: None, input_len: 0 };
     };
     // 趁体已经解开算指纹：为此再解析一遍是白花的 CPU——真实流量里这个体有几百 KB。
+    // **排在算指纹之前**：指纹里就含 tools 及其顺序，反过来的话前缀稳住了而落点还在跟着
+    // 客户端那个乱序变——两件事必须用同一份顺序。
+    let reordered = sort_tools && normalize_tool_order(&mut obj);
     let sticky = prefix_fingerprint(&obj);
     let input_len = obj.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
     let yes = Some(&serde_json::Value::Bool(true));
@@ -732,7 +741,7 @@ fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     let collapse = obj.get("stream") != yes;
     // 先扫参数、再判快路径：要不要重新序列化取决于**真的丢掉了东西**，而不是某个字段在不在。
     let dropped = drop_unsupported_params(&mut obj);
-    if !collapse && obj.get("store") == no && !dropped {
+    if !collapse && obj.get("store") == no && !dropped && !reordered {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
         return Normalized { body, collapse, chat: None, sticky, input_len };
     }
@@ -882,6 +891,44 @@ fn note_stale_reasoning(memo: &StaleReasoningMemo, session_key: Option<&str>, cr
         memo.pop_front();
     }
     memo.push_back((key.to_owned(), cred_id));
+}
+
+/// 把 `tools[]` 按名字排定序，返回**顺序是否真的动过**。
+///
+/// 为什么要排：工具定义**连同顺序**都进上游的 prompt cache 前缀（见 [`prefix_fingerprint`]
+/// 里那份官方口径）。客户端每轮把工具列表顺序打乱一次，就是每轮 100% 未命中——而且指纹跟着
+/// 变、落点也换，两头一起丢。排一遍就把一个不稳定的客户端强行稳住。
+///
+/// 为什么**默认不排**（见 [`store::DEFAULT_NORMALIZE_TOOL_ORDER`]）：这不是上游的硬约束，
+/// 而是我们替客户端做的决定。官方 codex CLI 的工具顺序本来就是固定的，那时排序一分不赚，
+/// 却让发上去的数组顺序成了官方客户端永远不会产生的那一种。工具顺序对模型也不是完全无意义
+/// （它是弱优先级暗示），静默改掉不合适。
+///
+/// 排序键是「名字 + 整条序列化」两级：
+/// - 名字取 `name`（函数工具）→ `server_label`（MCP）→ `type`（内建工具没有名字）。
+/// - 同名或都没名字时按整条序列化定序。只按名字排的话，两条同名工具的相对次序仍随客户端
+///   发来的顺序变，那等于没排。
+pub fn normalize_tool_order(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(serde_json::Value::Array(tools)) = obj.get_mut("tools") else { return false };
+    if tools.len() < 2 {
+        return false;
+    }
+    let sort_key = |t: &serde_json::Value| {
+        let ident = ["name", "server_label", "type"]
+            .iter()
+            .find_map(|k| t.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_owned();
+        (ident, t.to_string())
+    };
+    let keys: Vec<(String, String)> = tools.iter().map(&sort_key).collect();
+    // 已经是有序的就什么都不做：那时重排是空动作，而**报「动过了」会白白触发一次重新
+    // 序列化**——那会把整个 body 的 key 顺序改掉（见 Cargo.toml 里 preserve_order 的注）。
+    if keys.windows(2).all(|w| w[0] <= w[1]) {
+        return false;
+    }
+    tools.sort_by_cached_key(sort_key);
+    true
 }
 
 /// 一条请求的会话身份，加上给缓存未命中归因所需的那点上下文。
@@ -2694,7 +2741,7 @@ mod tests {
     }
 
     fn norm(path: &str, b: &str) -> Normalized {
-        normalize_responses_body(path, Bytes::from(b.to_owned()))
+        normalize_responses_body(path, Bytes::from(b.to_owned()), false)
     }
 
     /// `store`/`stream` 的三种来法都要落到上游要的值，且别的字段一个不动。
@@ -2806,15 +2853,15 @@ mod tests {
     fn body_rewrite_only_touches_responses_and_valid_json() {
         // 别的端点（如 models）不碰。
         let raw = Bytes::from_static(br#"{"store":true}"#);
-        assert_eq!(normalize_responses_body("models", raw.clone()).body, raw);
+        assert_eq!(normalize_responses_body("models", raw.clone(), false).body, raw);
         // 前导斜杠仍要认出是 responses。
-        let out = normalize_responses_body("/responses", raw.clone()).body;
+        let out = normalize_responses_body("/responses", raw.clone(), false).body;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["store"], false);
         assert_eq!(v["stream"], true);
         // 解不动的体原样放过，不在这里替上游拦。
         let junk = Bytes::from_static(b"not json");
-        assert_eq!(normalize_responses_body("responses", junk.clone()).body, junk);
+        assert_eq!(normalize_responses_body("responses", junk.clone(), false).body, junk);
     }
 
     /// 收拢流靠的是终局事件里那个 `response` 对象；增量事件与裸的同名字符串都不能骗过它。
@@ -2915,7 +2962,7 @@ mod tests {
         );
         // 两种路径写法（`/v1/chat/completions` 与根上的 `/chat/completions`）都要认出来。
         for path in ["chat/completions", "/chat/completions"] {
-            let n = plan_request(path, chat_body.clone()).expect("translates");
+            let n = plan_request(path, chat_body.clone(), false).expect("translates");
             assert!(n.chat.is_some(), "{path} 应走 chat 翻译");
             assert!(!n.collapse, "客户端要了流就照流回");
             let v: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
@@ -2926,15 +2973,16 @@ mod tests {
         let n = plan_request(
             "chat/completions",
             Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#),
+            false,
         )
         .unwrap();
         assert!(n.collapse);
 
         // responses 那条不受影响，也不会被当成 chat。
-        let n = plan_request("responses", Bytes::from_static(br#"{"model":"m"}"#)).unwrap();
+        let n = plan_request("responses", Bytes::from_static(br#"{"model":"m"}"#), false).unwrap();
         assert!(n.chat.is_none());
         // 形状错误在这一层就拒，不送去上游换一句指不到原因的 400。
-        assert!(plan_request("chat/completions", Bytes::from_static(b"{}")).is_err());
+        assert!(plan_request("chat/completions", Bytes::from_static(b"{}"), false).is_err());
     }
 
     /// 只有「OpenAI 兼容客户端问模型」那一种请求才接管，codex CLI 那条必须放过去。
@@ -3060,12 +3108,90 @@ mod tests {
         assert_eq!(cache_reason(Some(""), LeaseState::Absent, 0, A, usage(0)), None);
     }
 
+    /// 排 tools 的三件事：顺序被排定、指纹**跟着排完的顺序算**、已经有序时不动手。
+    #[test]
+    fn tool_order_normalization_stabilizes_both_order_and_fingerprint() {
+        let shuffled = br#"{"model":"m","instructions":"i",
+            "tools":[{"type":"function","name":"write"},{"type":"function","name":"apply_patch"},
+                     {"type":"web_search"}],
+            "input":[{"role":"user","content":"hi"}]}"#;
+        // 排完的样子：没名字的内建工具按 `type` 字串一起参与排序，不是被推到最后。
+        let sorted = br#"{"model":"m","instructions":"i",
+            "tools":[{"type":"function","name":"apply_patch"},{"type":"web_search"},
+                     {"type":"function","name":"write"}],
+            "input":[{"role":"user","content":"hi"}]}"#;
+
+        let names = |n: &Normalized| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
+            v["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| {
+                    t.get("name").or_else(|| t.get("type")).unwrap().as_str().unwrap().to_owned()
+                })
+                .collect()
+        };
+
+        // 不开时原样放过：这是默认行为，别把「没开」也给排了。
+        let off = plan_request("responses", Bytes::from_static(shuffled), false).unwrap();
+        assert_eq!(names(&off), vec!["write", "apply_patch", "web_search"]);
+
+        // 开了之后按排序键（名字，没名字则 type）走一遍字典序。
+        let on = plan_request("responses", Bytes::from_static(shuffled), true).unwrap();
+        assert_eq!(names(&on), vec!["apply_patch", "web_search", "write"]);
+
+        // **排过的那份与本来就有序的那份要算出同一个指纹**——这才是排序的目的：前缀稳了，
+        // 落点也不能再跟着客户端那个乱序换。
+        let already = plan_request("responses", Bytes::from_static(sorted), true).unwrap();
+        assert_eq!(on.sticky, already.sticky);
+        assert_ne!(off.sticky, on.sticky, "不排的那份指纹本来就该不一样");
+    }
+
+    /// 已经有序时不许重新序列化：那会把整个 body 的 key 顺序改掉（见 Cargo.toml 里
+    /// preserve_order 的注），而排序在这种输入上本该是个空动作。
+    #[test]
+    fn an_already_sorted_tool_list_is_left_byte_for_byte_alone() {
+        let raw = Bytes::from_static(
+            br#"{"model":"m","store":false,"stream":true,"instructions":"i","tools":[{"name":"a","type":"function"},{"name":"b","type":"function"}],"input":[{"role":"user","content":"hi"}]}"#,
+        );
+        let n = normalize_responses_body("responses", raw.clone(), true);
+        assert_eq!(n.body, raw, "有序的输入该一个字节都不动");
+    }
+
+    /// 同名工具也要有确定的次序，否则「排过」只是错觉——客户端换个顺序发，落点还是会变。
+    #[test]
+    fn same_named_tools_still_get_a_deterministic_order() {
+        let one = plan_request(
+            "responses",
+            Bytes::from_static(
+                br#"{"model":"m","tools":[{"type":"mcp","server_label":"x","server_url":"b"},
+                     {"type":"mcp","server_label":"x","server_url":"a"}],
+                     "input":[{"role":"user","content":"hi"}]}"#,
+            ),
+            true,
+        )
+        .unwrap();
+        let other = plan_request(
+            "responses",
+            Bytes::from_static(
+                br#"{"model":"m","tools":[{"type":"mcp","server_label":"x","server_url":"a"},
+                     {"type":"mcp","server_label":"x","server_url":"b"}],
+                     "input":[{"role":"user","content":"hi"}]}"#,
+            ),
+            true,
+        )
+        .unwrap();
+        assert_eq!(one.sticky, other.sticky, "server_label 撞了也得排得出确定的次序");
+    }
+
     /// 两条线格式都要报出 `input[]` 的项数——`first_turn` 与 `new_prefix` 全靠它分开。
     #[test]
     fn both_wire_formats_report_the_input_length() {
         let one = plan_request(
             "responses",
             Bytes::from_static(br#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#),
+            false,
         )
         .unwrap();
         assert_eq!(one.input_len, 1);
@@ -3076,13 +3202,14 @@ mod tests {
                 br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"},
                      {"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}"#,
             ),
+            false,
         )
         .unwrap();
         // system 进 instructions，不算一项输入；剩下三条才是。
         assert_eq!(grown.input_len, 3);
 
         // 解不出体（`models` 那类无体请求）时是 0，不是崩。
-        assert_eq!(plan_request("models", Bytes::new()).unwrap().input_len, 0);
+        assert_eq!(plan_request("models", Bytes::new(), false).unwrap().input_len, 0);
     }
 
     /// 两种线格式都要拿到指纹，且**同一段对话在 chat 那条路上长大时也不能变**。
@@ -3093,6 +3220,7 @@ mod tests {
             Bytes::from_static(
                 br#"{"model":"m","instructions":"i","input":[{"role":"user","content":"hi"}]}"#,
             ),
+            false,
         )
         .unwrap();
         assert!(n.sticky.is_some());
@@ -3102,6 +3230,7 @@ mod tests {
             Bytes::from_static(
                 br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}"#,
             ),
+            false,
         )
         .unwrap();
         let turn2 = plan_request(
@@ -3110,6 +3239,7 @@ mod tests {
                 br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"},
                      {"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}"#,
             ),
+            false,
         )
         .unwrap();
         assert!(turn1.sticky.is_some());

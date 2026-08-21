@@ -21,6 +21,8 @@ export interface Settings {
   cooldown_secs: number
   /** 会话落点的租约时长（秒，0 = 关闭租约、每次按会话键现算落点）。 */
   session_lease_secs: number
+  /** 转发前是否把 `tools[]` 按名字排序。默认关，只有客户端确实在乱序发工具时才该开。 */
+  normalize_tool_order: boolean
   /** 管理密码是否已设置。未设置时管理接口是完全敞开的。 */
   admin_configured: boolean
   version: string
@@ -63,5 +65,11 @@ export async function setCooldownSecs(secs: number): Promise<Settings> {
 /** 0 = 关掉租约。 */
 export async function setSessionLeaseSecs(secs: number): Promise<Settings> {
   const { data } = await api.post('/settings/session-lease-secs', { value: secs })
+  return data
+}
+
+/** 布尔项也走 0/1：设置那一族的写接口形状统一。 */
+export async function setNormalizeToolOrder(on: boolean): Promise<Settings> {
+  const { data } = await api.post('/settings/normalize-tool-order', { value: on ? 1 : 0 })
   return data
 }

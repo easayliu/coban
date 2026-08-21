@@ -8,8 +8,8 @@ import {
 import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
 import { clearPw, setPw } from '@/api/client'
 import {
-  getSettings, setApiKey, setCooldownSecs, setDefaultRpmLimit, setQuotaPausePct,
-  setRateLimitRetryMax, setSessionLeaseSecs, type Settings,
+  getSettings, setApiKey, setCooldownSecs, setDefaultRpmLimit, setNormalizeToolOrder,
+  setQuotaPausePct, setRateLimitRetryMax, setSessionLeaseSecs, type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { copyText, extractError } from '@/lib/utils'
@@ -36,6 +36,7 @@ import {
   NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement, NumberFieldInput,
 } from '@/components/ui/number-field'
 import { Spinner } from '@/components/ui/spinner'
+import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
 import { SettingsGroup } from '@/components/settings-group'
 
@@ -114,8 +115,8 @@ function CopyButton({
 }
 
 /** 设置项共用的保存 mutation，保持每个控件的 loading、错误提示和缓存更新口径一致。 */
-function useSettingMutation(
-  mutationFn: (value: number) => Promise<Settings>,
+function useSettingMutation<V extends number | boolean>(
+  mutationFn: (value: V) => Promise<Settings>,
   successTitle: string,
 ) {
   const qc = useQueryClient()
@@ -136,6 +137,33 @@ function useSettingMutation(
  * 抽出来是因为这一页有四个同构的项，各写一遍的话「改了没保存就切走」「保存中禁用」
  * 这类细节必然在某一个上漏掉。
  */
+/**
+ * 一个开关项。与 [`NumberSetting`] 的区别是**拨完立刻保存**，没有「保存」按钮：数字要给人
+ * 改完再确认的机会（半个数字是错的），而开关的中间态不存在，多一次点击只是多一次点击。
+ */
+function SwitchSetting({
+  label, description, checked, onToggle, pending,
+}: {
+  label: string
+  description: string
+  checked: boolean
+  onToggle: (next: boolean) => void
+  pending: boolean
+}) {
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{label}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">{description}</FieldDescription>
+      </div>
+      <div className="flex items-center gap-2 sm:justify-end">
+        {pending && <Spinner />}
+        <Switch checked={checked} disabled={pending} onCheckedChange={onToggle} aria-label={label} />
+      </div>
+    </Field>
+  )
+}
+
 function NumberSetting({
   label, description, value, min, max, onSave, pending,
 }: {
@@ -461,6 +489,10 @@ export function LimitsSettingsContent() {
   const pause = useSettingMutation(setQuotaPausePct, t('已保存额度阈值', 'Quota threshold saved'))
   const cooldown = useSettingMutation(setCooldownSecs, t('已保存冷却时长', 'Cooldown saved'))
   const lease = useSettingMutation(setSessionLeaseSecs, t('已保存租约时长', 'Lease duration saved'))
+  const toolOrder = useSettingMutation(
+    setNormalizeToolOrder,
+    t('已保存工具顺序设置', 'Tool order setting saved'),
+  )
 
   if (settingsQuery.isPending) {
     return (
@@ -583,6 +615,16 @@ export function LimitsSettingsContent() {
           max={86400}
           pending={lease.isPending}
           onSave={(n) => lease.mutate(n)}
+        />
+        <SwitchSetting
+          label={t('转发前把工具列表排序', 'Sort the tool list before forwarding')}
+          description={t(
+            '工具定义连同顺序都算在提示缓存的前缀里。有的客户端每轮发来的工具顺序都不一样，那就等于每轮都从零开始算——开着它能把这种客户端强行稳住。默认关：官方 codex CLI 的顺序本来就是固定的，那时排序一分不赚，还会让发上去的顺序变成官方客户端不会产生的那一种。要不要开，看上面「未命中都花在哪了」里「前缀每轮在变」那一栏占多少。',
+            'Tool definitions and their order are both part of the prompt cache prefix. Some clients send the tool list in a different order every turn, which restarts the cache from zero each time; turning this on forces such a client to be stable. Off by default: the official codex CLI already sends a fixed order, so sorting gains nothing there and makes the forwarded order one the official client would never produce. To decide, look at how much the "Prefix keeps changing" row accounts for under "Where the misses went".',
+          )}
+          checked={data.normalize_tool_order}
+          pending={toolOrder.isPending}
+          onToggle={(on) => toolOrder.mutate(on)}
         />
       </SettingsGroup>
     </div>

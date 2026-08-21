@@ -66,7 +66,7 @@ pub struct Translated {
 ///
 /// 返回的 `Err` 是给客户端看的 `invalid_request_error` 文案：这类错误在 coban 这一层就能
 /// 判定，送到上游只会换回一句指不到原因的 400。
-pub fn translate_request(raw: &[u8]) -> Result<Translated, String> {
+pub fn translate_request(raw: &[u8], sort_tools: bool) -> Result<Translated, String> {
     let v: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("the request body is not valid JSON: {e}"))?;
     let obj = v.as_object().ok_or_else(|| "the request body must be a JSON object".to_owned())?;
@@ -124,6 +124,11 @@ pub fn translate_request(raw: &[u8]) -> Result<Translated, String> {
     out.insert("store".into(), Value::Bool(false));
     out.insert("stream".into(), Value::Bool(true));
 
+    // **排在算指纹之前**：指纹里就含 tools 及其顺序，反过来的话前缀稳住了而落点还在跟着
+    // 客户端那个乱序变——两件事必须用同一份顺序。
+    if sort_tools {
+        crate::proxy::normalize_tool_order(&mut out);
+    }
     let sticky = crate::proxy::prefix_fingerprint(&out);
     let input_len = out.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
     let body = serde_json::to_vec(&Value::Object(out))
@@ -816,7 +821,7 @@ mod tests {
     use super::*;
 
     fn translate(body: &str) -> Translated {
-        translate_request(body.as_bytes()).expect("translates")
+        translate_request(body.as_bytes(), false).expect("translates")
     }
 
     fn upstream(body: &str) -> Value {
@@ -956,7 +961,7 @@ mod tests {
     /// 这一层判得出来的形状错误就在这一层拒，别送到上游去换一句指不到原因的 400。
     #[test]
     fn requests_that_cannot_work_are_rejected_here() {
-        let err = |b: &str| translate_request(b.as_bytes()).expect_err("rejected");
+        let err = |b: &str| translate_request(b.as_bytes(), false).expect_err("rejected");
         // n > 1：上游一次只出一条，静默给一条会让按 choices[1] 取值的客户端拿到越界。
         assert!(
             err(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"n":2}"#)
