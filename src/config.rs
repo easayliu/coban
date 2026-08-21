@@ -76,6 +76,9 @@ pub const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// （见 [`crate::proxy::list_models`]）。
 pub const MODELS_PATH: &str = "models";
 
+/// 会话/推理端点（`UPSTREAM_BASE` 之后那一段）。转发的主路径，探测也打这里。
+pub const RESPONSES_PATH: &str = "responses";
+
 /// 官方客户端的 `originator` 头取值。上游按它区分「哪个 codex 前端发来的」。
 ///
 /// 写死成 CLI 那个值而不是透传来访客户端的：coban 的接入方就是 codex CLI，透传等于把

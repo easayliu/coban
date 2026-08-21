@@ -318,21 +318,77 @@ async fn exchange(
 
 #[derive(Deserialize)]
 struct ImportAuthJsonReq {
-    /// `~/.codex/auth.json` 的内容。
+    /// `~/.codex/auth.json` 的内容，或一份带 `accounts` 数组的批量导出。
     content: String,
 }
 
-/// 从既有的 `~/.codex/auth.json` 导入一个已登录账号。
+/// 一次导入的结果。
+///
+/// **单个账号也走这个形状**：让「导入一个」成为「导入 N 个」的退化情形，前端只需一条
+/// 渲染路径。否则同一个接口按输入形态回两种结构，客户端得先判类型再取字段。
+#[derive(Serialize)]
+struct ImportReport {
+    imported: Vec<CredentialView>,
+    skipped: Vec<SkippedAccount>,
+}
+
+/// 批量导入里被跳过的一个账号。带上名字才定位得到是哪一个出的问题。
+#[derive(Serialize)]
+struct SkippedAccount {
+    name: String,
+    reason: String,
+}
+
+/// 导入已登录的账号：`~/.codex/auth.json`，或一份带 `accounts` 数组的批量导出。
 ///
 /// 存在的理由：机器上已经 `codex login` 过的账号不必再走一遍浏览器授权，而在无图形界面
 /// 的服务器上「打开浏览器粘回调」这条路本身就很难走。
+///
+/// 认三种形态，都在 [`import_one`] 里归一：
+/// - `~/.codex/auth.json` —— token 在 `tokens` 子对象里；
+/// - 裸的 token 对象 —— 根上直接是 `access_token`/`refresh_token`；
+/// - 批量导出（sub2api 等）—— 根上一个 `accounts` 数组，每项的 token 在 `credentials` 里。
+///
+/// 批量时**逐个独立处理，坏的跳过而不是整批失败**：23 个账号里有 1 个 token 已作废，
+/// 让另外 22 个也进不来是没道理的。跳过的连同原因一起回给调用方。
 async fn import_auth_json(
     State(state): State<AppState>,
     Json(req): Json<ImportAuthJsonReq>,
-) -> Result<Json<CredentialView>, ApiError> {
+) -> Result<Json<ImportReport>, ApiError> {
     let v: serde_json::Value = serde_json::from_str(req.content.trim())
         .map_err(|e| bad_request(format!("that is not valid JSON: {e}")))?;
-    let tokens = v.get("tokens").unwrap_or(&v);
+
+    let accounts: Vec<&serde_json::Value> = match v.get("accounts").and_then(|a| a.as_array()) {
+        Some(list) => list.iter().collect(),
+        None => vec![&v],
+    };
+    if accounts.is_empty() {
+        return Err(bad_request("the accounts array in that file is empty"));
+    }
+
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+    for (i, acc) in accounts.iter().enumerate() {
+        match import_one(&state, acc) {
+            Ok(view) => imported.push(view),
+            Err((_, reason)) => skipped.push(SkippedAccount { name: name_of(acc, i), reason }),
+        }
+    }
+
+    // 一个都没成时回 400 而不是「200 加一份全是 skipped 的报告」：整份文件不可用是
+    // 请求级失败，前端的错误分支才是该走的那条。原因回第一条——它们通常同因同源。
+    if imported.is_empty() {
+        let first = skipped.into_iter().next().map(|s| s.reason).unwrap_or_default();
+        return Err(bad_request(first));
+    }
+    Ok(Json(ImportReport { imported, skipped }))
+}
+
+/// 从一个账号对象里取 token 存库。
+///
+/// `credentials`（批量导出）/ `tokens`（auth.json）/ 根对象，按这个顺序找 token 所在的层。
+fn import_one(state: &AppState, acc: &serde_json::Value) -> Result<CredentialView, ApiError> {
+    let tokens = acc.get("credentials").or_else(|| acc.get("tokens")).unwrap_or(acc);
     let get = |k: &str| tokens.get(k).and_then(|x| x.as_str()).map(str::to_owned);
 
     let access_token =
@@ -342,11 +398,14 @@ async fn import_auth_json(
     })?;
     let id_token = get("id_token");
     let claims = id_token.as_deref().map(oauth::Claims::parse).unwrap_or_default();
-    // account_id 优先取 auth.json 自己那份，缺了再从 id_token 的 claim 里找。
-    let account_id = get("account_id").or_else(|| claims.account_id.clone());
+    // account_id 优先取文件自己那份（auth.json 叫 `account_id`，批量导出叫
+    // `chatgpt_account_id`），都缺了再从 id_token 的 claim 里找。
+    let account_id = get("account_id")
+        .or_else(|| get("chatgpt_account_id"))
+        .or_else(|| claims.account_id.clone());
 
-    save_token_set(
-        &state,
+    let mut view = save_token_set(
+        state,
         oauth::TokenSet {
             access_token,
             refresh_token,
@@ -357,8 +416,31 @@ async fn import_auth_json(
             id_token,
             claims: oauth::Claims { account_id, ..claims },
         },
-    )
-    .map(Json)
+    )?;
+
+    // 导出里带了优先级就沿用。**失败不算导入失败**：凭证本身已经存好了，为一个可以
+    // 在界面上改的字段把整条判为跳过，反而要人再导一遍。
+    if let Some(p) = acc.get("priority").and_then(|x| x.as_i64()) {
+        match state.store.set_priority(view.id, p) {
+            // 视图是 `save_token_set` 里就生成的，那时还没落这个值——不同步回去的话，
+            // 报告里回的是 0 而库里是 1，看报告推不出库里的状态。
+            Ok(()) => view.priority = p,
+            Err(e) => {
+                tracing::warn!(cred_id = view.id, error = %e, "imported but could not apply priority")
+            }
+        }
+    }
+    Ok(view)
+}
+
+/// 给一个账号对象取个能认出来的名字，用于跳过原因的定位。
+fn name_of(acc: &serde_json::Value, index: usize) -> String {
+    ["name", "email", "label"]
+        .iter()
+        .find_map(|k| acc.get(*k).and_then(|x| x.as_str()))
+        .or_else(|| acc.get("credentials").and_then(|c| c.get("email")).and_then(|x| x.as_str()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("account #{}", index + 1))
 }
 
 /// 把一组 token 落库并返回视图。

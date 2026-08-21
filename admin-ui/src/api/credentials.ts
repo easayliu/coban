@@ -144,8 +144,27 @@ export async function exchangeCode(callback: string, state?: string): Promise<Cr
   return data
 }
 
-/** 从既有的 `~/.codex/auth.json` 内容导入一个已登录账号。 */
-export async function importAuthJson(content: string): Promise<Credential> {
+/** 批量导入里被跳过的一个账号。 */
+export interface SkippedAccount {
+  name: string
+  reason: string
+}
+
+/**
+ * 一次导入的结果。单个账号也是这个形状（`imported` 长度 1），所以渲染只有一条路径。
+ */
+export interface ImportReport {
+  imported: Credential[]
+  skipped: SkippedAccount[]
+}
+
+/**
+ * 导入已登录的账号。
+ *
+ * 认 `~/.codex/auth.json`、裸 token 对象、以及带 `accounts` 数组的批量导出（sub2api 等）
+ * 三种形态——由后端 `import_one` 归一，前端不必先判是哪一种。
+ */
+export async function importAuthJson(content: string): Promise<ImportReport> {
   const { data } = await api.post('/import-auth-json', { content })
   return data
 }

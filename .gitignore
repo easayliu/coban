@@ -32,3 +32,7 @@
 
 # TS 增量构建缓存
 /admin-ui/tsconfig.tsbuildinfo
+
+# 账号凭证导出（含 refresh_token 明文，绝不入库）
+/sub2api-account-*.json
+/auth.json

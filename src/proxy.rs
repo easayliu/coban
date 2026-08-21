@@ -51,6 +51,9 @@ pub async fn handle(
         }
     }
 
+    // 请求体在重试间要重发多次，规范化只做一次（见 force_store_false）。
+    let body = force_store_false(&path, body);
+
     let started = Instant::now();
     let retry_max = state
         .store
@@ -245,6 +248,32 @@ fn stream_upstream(
 }
 
 /// 拼上游 URL：`UPSTREAM_BASE` + 来访路径（+ 原样带上 query）。
+/// 把 `responses` 请求体里的 `store` 按住在 `false`。
+///
+/// 上游只接受 `store: false`（会话不落在 ChatGPT 侧），漏传或传 `true` 一律 400
+/// `Store must be set to false`。codex CLI 自己会带上，但照 OpenAI 官方 Responses API
+/// 写的客户端不会——那边 `store` 默认就是 `true`。这种改写只此一处：它是上游的硬约束，
+/// 不是用户的选择，让每个接入方各自去踩一遍没有意义。
+///
+/// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
+fn force_store_false(path: &str, body: Bytes) -> Bytes {
+    if path.trim_start_matches('/') != config::RESPONSES_PATH {
+        return body;
+    }
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
+        return body;
+    };
+    if obj.get("store") == Some(&serde_json::Value::Bool(false)) {
+        return body;
+    }
+    obj.insert("store".to_owned(), serde_json::Value::Bool(false));
+    match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+        Ok(v) => Bytes::from(v),
+        // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
+        Err(_) => body,
+    }
+}
+
 fn upstream_url(path: &str, query: Option<&str>) -> String {
     let path = path.trim_start_matches('/');
     match query.filter(|q| !q.is_empty()) {
@@ -816,7 +845,7 @@ pub async fn list_models(
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 探测打到的上游路径（`UPSTREAM_BASE` 之后那一段）。与真实转发落到同一个端点。
-const PROBE_PATH: &str = "responses";
+const PROBE_PATH: &str = config::RESPONSES_PATH;
 
 /// 用量流水里标出「这条是连通性测试」的 UA。
 ///
@@ -1446,6 +1475,35 @@ mod tests {
             upstream_url("/responses", None),
             "https://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    /// `store` 的三种来法都要落到 `false`，且别的字段一个不动。
+    #[test]
+    fn store_is_pinned_to_false_on_responses() {
+        let pin = |b: &str| -> serde_json::Value {
+            let out = force_store_false("responses", Bytes::from(b.to_owned()));
+            serde_json::from_slice(&out).unwrap()
+        };
+        // 漏传（OpenAI 官方 API 那边默认 true）。
+        assert_eq!(pin(r#"{"model":"gpt-5.4"}"#)["store"], false);
+        // 显式 true。
+        assert_eq!(pin(r#"{"model":"gpt-5.4","store":true}"#)["store"], false);
+        // 已经是 false：原样。
+        let v = pin(r#"{"model":"gpt-5.4","store":false}"#);
+        assert_eq!(v["store"], false);
+        assert_eq!(v["model"], "gpt-5.4");
+    }
+
+    #[test]
+    fn store_rewrite_only_touches_responses_and_valid_json() {
+        // 别的端点（如 models）不碰。
+        let raw = Bytes::from_static(br#"{"store":true}"#);
+        assert_eq!(force_store_false("models", raw.clone()), raw);
+        // 前导斜杠仍要认出是 responses。
+        assert_eq!(force_store_false("/responses", raw.clone())[..], b"{\"store\":false}"[..]);
+        // 解不动的体原样放过，不在这里替上游拦。
+        let junk = Bytes::from_static(b"not json");
+        assert_eq!(force_store_false("responses", junk.clone()), junk);
     }
 
     fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
