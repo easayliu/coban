@@ -534,10 +534,11 @@ fn plan_request(path: &str, body: Bytes) -> Result<Normalized, String> {
 /// 一个 JSON 响应变成 SSE。所以这里同时记下「客户端本来没要流」，由 [`collapse_upstream`]
 /// 把流收回成 JSON——只改体不管回程的话，客户端拿到的是一堆读不懂的 `data:` 行。
 ///
-/// 顺手**丢掉 `max_output_tokens`**：上游不认这个参数（实测回 `Unsupported parameter:
-/// max_output_tokens`），带上去是整条请求 400。与 [`crate::chat`] 丢 `max_tokens` 同一个
-/// 取舍——客户端设的输出上限静默失效，好过每条请求都失败，且后者在客户端那头看到的只是
-/// 一句「请求失败」。codex CLI 不发这个字段，照 OpenAI 官方 Responses API 写的客户端会发。
+/// 顺手**把上游拒收的参数丢掉**（[`drop_unsupported_params`]）：带上去是整条请求 400，而
+/// 客户端那头看到的只是一句「请求失败」。与 [`crate::chat`] 丢 `temperature` 那一堆同一个
+/// 取舍——客户端设的采样参数与上限静默失效，好过每条请求都失败。codex CLI 这些一个都不发，
+/// 照 OpenAI 官方 Responses API 写的客户端会发，`temperature` 尤其常见（SDK 与各类前端默认
+/// 就带一个）。
 ///
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
 fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
@@ -552,11 +553,12 @@ fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
     let yes = Some(&serde_json::Value::Bool(true));
     let no = Some(&serde_json::Value::Bool(false));
     let collapse = obj.get("stream") != yes;
-    if !collapse && obj.get("store") == no && !obj.contains_key("max_output_tokens") {
-        // 三项都已经对：不重新序列化（也就不会顺手改掉字段顺序）。
+    // 先扫参数、再判快路径：要不要重新序列化取决于**真的丢掉了东西**，而不是某个字段在不在。
+    let dropped = drop_unsupported_params(&mut obj);
+    if !collapse && obj.get("store") == no && !dropped {
+        // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
         return Normalized { body, collapse, chat: None, sticky };
     }
-    obj.remove("max_output_tokens");
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
@@ -564,6 +566,65 @@ fn normalize_responses_body(path: &str, body: Bytes) -> Normalized {
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
         Err(_) => Normalized { body, collapse, chat: None, sticky },
     }
+}
+
+/// 上游拒收、且**丢了客户端察觉不到**的参数。逐个实测过，回的都是
+/// `Unsupported parameter: <名字>`。
+///
+/// 丢掉的代价是客户端设的采样参数、输出上限与观测选项静默失效；带上去的代价是**每一条请求
+/// 都 400**——后者更糟，且 400 不换号重试（见 [`forward_once`] 那头对状态码的分流），表现就是
+/// 这个接入方彻底不可用。`max_output_tokens` 也在这份清单里：它是最早被实测出来的一个。
+///
+/// 反过来，实测**能**过的（一个都不许动）：`tools`/`tool_choice`/`parallel_tool_calls`/
+/// `reasoning`（含 `summary`）/`text`（含 `verbosity` 与 `json_schema`）/`include`/
+/// `prompt_cache_key`/`stream_options`。
+const UNSUPPORTED_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "stop",
+    "user",
+    "metadata",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "top_k",
+    "safety_identifier",
+    "truncation",
+    "max_tool_calls",
+    "max_output_tokens",
+];
+
+/// 丢掉上游拒收的参数，返回**有没有真丢掉过东西**（快路径靠这个决定要不要重新序列化）。
+///
+/// 分两档，界线是「丢了会不会改变语义」：
+/// - [`UNSUPPORTED_PARAMS`]：无条件丢。
+/// - 带着默认值才丢的那几个：`n: 1`、`background: false`、`service_tier: "auto"`（这一个上游
+///   的措辞不一样：`Unsupported service_tier: auto`）。官方 SDK 会把它们填成默认值发出去，
+///   那时丢掉没有语义损失；而 `n: 2` 是真要两条、`background: true` 是真要异步任务，静默丢掉
+///   会让客户端拿到一个它没要的东西，那时不如把上游那句 400 照原样交回去。值的形状不对
+///   （如 `n: 1.0`）也归到这一支：不敢当默认值处置，一样交给上游判。
+///
+/// **`previous_response_id` 刻意不丢**：这条路径 `store` 被钉成 `false`，会话根本不在上游，
+/// 丢掉的后果是模型看不见前面几轮却照样答——静默答错比一句明确的 400 难查得多。
+fn drop_unsupported_params(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let mut dropped = false;
+    for k in UNSUPPORTED_PARAMS {
+        dropped |= obj.remove(*k).is_some();
+    }
+    for (k, default) in [
+        ("n", serde_json::json!(1)),
+        ("background", serde_json::json!(false)),
+        ("service_tier", serde_json::json!("auto")),
+    ] {
+        if obj.get(k) == Some(&default) {
+            obj.remove(k);
+            dropped = true;
+        }
+    }
+    dropped
 }
 
 /// 从（已经是 Responses 形状的）请求体里算一个**会话指纹**。
@@ -2120,27 +2181,76 @@ mod tests {
         assert_eq!(v["model"], "gpt-5.4");
     }
 
-    /// `max_output_tokens` 一定要在这里丢掉：上游回 `Unsupported parameter`，带上去是每条
-    /// 请求都 400。别的字段一个不能顺手丢。
+    /// 上游拒收的参数一定要在这里丢掉：带上去是每条请求都 400（而 400 不换号重试，等于这个
+    /// 接入方彻底不可用）。清单逐个实测过，回的都是 `Unsupported parameter: <名字>`。
     #[test]
-    fn max_output_tokens_is_dropped_on_responses() {
+    fn unsupported_parameters_are_dropped_on_responses() {
         let pin = |b: &str| -> serde_json::Value {
             serde_json::from_slice(&norm("responses", b).body).unwrap()
         };
-        let v = pin(r#"{"model":"gpt-5.4","store":false,"stream":true,"max_output_tokens":64}"#);
-        assert!(v.get("max_output_tokens").is_none());
-        // 丢一个字段不能顺带把这条路上的硬约束与客户端的别的参数搅了。
+        let v = pin(r#"{"model":"gpt-5.4","store":false,"stream":true,
+                "temperature":0.7,"top_p":0.9,"presence_penalty":0.1,"frequency_penalty":0.1,
+                "seed":1,"stop":["x"],"user":"u","metadata":{"a":"b"},"logit_bias":{"1":1},
+                "logprobs":true,"top_logprobs":2,"top_k":5,"safety_identifier":"s",
+                "truncation":"auto","max_tool_calls":3,"max_output_tokens":64}"#);
+        for k in UNSUPPORTED_PARAMS {
+            assert!(v.get(*k).is_none(), "`{k}` 不该出现在发往上游的体里");
+        }
+        // 丢一堆字段不能顺带把这条路上的硬约束与客户端别的参数搅了。
         assert_eq!(v["store"], false);
         assert_eq!(v["stream"], true);
         assert_eq!(v["model"], "gpt-5.4");
         // 与 store/stream 的改写正交：漏传那两项时同样要丢。
-        let v = pin(r#"{"model":"gpt-5.4","max_output_tokens":64,"reasoning":{"effort":"high"}}"#);
-        assert!(v.get("max_output_tokens").is_none());
+        let v = pin(r#"{"model":"gpt-5.4","temperature":0.7,"reasoning":{"effort":"high"}}"#);
+        assert!(v.get("temperature").is_none());
         assert_eq!(v["store"], false);
         assert_eq!(v["stream"], true);
         assert_eq!(v["reasoning"]["effort"], "high");
         // 客户端本来要不要流不受影响。
-        assert!(!norm("responses", r#"{"stream":true,"max_output_tokens":1}"#).collapse);
+        assert!(!norm("responses", r#"{"stream":true,"temperature":0.7}"#).collapse);
+    }
+
+    /// 实测能过的那些**一个都不许动**：多丢一个字段就是悄悄改掉了客户端的语义，而这条路径的
+    /// 接入方是 codex CLI 本身，被丢掉的可能正是它要的东西。
+    #[test]
+    fn the_parameters_the_upstream_accepts_are_left_alone() {
+        let raw = r#"{"model":"gpt-5.4","store":false,"stream":true,
+            "instructions":"be brief","input":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","name":"shell"}],"tool_choice":"auto",
+            "parallel_tool_calls":true,"reasoning":{"effort":"high","summary":"auto"},
+            "text":{"verbosity":"low"},"include":["reasoning.encrypted_content"],
+            "prompt_cache_key":"k1","stream_options":{"include_obfuscation":false},
+            "previous_response_id":"resp_1"}"#;
+        let n = norm("responses", raw);
+        // 该丢的一个都没有、store/stream 也已经对：连重新序列化都不该发生（字段顺序本身就是
+        // 「中间有没有代理」的指纹）。
+        assert_eq!(n.body, Bytes::from(raw.to_owned()), "没东西可丢时不该重新序列化");
+        // `previous_response_id` 刻意留着：这条路径 store 被钉成 false，会话不在上游，丢掉是
+        // 让模型看不见前面几轮却照样答——静默答错比一句明确的 400 难查得多。
+        let v: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
+        assert_eq!(v["previous_response_id"], "resp_1");
+    }
+
+    /// `n`/`background`/`service_tier`：带着默认值来等于没提要求，丢掉没有语义损失；非默认值
+    /// 是客户端真的在要求什么，那时交给上游那句 400，不替它静默改掉。
+    #[test]
+    fn parameters_that_are_only_dropped_at_their_default_value() {
+        let pin = |b: &str| -> serde_json::Value {
+            serde_json::from_slice(&norm("responses", b).body).unwrap()
+        };
+        let v = pin(r#"{"model":"m","store":false,"stream":true,
+                "n":1,"background":false,"service_tier":"auto"}"#);
+        assert!(v.get("n").is_none());
+        assert!(v.get("background").is_none());
+        assert!(v.get("service_tier").is_none());
+        // 非默认值原样带过去：`n:2` 是真要两条，`background:true` 是真要异步任务。
+        let v = pin(r#"{"model":"m","store":false,"stream":true,
+                "n":2,"background":true,"service_tier":"flex"}"#);
+        assert_eq!(v["n"], 2);
+        assert_eq!(v["background"], true);
+        assert_eq!(v["service_tier"], "flex");
+        // 形状不对（`n:1.0`）也不敢当默认值处置，一样交给上游判。
+        assert_eq!(pin(r#"{"model":"m","store":false,"stream":true,"n":1.0}"#)["n"], 1.0);
     }
 
     /// 「客户端本来要不要流」必须与改写分开记：钉了 `stream` 还得把回程的 SSE 收回成
