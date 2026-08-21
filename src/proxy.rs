@@ -146,7 +146,18 @@ pub async fn handle(
         )
         .await
         {
-            Ok(Outcome::Done(resp)) => return resp,
+            Ok(Outcome::Done(resp)) => {
+                // 这个号真的把请求发上去了，把会话租约续到它身上：同一段对话之后优先回到
+                // 这里，号池增删不再动它（见 `CredentialStore::bind_session`）。
+                //
+                // 写在这里而不是选号处，是因为只有走到这一步才知道请求真的发得出去；也因此
+                // 换号重试时拿到租约的是**最后成功的那个号**——上游的 prompt cache 现在热在
+                // 它身上，而不是最初按落点选中的那个。
+                if let Some(key) = &session_key {
+                    state.store.bind_session(key, cred.id);
+                }
+                return resp;
+            }
             Ok(Outcome::TryNext(reject, resp)) => {
                 let status = resp.status().as_u16();
                 last = Some(resp);

@@ -31,6 +31,8 @@ pub struct CredentialStore {
     rpm_rate: RateWindow,
     /// 被上游 429 过的凭证的冷却表（进程内）。
     cooldown: Mutex<HashMap<i64, Instant>>,
+    /// 会话键 → 上一次真正服务过它的凭证（进程内，带滑动 TTL）。见 [`SessionLeases`]。
+    leases: SessionLeases,
     /// `settings` 全表的内存镜像。
     ///
     /// **每条转发请求要读好几项设置**（接入 key、RPM 默认值、重试次数…），逐项走 SQL 就是
@@ -123,6 +125,73 @@ impl RateWindow {
     }
 }
 
+/// 会话键 → **上一次真正服务过这段前缀的凭证**（进程内，滑动 TTL）。
+///
+/// 没有这张表时落点由 [`sticky_pick`] 的 HRW 现算，而 HRW 只对「候选集」负责：号池增删一次，
+/// 约 1/N 的键换主——那是无状态方案的下限，压不下去。这张表就是那点状态：**落点一旦真的
+/// 服务过，就记下来**，之后同一会话优先回到它身上，加号删号都不再动已有会话。
+///
+/// 记「服务过的」而不是「选中的」是关键：选号可能被后续检查否掉（RPM、token 刷不出来），
+/// 而上游的 prompt cache 是被真实请求预热的。租约要指向缓存真的在的那个号，不是差点用上的
+/// 那个。写入点因此只有一处——转发拿到响应之后（见 [`CredentialStore::bind_session`]）。
+///
+/// **在内存里而不是库里**：租约本质上是「这段前缀在哪台机器上还热着」的影子，寿命与上游
+/// prompt cache 同量级（分钟到小时），落库要付每请求一次写、一张会长大的表、一套 GC，换来
+/// 的只是重启后的几分钟——而重启只要号池没变，HRW 现算出来的落点跟租约本来就是同一个。
+/// 同 [`RateWindow`] 与冷却表的取舍。
+#[derive(Default)]
+struct SessionLeases {
+    map: Mutex<HashMap<String, Lease>>,
+}
+
+#[derive(Clone, Copy)]
+struct Lease {
+    cred_id: i64,
+    /// 最后一次续约的时刻。**TTL 是滑动的**：会话还在说话就一直续着，停了才过期。
+    ///
+    /// 绝对 TTL 会让一段长对话每 TTL 被强制换一次号，而那正是这张表要避免的事——
+    /// 对话越长，那一次未命中越贵。
+    at: Instant,
+}
+
+impl SessionLeases {
+    fn get(&self, key: &str, ttl: Duration) -> Option<i64> {
+        let map = self.map.lock();
+        map.get(key).filter(|l| l.at.elapsed() < ttl).map(|l| l.cred_id)
+    }
+
+    /// 续约。顺手做惰性 GC——**只在表要涨过上限时扫**，稳态下这是每条请求都走的热路径。
+    fn bind(&self, key: &str, cred_id: i64, ttl: Duration) {
+        let now = Instant::now();
+        let mut map = self.map.lock();
+        if map.len() >= LEASE_MAX_ENTRIES && !map.contains_key(key) {
+            map.retain(|_, l| now.duration_since(l.at) < ttl);
+            if map.len() >= LEASE_MAX_ENTRIES {
+                // 过期的清完还是满：按最后活跃时刻砍掉老的那一半。留新的那半，因为还在
+                // 活跃的会话才是租约有价值的地方——一条已经沉默很久的会话，它的前缀在
+                // 上游那边大概也早凉了。
+                let mut ats: Vec<Instant> = map.values().map(|l| l.at).collect();
+                let mid = ats.len() / 2;
+                let cutoff = *ats.select_nth_unstable(mid).1;
+                map.retain(|_, l| l.at >= cutoff);
+            }
+        }
+        map.insert(key.to_owned(), Lease { cred_id, at: now });
+    }
+
+    /// 删号时清掉指向它的租约。
+    ///
+    /// 不清也不会选错（那个 id 压根不在候选里，租约是哑的），但**删了重加同一个账号会拿到
+    /// 新的 rowid**，留着的旧租约就成了永远命中不了的死条目，白占着 GC 的名额。
+    fn forget_cred(&self, cred_id: i64) {
+        self.map.lock().retain(|_, l| l.cred_id != cred_id);
+    }
+
+    fn clear(&self) {
+        self.map.lock().clear();
+    }
+}
+
 // ---------- 设置项 ----------
 
 /// 接入用的 API Key（网页可改；命令行/环境变量优先且令网页只读）。
@@ -147,6 +216,20 @@ pub const DEFAULT_QUOTA_PAUSE_PCT: i64 = 90;
 pub const COOLDOWN_SECS: &str = "cooldown_secs";
 /// 同上的默认值。
 pub const DEFAULT_COOLDOWN_SECS: i64 = 60;
+/// 会话落点的租约时长（秒，`0` = 关掉租约、退回纯 HRW 现算）。见 [`SessionLeases`]。
+pub const SESSION_LEASE_SECS: &str = "session_lease_secs";
+/// 同上的默认值。
+///
+/// 30 分钟：要盖住的是「同一段对话两轮之间的间隔」——人去开个会再回来接着问，落点不该变。
+/// 再长的意义有限（上游 prompt cache 早凉了，租约只剩下稳住流量分布这一层作用），
+/// 更短则会让停顿稍久的对话白丢一整段前缀。
+pub const DEFAULT_SESSION_LEASE_SECS: i64 = 1800;
+
+/// 租约表的条目上限。
+///
+/// 一个键就是一段「首条消息 + 模型 + 工具集」的组合，长期跑下来能攒出很多。超过就惰性
+/// GC（见 [`SessionLeases::bind`]）。两万条约几 MB，够覆盖任何单机代理的活跃会话数。
+const LEASE_MAX_ENTRIES: usize = 20_000;
 
 /// RPM 的窗口长度（秒）。
 pub const RPM_WINDOW_SECS: u64 = 60;
@@ -406,6 +489,7 @@ impl CredentialStore {
             refresh_locks: Mutex::new(HashMap::new()),
             rpm_rate: RateWindow::default(),
             cooldown: Mutex::new(HashMap::new()),
+            leases: SessionLeases::default(),
             settings: parking_lot::RwLock::new(settings),
         }
     }
@@ -703,6 +787,7 @@ impl CredentialStore {
         tx.execute("DELETE FROM credential_stats WHERE cred_id = ?1", params![id])?;
         tx.execute("DELETE FROM usage_logs WHERE cred_id = ?1", params![id])?;
         tx.commit()?;
+        self.leases.forget_cred(id);
         Ok(n > 0)
     }
 
@@ -714,6 +799,7 @@ impl CredentialStore {
         tx.execute("DELETE FROM credential_stats", [])?;
         tx.execute("DELETE FROM usage_logs", [])?;
         tx.commit()?;
+        self.leases.clear();
         Ok(n)
     }
 
@@ -954,12 +1040,28 @@ impl CredentialStore {
     /// 全被限流时返回 [`AllRateLimited`]（带最短等待秒数），调用点据此回一个带
     /// `retry-after` 的 429，而不是一句没有下文的「没有可用账号」。
     ///
-    /// `sticky` 是这条请求的会话键（见 [`crate::proxy`] 的 `prefix_fingerprint`）。给了就在
-    /// **最优优先级档内**按它固定落点，没给则按档内 LRU 轮换。
+    /// `sticky` 是这条请求的会话键（见 [`crate::proxy`] 的 `prefix_fingerprint`）。给了就按它
+    /// 定落点，没给则按档内 LRU 轮换。定落点分两层，**租约优先于哈希**：
     ///
-    /// 只在档内粘：跨档粘会让一个低优先级的号因为哈希落点抢在高优先级前面，那是把分档这件
-    /// 事本身推翻了。而档内那个号一旦不可用（停用/冷却/额度暂停/RPM 满/已试过），它压根
-    /// 不在候选里，落点自然移到同档的下一个——降级不需要额外分支。
+    /// 1. **租约**（[`SessionLeases`]）：这个键上一次真的被哪个号服务过，就还给它。这一层是
+    ///    为了让号池增删不动已有会话——纯靠哈希现算的话，增删一次约 1/N 的键换主。
+    /// 2. **HRW 落点**（[`sticky_pick`]）：没有租约（新会话、租约过期、或那个号现在不可用）
+    ///    时，在**最优优先级档内**按会话键现算。
+    ///
+    /// 两层的分档口径不一样，这是有意的：
+    ///
+    /// - 第 2 层只在档内粘。跨档粘会让一个低优先级的号因为哈希落点抢在高优先级前面，那是把
+    ///   分档这件事本身推翻了。
+    /// - 第 1 层**不看档**。优先级回答的是「没有别的信息时该选谁」，而租约带来的正是那个信息:
+    ///   这段前缀已经在某个号上预热过了。把一段热着的会话换到另一档去，丢掉的是一整段前缀
+    ///   缓存——而降低成本恰好是分档想达到的目的，为它牺牲缓存是本末倒置。
+    ///
+    ///   代价要写明：**调优先级不会赶走已经在跑的会话**，只影响新会话，老会话等租约自然过期。
+    ///   要立刻把流量从某个号挪走，就停用它——停用（连同额度暂停、冷却）会让它退出候选，
+    ///   租约当场失效。优先级是软偏好，停用才是硬开关。
+    ///
+    /// 两层都不需要「降级」分支：号一旦不可用（停用/冷却/额度暂停/RPM 满/本次已试过）就压根
+    /// 不在候选里，租约命不中、HRW 也选不到它，落点自然移到下一个。
     pub fn select(&self, exclude: &[i64], sticky: Option<&str>) -> Result<Credential> {
         self.resume_due()?;
         let all = self.list()?;
@@ -1002,16 +1104,51 @@ impl CredentialStore {
             );
         }
         candidates.sort_unstable();
-        let id = match sticky.filter(|k| !k.is_empty()) {
-            Some(key) => {
+        let sticky = sticky.filter(|k| !k.is_empty());
+        // 租约只有在那个号**这次真的可用**时才算命中：不可用时不清租约（那多半是一阵冷却），
+        // 让它落到 HRW 上；号回来了会话也就回去了。
+        let leased = sticky
+            .and_then(|k| self.leased_cred(k))
+            .filter(|id| candidates.iter().any(|c| c.2 == *id));
+        let id = match (leased, sticky) {
+            (Some(id), _) => id,
+            (None, Some(key)) => {
                 let top = candidates[0].0;
                 let tier: Vec<i64> =
                     candidates.iter().filter(|c| c.0 == top).map(|c| c.2).collect();
                 sticky_pick(&tier, key).unwrap_or(candidates[0].2)
             }
-            None => candidates[0].2,
+            (None, None) => candidates[0].2,
         };
         all.into_iter().find(|c| c.id == id).context("selected credential vanished")
+    }
+
+    /// 记下「这个号真的服务过这段前缀」，并把租约续到现在。
+    ///
+    /// 调用点只有转发路径拿到上游响应之后那一处——**不能在选号时写**：那时候还不知道这个号
+    /// 到底发不发得出去（RPM 可能满、token 可能刷不出来），而租约要指向 prompt cache 真的
+    /// 被预热的那个号。同理，换号重试时是最后成功的那个号拿到租约，不是最初选中的那个:
+    /// 缓存现在热在它身上。
+    ///
+    /// 租约时长为 0 时整个机制关掉，落点退回 [`sticky_pick`] 现算。
+    pub fn bind_session(&self, key: &str, cred_id: i64) {
+        if key.is_empty() {
+            return;
+        }
+        if let Some(ttl) = self.lease_ttl() {
+            self.leases.bind(key, cred_id, ttl);
+        }
+    }
+
+    /// 租约时长；`None` = 机制关闭。
+    fn lease_ttl(&self) -> Option<Duration> {
+        let secs = self.get_setting_i64(SESSION_LEASE_SECS, DEFAULT_SESSION_LEASE_SECS);
+        (secs > 0).then(|| Duration::from_secs(secs as u64))
+    }
+
+    /// 这个会话键还有效的租约指向哪个号。
+    fn leased_cred(&self, key: &str) -> Option<i64> {
+        self.leases.get(key, self.lease_ttl()?)
     }
 
     /// 占一个 RPM 名额。已满时返回 [`RpmLimited`]。
@@ -1627,7 +1764,9 @@ mod tests {
         );
     }
 
-    /// 粘性只在档内生效：跨档粘会让低优先级的号因为哈希落点抢在高优先级前面。
+    /// **新会话**的哈希落点只在档内选：跨档粘会让低优先级的号因为哈希落点抢在高优先级前面。
+    /// （已经被服务过的会话另算，那是租约的事，见
+    /// [`a_lease_outranks_a_better_priority_tier`]。）
     #[test]
     fn stickiness_never_crosses_a_priority_tier() {
         let s = store();
@@ -1647,6 +1786,101 @@ mod tests {
         let pick = s.select(&[], Some("sess-7")).unwrap().id;
         assert!(rest.contains(&pick));
         assert_eq!(s.select(&[], Some("sess-7")).unwrap().id, pick);
+    }
+
+    /// 租约存在的理由：**加号不该打乱任何一条已经在跑的会话**。
+    ///
+    /// 纯哈希落点做不到这件事——候选集从 4 变 5，约 1/5 的键会换主。
+    #[test]
+    fn adding_a_credential_leaves_leased_sessions_alone() {
+        let s = store();
+        for n in ["a", "b", "c", "d"] {
+            add(&s, n);
+        }
+        let keys: Vec<String> = (0..40).map(|i| format!("sess-{i}")).collect();
+        // 每个键选一次并「转发成功」，于是各自拿到一张租约。
+        let before: Vec<i64> = keys
+            .iter()
+            .map(|k| {
+                let id = s.select(&[], Some(k)).unwrap().id;
+                s.bind_session(k, id);
+                id
+            })
+            .collect();
+
+        add(&s, "e");
+        let after: Vec<i64> = keys.iter().map(|k| s.select(&[], Some(k)).unwrap().id).collect();
+        assert_eq!(after, before, "加了一个号，已有会话的落点一个都不该动");
+
+        // 新会话才会用上新号——否则「租约优先」就退化成了「永远不接纳新号」。
+        let fresh: std::collections::HashSet<i64> =
+            (100..160).map(|i| s.select(&[], Some(&format!("sess-{i}"))).unwrap().id).collect();
+        assert_eq!(fresh.len(), 5, "新会话该摊到全部 5 个号上: {fresh:?}");
+    }
+
+    /// 租约压过优先级：已经预热在某个号上的会话，不因为别处冒出一个更优的档就换走。
+    /// 新会话照常跟着优先级。
+    #[test]
+    fn a_lease_outranks_a_better_priority_tier() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+
+        s.bind_session("sess-1", a.id);
+        s.set_priority(b.id, -1).unwrap();
+
+        assert_eq!(s.select(&[], Some("sess-1")).unwrap().id, a.id, "老会话该留在预热过的号上");
+        assert_eq!(s.select(&[], Some("sess-new")).unwrap().id, b.id, "新会话该跟着优先级走");
+    }
+
+    /// 租约指向的号不可用时让位，但**不作废**：那多半只是一阵冷却，号回来了会话也就回去。
+    /// 停用是硬开关——把流量立刻挪走靠的是它，不是改优先级。
+    #[test]
+    fn a_lease_yields_while_its_credential_is_unavailable() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+        s.bind_session("sess-1", a.id);
+
+        s.note_rate_limited(a.id, 60);
+        assert_eq!(s.select(&[], Some("sess-1")).unwrap().id, b.id, "冷却中该让位");
+        s.clear_cooldown(a.id);
+        assert_eq!(s.select(&[], Some("sess-1")).unwrap().id, a.id, "号回来了会话该回去");
+
+        s.set_disabled(a.id, true).unwrap();
+        assert_eq!(s.select(&[], Some("sess-1")).unwrap().id, b.id, "停用也让位");
+
+        // 删号要把租约一并清掉，否则留下的是一条永远命不中的死条目。
+        s.delete(a.id).unwrap();
+        assert_eq!(s.select(&[], Some("sess-1")).unwrap().id, b.id);
+    }
+
+    /// 租约会过期（滑动 TTL），过期后落点退回按会话键现算；设成 0 则整个机制关掉。
+    #[test]
+    fn a_lease_expires_and_can_be_switched_off() {
+        let s = store();
+        let a = add(&s, "a");
+        let ids: Vec<i64> = ["b", "c", "d"].iter().map(|n| add(&s, n).id).collect();
+        // 找一个哈希落点不是 a 的键，这样「有没有走租约」是能区分开的。
+        let key = (0..200)
+            .map(|i| format!("sess-{i}"))
+            .find(|k| s.select(&[], Some(k)).unwrap().id != a.id)
+            .expect("总该有键落在 a 之外");
+        let hashed = s.select(&[], Some(&key)).unwrap().id;
+        assert!(ids.contains(&hashed));
+
+        s.bind_session(&key, a.id);
+        assert_eq!(s.select(&[], Some(&key)).unwrap().id, a.id);
+
+        // 关掉：立刻退回现算，且不影响已记下的租约（重新打开还在）。
+        s.set_setting(SESSION_LEASE_SECS, "0").unwrap();
+        assert_eq!(s.select(&[], Some(&key)).unwrap().id, hashed, "租约关掉后该按会话键现算");
+
+        // 过期：把 TTL 收到 1 秒再等过去。
+        s.set_setting(SESSION_LEASE_SECS, "1").unwrap();
+        assert_eq!(s.select(&[], Some(&key)).unwrap().id, a.id);
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert_eq!(s.select(&[], Some(&key)).unwrap().id, hashed, "过期后该按会话键现算");
     }
 
     /// 优先级压过轮换：P0 没打满之前不该碰 P1。

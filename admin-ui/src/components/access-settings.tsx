@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CableIcon, CheckIcon, CopyIcon, EyeIcon, EyeOffIcon, GaugeIcon,
-  LockKeyholeIcon, RefreshCwIcon, SaveIcon, ShieldAlertIcon, SparklesIcon, TimerResetIcon, Trash2Icon,
+  LockKeyholeIcon, PinIcon, RefreshCwIcon, SaveIcon, ShieldAlertIcon, SparklesIcon, TimerResetIcon,
+  Trash2Icon,
 } from 'lucide-react'
 import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
 import { clearPw, setPw } from '@/api/client'
 import {
   getSettings, setApiKey, setCooldownSecs, setDefaultRpmLimit, setQuotaPausePct,
-  setRateLimitRetryMax, type Settings,
+  setRateLimitRetryMax, setSessionLeaseSecs, type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { copyText, extractError } from '@/lib/utils'
@@ -459,6 +460,7 @@ export function LimitsSettingsContent() {
   const rpm = useSettingMutation(setDefaultRpmLimit, t('已保存默认 RPM 上限', 'Default RPM limit saved'))
   const pause = useSettingMutation(setQuotaPausePct, t('已保存额度阈值', 'Quota threshold saved'))
   const cooldown = useSettingMutation(setCooldownSecs, t('已保存冷却时长', 'Cooldown saved'))
+  const lease = useSettingMutation(setSessionLeaseSecs, t('已保存租约时长', 'Lease duration saved'))
 
   if (settingsQuery.isPending) {
     return (
@@ -559,6 +561,28 @@ export function LimitsSettingsContent() {
           max={86400}
           pending={cooldown.isPending}
           onSave={(n) => cooldown.mutate(n)}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={PinIcon}
+        title={t('会话粘性', 'Session stickiness')}
+        description={t(
+          '同一段对话尽量一直落在同一个账号上——上游的提示缓存按账号存，换号就等于把整段前缀重新算一遍。',
+          'Keep one conversation on one account. Upstream caches prompts per account, so switching means re-reading the whole prefix.',
+        )}
+      >
+        <NumberSetting
+          label={t('落点租约时长（秒）', 'Placement lease (seconds)')}
+          description={t(
+            '一个账号真的服务过某段对话之后，这条对话在这么久之内还会优先回到它身上；每次请求都会续期，所以只有停下来不说话才会过期。有了它，加号删号不会打乱正在跑的对话。0 表示关闭，每次按会话内容现算落点——那时账号增删会让约 1/N 的对话换号。注意：租约压过优先级，改优先级只影响新对话；要立刻把流量从某个账号挪走请停用它。',
+            'Once an account has actually served a conversation, that conversation returns to it for this long. Every request renews the lease, so it only expires after the conversation goes quiet. With it, adding or removing accounts leaves running conversations alone. Set 0 to disable and recompute placement from the conversation each time — then adding or removing an account remaps about 1/N of conversations. Note that a lease outranks priority, so priority changes only affect new conversations; disable an account to move traffic off it right away.',
+          )}
+          value={data.session_lease_secs}
+          min={0}
+          max={86400}
+          pending={lease.isPending}
+          onSave={(n) => lease.mutate(n)}
         />
       </SettingsGroup>
     </div>

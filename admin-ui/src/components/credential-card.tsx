@@ -4,7 +4,6 @@ import {
   CheckIcon,
   ClockIcon,
   EllipsisIcon,
-  HashIcon,
   ScrollTextIcon,
   WalletCardsIcon,
   XIcon,
@@ -12,13 +11,10 @@ import {
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
-  cacheHitRate,
   cn,
   displayCredentialLabel,
   formatCompactNumber,
   formatFullTime,
-  formatPercent,
-  formatTokens,
   formatUsd,
   relativeTime,
 } from '@/lib/utils'
@@ -102,18 +98,9 @@ export const CredentialCard = memo(function CredentialCard({
   const rpmLive = cred.rpm > 0
   const requests = cred.stats.request_total
   const requestsText = formatCompactNumber(requests, locale)
-  // **cached 不另加**：上游报的 input 已经含它（见 CredentialStats 的注），
-  // 三个一起加会把命中缓存的会话凭空放大一倍。
-  const tokens = cred.stats.input_tokens_total + cred.stats.output_tokens_total
-  const tokensText = formatTokens(tokens)
-  // 这个号的终身缓存命中率：命中的输入 ÷ 输入（分母含命中部分，见 cacheHitRate 的注）。
-  // 只进悬浮提示，不在页脚另占一格——那一行的宽度是按字符数算着排的（见 footerChars）。
-  const credCacheRate = cacheHitRate(cred.stats.input_tokens_total, cred.stats.cached_tokens_total)
-  // 页脚四组数字（请求数 / token 数 / 累计费用 / RPM）在窄卡片上排一行还是两行，按字符数
-  // 定：都是等宽字形，字符数就是宽度。375px 的屏上实测能容下 17 个字符（`1.2k` + `931K`
-  // + `$214.60` + `100/120` 就已经超了），再多才折行，否则尾巴会伸到右边的开关底下。
+  // 页脚三组数字（请求数 / 累计费用 / RPM）在窄卡片上排一行还是两行，按字符数定。
+  // 这与 Luban 的卡片布局保持一致：超出窄屏容量时，上行「请求数 · 开关」、下行「费用 · RPM」。
   const footerChars = requestsText.length
-    + tokensText.length
     + formatUsd(cred.stats.cost_total_usd).length
     + `${cred.rpm}${rpmLimit > 0 ? `/${rpmLimit}` : ''}`.length
   const footerStacked = footerChars > 17
@@ -427,10 +414,8 @@ export const CredentialCard = memo(function CredentialCard({
         </CardPanel>
 
         {/* 页脚有两套排布，而不是让一行内容自己折行：折出来的第二行长短随内容而变，
-            开关又浮在两行之间，看着像挤坏了。
-            数字长到窄卡片一行装不下时（见 [footerChars]）：上行「请求数 ┄ 开关」，
-            下行「费用 · RPM」，两行从同一条左边线起、开关钉在右上。
-            @sm/card 起（卡片列最小 27rem）宽度够，一律单行、竖线分区。 */}
+            开关又浮在两行之间，看着像挤坏了。数字放不下时上行「请求数 · 开关」、下行「费用 · RPM」；
+            @sm/card 起卡片宽度足够，再恢复单行布局。 */}
         <CardFooter
           className={cn(
             'mt-auto items-center border-t bg-muted/32 px-4 py-2.5 sm:py-3 @sm/card:flex @sm/card:gap-4',
@@ -494,27 +479,6 @@ export const CredentialCard = memo(function CredentialCard({
             )}
           >
             <Separator orientation="vertical" className="hidden h-5 @sm/card:block" />
-            {/* token 数排在请求数与费用之间：三个数是同一条链上的粗细——多少条请求、
-                烧了多少 token、折成多少钱，挨着放才好互相印证（`40 条 / 395 token` 一眼看出
-                都是小请求）。用 formatTokens 而不是 formatCompactNumber：K/M 与价目表的
-                MTok 同一量纲，中文 locale 下那个「12万」换算不过去。 */}
-            <Tooltip>
-              <TooltipTrigger
-                render={<span />}
-                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs"
-              >
-                <HashIcon className="hidden size-3.5 text-muted-foreground @sm/card:inline" aria-hidden />
-                <span className="sr-only">{t('累计 token 数', 'Cumulative tokens')}</span>
-                <span className="font-medium tabular-nums">{tokensText}</span>
-              </TooltipTrigger>
-              <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                {t(
-                  `累计 ${tokens.toLocaleString(locale)} token：输入 ${cred.stats.input_tokens_total.toLocaleString(locale)}（其中命中缓存 ${cred.stats.cached_tokens_total.toLocaleString(locale)}，命中率 ${formatPercent(credCacheRate)}）+ 输出 ${cred.stats.output_tokens_total.toLocaleString(locale)}`,
-                  `${tokens.toLocaleString(locale)} tokens total: ${cred.stats.input_tokens_total.toLocaleString(locale)} input (${cred.stats.cached_tokens_total.toLocaleString(locale)} cache hits, ${formatPercent(credCacheRate)} hit rate) + ${cred.stats.output_tokens_total.toLocaleString(locale)} output`,
-                )}
-              </TooltipPopup>
-            </Tooltip>
-            <Separator orientation="vertical" className="h-5" />
             <Tooltip>
               <TooltipTrigger
                 render={<span />}

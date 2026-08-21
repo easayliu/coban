@@ -126,6 +126,7 @@ pub async fn run(
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
         .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
         .route("/settings/cooldown-secs", post(set_cooldown_secs))
+        .route("/settings/session-lease-secs", post(set_session_lease_secs))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
@@ -954,6 +955,8 @@ struct SettingsResp {
     rate_limit_retry_max: i64,
     quota_pause_pct: i64,
     cooldown_secs: i64,
+    /// 会话落点的租约时长（秒，0 = 关闭）。
+    session_lease_secs: i64,
     /// 管理鉴权是否已开启（前端据此决定要不要显示「导出」这类高危操作）。
     admin_configured: bool,
     version: &'static str,
@@ -973,6 +976,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
             .get_setting_i64(store::RATE_LIMIT_RETRY_MAX, store::DEFAULT_RATE_LIMIT_RETRY_MAX),
         quota_pause_pct: s.get_setting_i64(store::QUOTA_PAUSE_PCT, store::DEFAULT_QUOTA_PAUSE_PCT),
         cooldown_secs: s.get_setting_i64(store::COOLDOWN_SECS, store::DEFAULT_COOLDOWN_SECS),
+        session_lease_secs: s
+            .get_setting_i64(store::SESSION_LEASE_SECS, store::DEFAULT_SESSION_LEASE_SECS),
         admin_configured: auth::admin_configured(&state),
         version: env!("CARGO_PKG_VERSION"),
     })
@@ -1045,6 +1050,14 @@ async fn set_cooldown_secs(
     Json(req): Json<IntReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     set_int_setting(state, store::COOLDOWN_SECS, req.value, 1..=86_400).await
+}
+
+/// 0 是合法值：把会话租约整个关掉，落点退回按会话键现算（见 `store::SessionLeases`）。
+async fn set_session_lease_secs(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::SESSION_LEASE_SECS, req.value, 0..=86_400).await
 }
 
 // ---------- 杂项 ----------

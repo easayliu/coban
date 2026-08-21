@@ -19,6 +19,8 @@ export interface Settings {
   quota_pause_pct: number
   /** 撞 429 后该账号冷却多久（秒）。 */
   cooldown_secs: number
+  /** 会话落点的租约时长（秒，0 = 关闭租约、每次按会话键现算落点）。 */
+  session_lease_secs: number
   /** 管理密码是否已设置。未设置时管理接口是完全敞开的。 */
   admin_configured: boolean
   version: string
@@ -55,5 +57,11 @@ export async function setQuotaPausePct(pct: number): Promise<Settings> {
 
 export async function setCooldownSecs(secs: number): Promise<Settings> {
   const { data } = await api.post('/settings/cooldown-secs', { value: secs })
+  return data
+}
+
+/** 0 = 关掉租约。 */
+export async function setSessionLeaseSecs(secs: number): Promise<Settings> {
+  const { data } = await api.post('/settings/session-lease-secs', { value: secs })
   return data
 }
