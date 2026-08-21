@@ -31,13 +31,37 @@ export const CACHE_REASONS: Record<
     ],
     tone: 'neutral',
   },
-  new_prefix: {
-    label: ['前缀每轮在变', 'Prefix keeps changing'],
+  instructions_changed: {
+    label: ['系统提示变了', 'System prompt changed'],
     hint: [
-      '一段多轮对话以一个从没见过的前缀身份出现，说明客户端每轮在改 instructions 或 tools（两者都进前缀）。这一类是纯亏。coban 刚重启时也会短暂落到这里。',
-      'A multi-turn conversation showed up under a never-seen prefix identity, so the client is changing instructions or tools between turns (both are part of the prefix). This one is pure waste. A recent restart also lands here briefly.',
+      '同一段对话，模型和工具都没动，但 instructions 变了——前缀因此整段作废。真凶多半是提示里带了随时间走的东西：工作目录、git 分支、当天日期（日期这条每条对话每天恰好触发一次）。要修得改客户端那头。',
+      'Same conversation, same model and tools, but the instructions changed — which invalidates the whole prefix. The usual culprit is something time-varying baked into the prompt: the working directory, the git branch, or today\'s date (that last one fires exactly once per conversation per day). Fixing it means changing the client.',
     ],
     tone: 'bad',
+  },
+  tools_changed: {
+    label: ['工具集变了', 'Tool set changed'],
+    hint: [
+      '同一段对话，工具的集合或顺序动了（MCP server 重连之后常这样）。工具定义连同顺序都算在前缀里。**只有这一类**是「转发前把工具列表排序」那个开关治得了的——如果这一栏占比可观，去调度设置里把它打开。',
+      'Same conversation, but the tool set or its order moved (common after an MCP server reconnects). Tool definitions and their order are both part of the prefix. This is the only bucket the "sort the tool list" switch can fix — if this row is sizeable, turn it on in the scheduling settings.',
+    ],
+    tone: 'bad',
+  },
+  model_switched: {
+    label: ['换了模型', 'Model switched'],
+    hint: [
+      '同一段对话中途换了模型。上游按模型分开存缓存，所以这次未命中是必然的，没什么可修——除非你并不想换模型（客户端自动降级回退也算换）。',
+      'The conversation switched models mid-way. Upstream caches per model, so this miss was unavoidable and there is nothing to fix — unless you did not mean to switch (an automatic client-side fallback counts as switching).',
+    ],
+    tone: 'neutral',
+  },
+  new_conversation: {
+    label: ['没见过这段对话', 'Unseen conversation'],
+    hint: [
+      '连这段对话的开头都没见过。真新对话、codex resume、上下文压缩之后的第一条，以及 coban 刚重启（对照表在内存里，重启即空）都落在这里。它是这几类里的假阳性去处，所以基本不用管——把它单独摘出来，上面那三类才干净得能拿来定位。',
+      'Not even the opening of this conversation is on record. A genuinely new conversation, a codex resume, the first request after a context compaction, and a recent coban restart (the comparison table lives in memory) all land here. This is where the false positives go, so it rarely needs action — separating it out is what keeps the three buckets above clean enough to act on.',
+    ],
+    tone: 'neutral',
   },
   rotated: {
     label: ['换号了', 'Rotated away'],
@@ -50,8 +74,8 @@ export const CACHE_REASONS: Record<
   lease_expired: {
     label: ['落点租约过期', 'Lease expired'],
     hint: [
-      '同一段对话停得太久，落点租约过期后重新算过。想少见到这一类就把租约时长调长。',
-      'The conversation went quiet long enough for its placement lease to expire, so the placement was recomputed. Raise the lease duration to see less of this.',
+      '同一段对话停得太久，落点租约过期后重新算过；前缀本身没变。想少见到这一类就把租约时长调长。',
+      'The conversation went quiet long enough for its placement lease to expire, so the placement was recomputed; the prefix itself did not change. Raise the lease duration to see less of this.',
     ],
     tone: 'neutral',
   },

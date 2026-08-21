@@ -411,7 +411,10 @@ const previewCacheReasons = {
   since: now - 7 * 24 * 3600,
   reasons: [
     { reason: 'hit', requests: 1_284, input_tokens: 18_400_000, cached_tokens: 17_120_000 },
-    { reason: 'new_prefix', requests: 46, input_tokens: 1_040_000, cached_tokens: 0 },
+    { reason: 'instructions_changed', requests: 46, input_tokens: 1_040_000, cached_tokens: 0 },
+    { reason: 'tools_changed', requests: 22, input_tokens: 480_000, cached_tokens: 0 },
+    { reason: 'new_conversation', requests: 31, input_tokens: 390_000, cached_tokens: 0 },
+    { reason: 'model_switched', requests: 8, input_tokens: 260_000, cached_tokens: 0 },
     { reason: 'rotated', requests: 18, input_tokens: 612_000, cached_tokens: 0 },
     { reason: 'lease_expired', requests: 11, input_tokens: 208_000, cached_tokens: 0 },
     { reason: 'upstream_cold', requests: 9, input_tokens: 141_000, cached_tokens: 0 },
@@ -434,7 +437,8 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   session_id: `sess_${String(index % 3).padStart(2, '0')}f2c1a9`,
   // 几种结局都摆一个：没用量的那条（index 9）必须是 no_usage，否则那一行会显示一个
   // 「命中」却又没有任何 token 读数。
-  cache_reason: index === 9 ? 'no_usage' : index === 5 ? 'rotated' : index % 4 === 1 ? 'new_prefix' : 'hit',
+  cache_reason:
+    index === 9 ? 'no_usage' : index === 5 ? 'rotated' : index % 4 === 1 ? 'instructions_changed' : 'hit',
   model: index % 3 === 0 ? 'gpt-5-codex' : 'gpt-5',
   path: '/backend-api/codex/responses',
   ua: 'codex_cli_rs/0.47.0 (Mac OS 15.3; arm64)',

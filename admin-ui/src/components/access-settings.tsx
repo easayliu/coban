@@ -9,7 +9,8 @@ import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth
 import { clearPw, setPw } from '@/api/client'
 import {
   getSettings, setApiKey, setCooldownSecs, setDefaultRpmLimit, setNormalizeToolOrder,
-  setQuotaPausePct, setRateLimitRetryMax, setSessionLeaseSecs, type Settings,
+  setQuotaPausePct, setRateLimitRetryMax, setRateLimitRotate, setRateLimitWaitRetryMax,
+  setRateLimitWaitSecs, setSessionLeaseSecs, type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { copyText, extractError } from '@/lib/utils'
@@ -485,6 +486,18 @@ export function LimitsSettingsContent() {
   const settingsQuery = useSettings()
   const { data } = settingsQuery
   const retry = useSettingMutation(setRateLimitRetryMax, t('已保存重试次数', 'Retry budget saved'))
+  const rotate = useSettingMutation(
+    setRateLimitRotate,
+    t('已保存换号设置', 'Rotation setting saved'),
+  )
+  const waitSecs = useSettingMutation(
+    setRateLimitWaitSecs,
+    t('已保存等待上限', 'Wait ceiling saved'),
+  )
+  const waitRetry = useSettingMutation(
+    setRateLimitWaitRetryMax,
+    t('已保存同号重试次数', 'Same-account retry budget saved'),
+  )
   const rpm = useSettingMutation(setDefaultRpmLimit, t('已保存默认 RPM 上限', 'Default RPM limit saved'))
   const pause = useSettingMutation(setQuotaPausePct, t('已保存额度阈值', 'Quota threshold saved'))
   const cooldown = useSettingMutation(setCooldownSecs, t('已保存冷却时长', 'Cooldown saved'))
@@ -522,15 +535,53 @@ export function LimitsSettingsContent() {
         icon={RefreshCwIcon}
         title={t('账号轮换', 'Account rotation')}
         description={t(
-          '一条请求被上游拒掉之后，最多再换几个账号重试。',
-          'How many other accounts a single request may fall back to after upstream rejects it.',
+          '一条请求被上游拒掉之后，是换个账号重试，还是在原账号上等一等。',
+          'After upstream rejects a request: fall back to another account, or wait it out on the current one.',
         )}
       >
+        <SwitchSetting
+          label={t('撞限流就换账号', 'Switch accounts on a rate limit')}
+          description={t(
+            '默认开：撞上游 429 时把这个号打上冷却、当场换下一个号——一堆号挂在这儿的意义就在这里。关掉之后这条请求只认选中的那个号：撞 429 就在原地等一等再发一遍，等待与次数见下面两项；次数用完仍是 429 就把上游的判决原样交回客户端，不再换号。号少、或者更在乎会话别乱跑时值得关——上游的提示缓存按账号存，换一次号等于把整段前缀重算一遍，代价可能比等几秒还大。',
+            'On by default: an upstream 429 cools that account down and the request moves to the next one — that is the whole point of pooling accounts. Turn it off and a request sticks to the account it picked: on a 429 it waits in place and retries, bounded by the two settings below; once those run out the upstream 429 goes straight back to the client and no other account is tried. Worth turning off with few accounts, or when conversation stickiness matters — upstream caches prompts per account, so one switch re-reads the whole prefix, which can cost more than waiting a few seconds.',
+          )}
+          checked={data.rate_limit_rotate}
+          pending={rotate.isPending}
+          onToggle={(on) => rotate.mutate(on)}
+        />
+        {!data.rate_limit_rotate && (
+          <>
+            <NumberSetting
+              label={t('同号重试最多等多久（秒）', 'Maximum wait before retrying (seconds)')}
+              description={t(
+                '等多久由上游说了算：优先按它给的 retry-after 或错误体里的恢复提示，都没有才按上面的限流冷却时长。这个值是上限——上游说要等的比它还长（额度用尽那种 429 常常是几小时），就当场把 429 交回客户端，挂着等只会让客户端自己先超时，而且什么也没等到。',
+                'How long to wait is decided upstream: its retry-after, else the reset hint in the error body, else the rate-limit cooldown above. This value is a ceiling — when upstream asks for longer than this (a quota-exhausted 429 is often hours away), the 429 goes back to the client immediately, because hanging on would just hit the client\u2019s own timeout and gain nothing.',
+              )}
+              value={data.rate_limit_wait_secs}
+              min={1}
+              max={3600}
+              pending={waitSecs.isPending}
+              onSave={(n) => waitSecs.mutate(n)}
+            />
+            <NumberSetting
+              label={t('同号最多重试次数', 'Maximum retries on the same account')}
+              description={t(
+                '在同一个账号上最多等着重发几次。0 表示一次都不等，撞 429 直接把上游的判决交回客户端。',
+                'How many times a request may wait and resend on the same account. Set 0 to never wait and hand the upstream 429 straight back.',
+              )}
+              value={data.rate_limit_wait_retry_max}
+              min={0}
+              max={8}
+              pending={waitRetry.isPending}
+              onSave={(n) => waitRetry.mutate(n)}
+            />
+          </>
+        )}
         <NumberSetting
           label={t('最多换号重试次数', 'Maximum retries across accounts')}
           description={t(
-            '撞限流（429）时不受这个数字限制：那个号会被打上冷却，请求一路换到找出可用的号为止。这里管的是「连不上上游」那类故障——它慢、又要重发整个请求体，设得太大会让一条打不通的请求拖很久。0 表示完全不换号，把上游的判决（含 429）原样交回客户端。',
-            'Rate limits (429) are not bounded by this number: the account is cooled down and the request keeps rotating until it finds a usable one. This bounds unreachable-upstream failures instead — those are slow and resend the whole request body, so a large value makes a doomed request hang for a long time. Set 0 to disable rotation entirely and pass the upstream verdict (429 included) straight back.',
+            '撞限流（429）时不受这个数字限制（上面那个开关管它）：那个号会被打上冷却，请求一路换到找出可用的号为止。这里管的是「连不上上游」那类故障——它慢、又要重发整个请求体，设得太大会让一条打不通的请求拖很久。0 表示完全不换号，把上游的判决（含 429）原样交回客户端。',
+            'Rate limits (429) are not bounded by this number — the switch above governs those: the account is cooled down and the request keeps rotating until it finds a usable one. This bounds unreachable-upstream failures instead — those are slow and resend the whole request body, so a large value makes a doomed request hang for a long time. Set 0 to disable rotation entirely and pass the upstream verdict (429 included) straight back.',
           )}
           value={data.rate_limit_retry_max}
           min={0}

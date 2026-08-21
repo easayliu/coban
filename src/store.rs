@@ -33,6 +33,8 @@ pub struct CredentialStore {
     cooldown: Mutex<HashMap<i64, Instant>>,
     /// 会话键 → 上一次真正服务过它的凭证（进程内，带滑动 TTL）。见 [`SessionLeases`]。
     leases: SessionLeases,
+    /// 对话开头 → 上一次见到的前缀分段指纹（进程内，同一个 TTL）。见 [`PrefixMemo`]。
+    prefixes: PrefixMemo,
     /// `settings` 全表的内存镜像。
     ///
     /// **每条转发请求要读好几项设置**（接入 key、RPM 默认值、重试次数…），逐项走 SQL 就是
@@ -217,6 +219,100 @@ impl SessionLeases {
     }
 }
 
+/// 前缀的分段指纹。见 [`crate::proxy`] 的 `prefix_parts`。
+///
+/// 会话键是这四段揉成的**一个**哈希，揉完就分不出是哪一段变了。分开存才回答得了「前缀变了」
+/// 之后的那个问题：变的是哪一段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixSegments<'a> {
+    /// `input[0]` 的哈希——**「这段对话」的稳定身份**。对话越聊越长，但开头那一项不变，
+    /// 所以它能在其余三段变掉、总键因此对不上的时候，仍然认出「这是同一段对话」。
+    pub head: &'a str,
+    pub model: &'a str,
+    pub instructions: &'a str,
+    pub tools: &'a str,
+}
+
+/// 总键没见过时，四段里**是哪一段**变了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixDrift {
+    /// memo 里没有这段对话的底子可比：真的第一次见，或者进程刚重启（表在内存里）。
+    NoBaseline,
+    Model,
+    Instructions,
+    Tools,
+    /// 四段都对得上。总键却没见过，只可能是租约那张表先被 GC 掉了而这张还留着。
+    Same,
+}
+
+/// 对话开头 → 上一次见到的另外三段（进程内，滑动 TTL，与 [`SessionLeases`] 同一个 TTL）。
+///
+/// 只为归因存在，选号一步都不看它。放在这里而不是 proxy 侧，是为了跟租约表共用那份 TTL 与
+/// 那套惰性 GC——两张表的生命周期必须一样，否则「租约还在、底子没了」这种时序差会造出一类
+/// 谁也解释不了的归因。
+#[derive(Default)]
+struct PrefixMemo {
+    map: Mutex<HashMap<String, MemoEntry>>,
+}
+
+struct MemoEntry {
+    model: String,
+    instructions: String,
+    tools: String,
+    at: Instant,
+}
+
+impl PrefixMemo {
+    /// 拿这次的分段跟上次比。
+    ///
+    /// **多段同时变时只报第一个，顺序是 model → instructions → tools**：换模型本身就让缓存
+    /// 必然失效（上游按模型分开存），那时再说「instructions 也变了」是噪声——换个模型连带
+    /// 换一套系统提示很正常，而反过来不成立。先报那个不用修的，免得把人引到错的地方。
+    fn drift(&self, seg: PrefixSegments<'_>, ttl: Duration) -> PrefixDrift {
+        let map = self.map.lock();
+        let Some(e) = map.get(seg.head).filter(|e| e.at.elapsed() < ttl) else {
+            return PrefixDrift::NoBaseline;
+        };
+        if e.model != seg.model {
+            PrefixDrift::Model
+        } else if e.instructions != seg.instructions {
+            PrefixDrift::Instructions
+        } else if e.tools != seg.tools {
+            PrefixDrift::Tools
+        } else {
+            PrefixDrift::Same
+        }
+    }
+
+    /// 记下这次的分段。GC 与 [`SessionLeases::bind`] 同一套，理由也同。
+    fn note(&self, seg: PrefixSegments<'_>, ttl: Duration) {
+        let now = Instant::now();
+        let mut map = self.map.lock();
+        if map.len() >= LEASE_MAX_ENTRIES && !map.contains_key(seg.head) {
+            map.retain(|_, e| now.duration_since(e.at) < ttl);
+            if map.len() >= LEASE_MAX_ENTRIES {
+                let mut ats: Vec<Instant> = map.values().map(|e| e.at).collect();
+                let mid = ats.len() / 2;
+                let cutoff = *ats.select_nth_unstable(mid).1;
+                map.retain(|_, e| e.at >= cutoff);
+            }
+        }
+        map.insert(
+            seg.head.to_owned(),
+            MemoEntry {
+                model: seg.model.to_owned(),
+                instructions: seg.instructions.to_owned(),
+                tools: seg.tools.to_owned(),
+                at: now,
+            },
+        );
+    }
+
+    fn clear(&self) {
+        self.map.lock().clear();
+    }
+}
+
 // ---------- 设置项 ----------
 
 /// 接入用的 API Key（网页可改；命令行/环境变量优先且令网页只读）。
@@ -230,9 +326,55 @@ pub const DEFAULT_RPM_LIMIT: &str = "default_rpm_limit";
 /// 就是把号池里还能用的号找出来，只受一条请求的尝试硬顶约束（见 `proxy::RotationBudget`）。
 ///
 /// `0` 仍是总开关：一次都不换，上游的判决（含 429）原样交回客户端。
+///
+/// 撞限流那一类还多受 [`RATE_LIMIT_ROTATE`] 一道开关约束——关掉之后限流一次号都不换，
+/// 改成在原地等一等再用同一个号重发。
 pub const RATE_LIMIT_RETRY_MAX: &str = "rate_limit_retry_max";
 /// 同上的默认值。
 pub const DEFAULT_RATE_LIMIT_RETRY_MAX: i64 = 2;
+
+/// 撞上游 429 之后要不要换个号重发（`1` = 换号，`0` = 就地等一等再用同一个号重发）。
+///
+/// **默认换号**：一堆号挂在 coban 后面的全部意义就是「这个号满了还有下一个」，撞限流
+/// 当场换号是最短的一条路——换号是瞬时的，等待不是。
+///
+/// 关掉是给另一种用法的：号少（等回血比换号现实）、或者更在乎会话别乱跑——上游那份
+/// prompt cache 按账号存，换一次号等于把整段前缀重算一遍，代价可能比等几秒还大。关掉
+/// 之后这条请求只认选中的那个号：撞 429 就按 [`RATE_LIMIT_WAIT_SECS`] 等一等再发一遍，
+/// [`RATE_LIMIT_WAIT_RETRY_MAX`] 次用完仍是 429 就把上游的判决原样交回客户端，**不再
+/// 换号**。
+///
+/// **只管「这个号满了」这一类**（上游 429 与本地 RPM 闸——后者不等，直接回 429 带
+/// `retry-after` 让客户端退避，服务端不为自己设的闸挂着等）。另外两类照旧换号，与这道
+/// 开关无关：
+/// - **坏号**（凭证失效、被封）：不是等一等就好的事，不换只会让一个坏号把每条请求都
+///   拖死，而池子里的好号一直闲着。
+/// - **链路/上游故障**（连不上、token 刷不出来）：与「这个号满没满」无关，仍由
+///   [`RATE_LIMIT_RETRY_MAX`] 管着换几次。
+pub const RATE_LIMIT_ROTATE: &str = "rate_limit_rotate";
+/// 同上的默认值。
+pub const DEFAULT_RATE_LIMIT_ROTATE: i64 = 1;
+
+/// 不换号时，为一次就地重试**最多**愿意等多久（秒）。
+///
+/// 实际等多久由上游说了算：`retry-after` 头 → 体里的恢复提示 → [`COOLDOWN_SECS`]，与
+/// 冷却时长同一个取值（见 `proxy::rate_limit_cooldown`）。这个值是**上限，不是等待
+/// 时长**：上游说要等的比它还长，说明这不是「几秒后就回血」的瞬时限流（多半是额度用尽，
+/// 几小时后才恢复），那就当场把 429 交回客户端——挂在那儿等只会让客户端自己先超时，
+/// 而且什么也没等到。
+pub const RATE_LIMIT_WAIT_SECS: &str = "rate_limit_wait_secs";
+/// 同上的默认值。
+///
+/// 60 秒：够盖住瞬时限流那一类（上游给的 `retry-after` 通常是几秒到几十秒），又不至于
+/// 让一条客户端请求挂到它自己超时。
+pub const DEFAULT_RATE_LIMIT_WAIT_SECS: i64 = 60;
+
+/// 不换号时，同一个号最多就地重试几次（`0` = 一次都不等，撞 429 直接交回客户端）。
+///
+/// 只在 [`RATE_LIMIT_ROTATE`] 关着时作数。
+pub const RATE_LIMIT_WAIT_RETRY_MAX: &str = "rate_limit_wait_retry_max";
+/// 同上的默认值。
+pub const DEFAULT_RATE_LIMIT_WAIT_RETRY_MAX: i64 = 2;
 /// 额度用到百分之多少就暂停这个账号（0 = 不暂停）。
 pub const QUOTA_PAUSE_PCT: &str = "quota_pause_pct";
 /// 同上的默认值。留 10% 余量，免得一条长请求跑到一半正好把额度撞穿。
@@ -249,8 +391,10 @@ pub const NORMALIZE_TOOL_ORDER: &str = "normalize_tool_order";
 /// 官方 codex CLI 的顺序是固定的，那时排序一分不赚，还会让发上去的数组顺序变成官方客户端
 /// 永远不会产生的那一种——与 `Cargo.toml` 里 `preserve_order` 那条注防的是同一类指纹。
 ///
-/// 要不要开，看归因里 `new_prefix` 那一桶占多少（见 [`CredentialStore::cache_reasons`]）:
-/// 那一桶大就是前缀在变，开它才有意义。
+/// 要不要开有客观依据：看归因里 **`tools_changed`** 那一桶占多少（见
+/// [`CredentialStore::cache_reasons`]）。那一桶专指「同一段对话里工具集合或顺序动了」，
+/// 是这个开关唯一治得了的情况——别看别的桶，`instructions_changed` 与 `model_switched` 排
+/// 工具一分不赚。
 pub const DEFAULT_NORMALIZE_TOOL_ORDER: i64 = 0;
 
 /// 会话落点的租约时长（秒，`0` = 关掉租约、退回纯 HRW 现算）。见 [`SessionLeases`]。
@@ -583,6 +727,7 @@ impl CredentialStore {
             rpm_rate: RateWindow::default(),
             cooldown: Mutex::new(HashMap::new()),
             leases: SessionLeases::default(),
+            prefixes: PrefixMemo::default(),
             settings: parking_lot::RwLock::new(settings),
         }
     }
@@ -943,6 +1088,7 @@ impl CredentialStore {
         tx.execute("DELETE FROM usage_logs", [])?;
         tx.commit()?;
         self.leases.clear();
+        self.prefixes.clear();
         Ok(n)
     }
 
@@ -1280,6 +1426,27 @@ impl CredentialStore {
         }
         if let Some(ttl) = self.lease_ttl() {
             self.leases.bind(key, cred_id, ttl);
+        }
+    }
+
+    /// 这次的前缀分段与上次比，是哪一段变了。见 [`PrefixMemo::drift`]。
+    ///
+    /// 与 [`Self::lease_state`] 一样**必须在选号之前读**：一次成功的转发会把这次的分段写进
+    /// memo，之后再读永远是「没变」。
+    ///
+    /// 租约机制关掉时回 [`PrefixDrift::NoBaseline`]——那时归因整体退化成 `unattributed`，
+    /// 分段比不比都到不了用它的地方。
+    pub fn prefix_drift(&self, seg: PrefixSegments<'_>) -> PrefixDrift {
+        match self.lease_ttl() {
+            None => PrefixDrift::NoBaseline,
+            Some(ttl) => self.prefixes.drift(seg, ttl),
+        }
+    }
+
+    /// 记下这次的前缀分段。调用点与 [`Self::bind_session`] 同一处，理由也同。
+    pub fn note_prefix(&self, seg: PrefixSegments<'_>) {
+        if let Some(ttl) = self.lease_ttl() {
+            self.prefixes.note(seg, ttl);
         }
     }
 
@@ -2126,6 +2293,60 @@ mod tests {
         assert_eq!(s.lease_state("sess-1"), LeaseState::Off);
     }
 
+    /// 分段 memo 的三件事：认出是哪一段变了、多段同变时的报告顺序、以及 TTL。
+    #[test]
+    fn the_prefix_memo_names_the_segment_that_drifted() {
+        let s = store();
+        let seg = |model, instructions, tools| PrefixSegments {
+            head: "conv-1",
+            model,
+            instructions,
+            tools,
+        };
+        let base = seg("m1", "i1", "t1");
+
+        // 没底子可比时说 NoBaseline，不能假装「没变」——那会把真新对话记成上游凉了。
+        assert_eq!(s.prefix_drift(base), PrefixDrift::NoBaseline);
+        s.note_prefix(base);
+        assert_eq!(s.prefix_drift(base), PrefixDrift::Same);
+
+        assert_eq!(s.prefix_drift(seg("m2", "i1", "t1")), PrefixDrift::Model);
+        assert_eq!(s.prefix_drift(seg("m1", "i2", "t1")), PrefixDrift::Instructions);
+        assert_eq!(s.prefix_drift(seg("m1", "i1", "t2")), PrefixDrift::Tools);
+
+        // 多段同时变只报第一个，顺序 model → instructions → tools：换模型本身就让缓存必然
+        // 失效，那时再说「instructions 也变了」是噪声。
+        assert_eq!(s.prefix_drift(seg("m2", "i2", "t2")), PrefixDrift::Model);
+        assert_eq!(s.prefix_drift(seg("m1", "i2", "t2")), PrefixDrift::Instructions);
+
+        // 另一段对话（head 不同）互不干扰。
+        let other = PrefixSegments { head: "conv-2", model: "m1", instructions: "i1", tools: "t1" };
+        assert_eq!(s.prefix_drift(other), PrefixDrift::NoBaseline);
+
+        // 续上新的分段之后，比的是最近那一次。
+        s.note_prefix(seg("m2", "i1", "t1"));
+        assert_eq!(s.prefix_drift(seg("m2", "i1", "t1")), PrefixDrift::Same);
+        assert_eq!(s.prefix_drift(base), PrefixDrift::Model);
+    }
+
+    /// memo 与租约共用那份 TTL：关掉租约时它一并停摆（那时归因整体退化成 unattributed），
+    /// TTL 到点后底子过期。
+    #[test]
+    fn the_prefix_memo_shares_the_lease_ttl() {
+        let s = store();
+        let seg = PrefixSegments { head: "conv-1", model: "m", instructions: "i", tools: "t" };
+
+        s.set_setting(SESSION_LEASE_SECS, "0").unwrap();
+        s.note_prefix(seg);
+        assert_eq!(s.prefix_drift(seg), PrefixDrift::NoBaseline, "租约关掉时 memo 也不该说话");
+
+        s.set_setting(SESSION_LEASE_SECS, "1").unwrap();
+        s.note_prefix(seg);
+        assert_eq!(s.prefix_drift(seg), PrefixDrift::Same);
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert_eq!(s.prefix_drift(seg), PrefixDrift::NoBaseline, "过期的底子不能再拿来比");
+    }
+
     /// 归因合计按**白付的输入 token**排，不按条数：一条长对话未命中比一堆小请求贵得多。
     /// `cache_reason` 为空的行归到 `legacy`（升级前的旧流水），不能悄悄丢掉，也不能跟
     /// 「分不出来」混成一桶。
@@ -2148,13 +2369,13 @@ mod tests {
         for _ in 0..20 {
             log(Some("first_turn"), 200, 0);
         }
-        log(Some("new_prefix"), 180_000, 0);
+        log(Some("instructions_changed"), 180_000, 0);
         log(Some("hit"), 100_000, 96_000);
         log(None, 5_000, 0);
 
         let stats = s.cache_reasons(0).unwrap();
         let order: Vec<&str> = stats.iter().map(|r| r.reason.as_str()).collect();
-        assert_eq!(order, vec!["new_prefix", "legacy", "hit", "first_turn"], "{stats:?}");
+        assert_eq!(order, vec!["instructions_changed", "legacy", "hit", "first_turn"], "{stats:?}");
 
         let churn = &stats[0];
         assert_eq!(churn.requests, 1);

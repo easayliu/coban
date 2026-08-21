@@ -8,7 +8,7 @@
 //! 用量嗅探、落库、计价两种线格式**共用同一份代码**，翻译只是夹在最外面的一进一出。
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::{Body, Bytes},
@@ -68,7 +68,7 @@ pub async fn handle(
         .store
         .get_setting_i64(store::NORMALIZE_TOOL_ORDER, store::DEFAULT_NORMALIZE_TOOL_ORDER)
         != 0;
-    let Normalized { body, collapse, chat, sticky, input_len } =
+    let Normalized { body, collapse, chat, prefix, input_len } =
         match plan_request(&path, body, sort_tools) {
             Ok(n) => n,
             // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
@@ -95,14 +95,21 @@ pub async fn handle(
     //
     // 客户端自报的会话 id 优先——那是真的会话身份；实测三个真实 codex 客户端一个都不发，
     // 所以绝大多数请求靠的是前缀指纹那条路。
-    let session_key = incoming_session_id(&headers).or(sticky);
-    // 租约状态在**选号之前**读一次并带着走：转发成功会把租约续到这次用的号上，之后再读
-    // 永远是「没换号」，归因就永远看不见换号那一类（见 cache_reason）。
+    let session_key =
+        incoming_session_id(&headers).or_else(|| prefix.as_ref().map(|p| p.key.clone()));
+    // 租约状态与前缀漂移都在**选号之前**读一次并带着走：转发成功会把两张表都更新到这次的
+    // 值上，之后再读永远是「没换号、没变过」，归因就永远看不见这两类（见 cache_reason）。
     let session = SessionCtx {
         lease: session_key
             .as_deref()
             .map_or(store::LeaseState::Absent, |k| state.store.lease_state(k)),
+        // 客户端自报了会话头时也照样比前缀：那个头认的是「同一段对话」，而前缀变没变是另
+        // 一件事——两者都成立时，「有会话头且前缀没变」才是真的该命中。
+        drift: prefix
+            .as_ref()
+            .map_or(store::PrefixDrift::NoBaseline, |p| state.store.prefix_drift(p.segments())),
         key: session_key,
+        prefix,
         input_len,
     };
 
@@ -110,8 +117,14 @@ pub async fn handle(
     let retry_max = state
         .store
         .get_setting_i64(store::RATE_LIMIT_RETRY_MAX, store::DEFAULT_RATE_LIMIT_RETRY_MAX);
+    // 撞限流到底换不换号。关掉时限流类一次都不换，改成在同一个号上等一等再发
+    // （见 [`RateLimitWait`]）。
+    let rotate_on_rate_limit = state
+        .store
+        .get_setting_i64(store::RATE_LIMIT_ROTATE, store::DEFAULT_RATE_LIMIT_ROTATE)
+        != 0;
     // 限流类拒绝一路换到号池走完（硬顶 MAX_ATTEMPTS），链路/上游故障由 retry_max 卡住。
-    let mut budget = RotationBudget::new(retry_max);
+    let mut budget = RotationBudget::new(retry_max, rotate_on_rate_limit);
 
     let mut tried: Vec<i64> = Vec::new();
     let mut last: Option<Response> = None;
@@ -135,8 +148,9 @@ pub async fn handle(
                     "rpm limit reached, trying next"
                 );
                 last = Some(rate_limit_response(rl.retry_after_secs, &e.to_string()));
-                // 本地 RPM 满是限流的一种（而且连上游都没打），照 Credential 记。
-                if !budget.allows(Reject::Credential) {
+                // 本地 RPM 满是限流的一种（而且连上游都没打），照 RateLimited 记：
+                // 关掉换号开关时它也不换号，客户端拿到的是带 retry-after 的 429。
+                if !budget.allows(Reject::RateLimited) {
                     break;
                 }
                 continue;
@@ -170,6 +184,11 @@ pub async fn handle(
                 // 它身上，而不是最初按落点选中的那个。
                 if let Some(key) = session.key() {
                     state.store.bind_session(key, cred.id);
+                }
+                // 前缀 memo 与租约同时更新：两张表必须同步推进，否则「租约还在、底子没了」
+                // 这种时序差会造出一类谁也解释不了的归因。
+                if let Some(p) = &session.prefix {
+                    state.store.note_prefix(p.segments());
                 }
                 return resp;
             }
@@ -259,11 +278,20 @@ enum Outcome {
     TryNext(Reject, Response),
 }
 
-/// 换号的理由。两类失败的代价与终止性都不一样，故要分开记（见 [`RotationBudget`]）。
+/// 换号的理由。三类失败的代价与终止性都不一样，故要分开记（见 [`RotationBudget`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reject {
-    /// **这个号**现在不能用：限流、额度用尽、账号级错误。它当场被排掉（`exclude`）并
-    /// 打上冷却/停用，所以「再换一个」是严格向前走一遍号池，走得完、也走不回头。
+    /// **这个号**现在满了：上游 429，或本地 RPM 闸。它当场被排掉（`exclude`）并打上冷却，
+    /// 所以「再换一个」是严格向前走一遍号池，走得完、也走不回头。
+    ///
+    /// 只有这一类受 [`store::RATE_LIMIT_ROTATE`] 那道开关约束：满了是会自己回血的，
+    /// 「等一等」才是一个真选项。
+    RateLimited,
+    /// **这个号**坏了：账号级错误（凭证失效、被封）。它当场被 `mark_banned` 停用，
+    /// 换号同样是向前走一遍号池。
+    ///
+    /// **不受换号开关约束**：这不是「等一等就好」的事，不换只会让一个坏号把每条请求
+    /// 都拖死，而池子里的好号一直闲着。
     Credential,
     /// **这条链路或上游本身**的问题：连不上、出站被掐。换号有意义（逐账号代理各走各的
     /// 出口），但它既不能证明哪个号坏了、也不会自己收敛，重发整个请求体的代价和超时
@@ -283,15 +311,22 @@ enum Reject {
 ///
 /// `retry_max == 0` 仍是那个明确的关闭开关：一次都不换，上游的判决（含 429）原样交回
 /// 客户端，让它自己退避。
+///
+/// [`store::RATE_LIMIT_ROTATE`] 只掐 [`Reject::RateLimited`] 那一类（`on_rate_limit`）：关掉之后撞 429
+/// 一个号都不换，等待与重试改在 [`RateLimitWait`] 里就地做完；而链路/上游故障照旧按
+/// `upstream_left` 换号——那与「这个号满没满」无关，不换只会让一条本可以打通的请求
+/// 白白失败。
 struct RotationBudget {
     rotate: bool,
+    /// 撞限流要不要换号。
+    on_rate_limit: bool,
     upstream_left: usize,
 }
 
 impl RotationBudget {
-    fn new(retry_max: i64) -> Self {
+    fn new(retry_max: i64, on_rate_limit: bool) -> Self {
         let n = retry_max.max(0);
-        Self { rotate: n > 0, upstream_left: n as usize }
+        Self { rotate: n > 0, on_rate_limit, upstream_left: n as usize }
     }
 
     /// 这次失败之后还要不要再换一个号。会扣掉相应的额度。
@@ -300,6 +335,7 @@ impl RotationBudget {
             return false;
         }
         match reject {
+            Reject::RateLimited => self.on_rate_limit,
             Reject::Credential => true,
             Reject::Upstream => match self.upstream_left {
                 0 => false,
@@ -309,6 +345,51 @@ impl RotationBudget {
                 }
             },
         }
+    }
+}
+
+/// 关掉换号开关之后，撞 429 的那条请求「就地等一等再用同一个号发一遍」的额度。
+///
+/// 只在 [`store::RATE_LIMIT_ROTATE`] 关着时有额度；开着（默认）时 `left` 恒为 0，
+/// 也就是撞 429 立刻换号，与这个类型没做过任何事一样。
+///
+/// **等多久由上游说了算，配置只给上限**：真正的等待时长是
+/// [`rate_limit_cooldown`] 那三级取值（`retry-after` → 体里的恢复提示 → 冷却时长），
+/// 而 [`store::RATE_LIMIT_WAIT_SECS`] 是「最多愿意等这么久」。等得比它还久的那种 429
+/// 多半是额度用尽（几小时后才回血），挂着等只会让客户端自己先超时——那时当场把 429
+/// 交回去，让客户端自己决定什么时候再来。
+struct RateLimitWait {
+    /// 还能就地重试几次。
+    left: u32,
+    /// 一次重试最多愿意等多久（秒）。
+    max_wait: i64,
+}
+
+impl RateLimitWait {
+    fn from_settings(store: &CredentialStore) -> Self {
+        let rotate =
+            store.get_setting_i64(store::RATE_LIMIT_ROTATE, store::DEFAULT_RATE_LIMIT_ROTATE) != 0;
+        if rotate {
+            return Self { left: 0, max_wait: 0 };
+        }
+        let left = store
+            .get_setting_i64(
+                store::RATE_LIMIT_WAIT_RETRY_MAX,
+                store::DEFAULT_RATE_LIMIT_WAIT_RETRY_MAX,
+            )
+            .clamp(0, MAX_ATTEMPTS as i64) as u32;
+        let max_wait = store
+            .get_setting_i64(store::RATE_LIMIT_WAIT_SECS, store::DEFAULT_RATE_LIMIT_WAIT_SECS);
+        Self { left, max_wait }
+    }
+
+    /// 这次 429 要不要就地等；`Some(d)` 是该睡多久。返回 `Some` 就扣掉一次额度。
+    fn allows(&mut self, cooldown_secs: i64) -> Option<Duration> {
+        if self.left == 0 || cooldown_secs > self.max_wait {
+            return None;
+        }
+        self.left -= 1;
+        Some(Duration::from_secs(cooldown_secs.max(0) as u64))
     }
 }
 
@@ -362,6 +443,9 @@ async fn forward_once(
         fwd_body = fixed;
         stripped = true;
     }
+
+    // 撞 429 之后就地等的额度。关着换号开关时才有额度，见 [`RateLimitWait`]。
+    let mut rate_limit_wait = RateLimitWait::from_settings(&state.store);
 
     let (up, quota) = loop {
         let req = client
@@ -419,14 +503,31 @@ async fn forward_once(
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
             let secs = rate_limit_cooldown(state, &up_headers, &bytes);
+            // 冷却先打上，两条路都要：换号那条靠它把这个号排出选号，就地等那条靠它让
+            // **别的**请求别再撞同一堵墙——而等的时长与冷却是同一个数，睡醒时它自己就
+            // 到期了，不必也不该在这里提前抹掉。
+            state.store.note_rate_limited(cred.id, secs);
+            // 关掉换号开关的那种配法：等一等，再用同一个号发一遍。
+            //
+            // 重发不再占 RPM 名额（名额由调用点在选号后占过一次），理由同下面摘密文
+            // 那条：为了一次自己发起的重试把这条客户端请求判死，换回来的只是同一个 429。
+            if let Some(wait) = rate_limit_wait.allows(secs) {
+                tracing::info!(
+                    cred_id = cred.id,
+                    wait_secs = secs,
+                    retries_left = rate_limit_wait.left,
+                    "upstream rate limited this credential; waiting it out on the same credential"
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
             tracing::info!(
                 cred_id = cred.id,
                 cooldown_secs = secs,
-                "upstream rate limited this credential, cooling it down and trying the next one"
+                "upstream rate limited this credential, cooling it down"
             );
-            state.store.note_rate_limited(cred.id, secs);
             return Ok(Outcome::TryNext(
-                Reject::Credential,
+                Reject::RateLimited,
                 error_passthrough(status, &up_headers, bytes, chat),
             ));
         }
@@ -614,6 +715,7 @@ fn stream_upstream(
         cred_label: cred.label.clone(),
         session_key: session.key.clone(),
         lease: session.lease,
+        drift: session.drift,
         input_len: session.input_len,
         path: path.to_owned(),
         ua: ua_of(req_headers),
@@ -669,8 +771,8 @@ struct Normalized {
     /// 来访用的是 Chat Completions 线格式时，回程翻译要用到的那点形态；`None` 表示
     /// Responses 原样透传。
     chat: Option<ChatMode>,
-    /// 这条请求的会话指纹（见 [`prefix_fingerprint`]）。解不出体时为 `None`。
-    sticky: Option<String>,
+    /// 这条请求的会话指纹与四段分段哈希（见 [`prefix_parts`]）。解不出体时为 `None`。
+    prefix: Option<PrefixParts>,
     /// `input[]` 有几项（解不出体时 0）。给缓存归因用，见 [`cache_reason`]。
     input_len: usize,
 }
@@ -695,7 +797,7 @@ fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized,
             // 「客户端没要流」在两种线格式里是同一件事，收拢那段代码也就共用。
             collapse: !t.stream,
             chat: Some(ChatMode { model: t.model, include_usage: t.include_usage }),
-            sticky: t.sticky,
+            prefix: t.prefix,
             input_len: t.input_len,
         });
     }
@@ -725,16 +827,16 @@ fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized,
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
 fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
-        return Normalized { body, collapse: false, chat: None, sticky: None, input_len: 0 };
+        return Normalized { body, collapse: false, chat: None, prefix: None, input_len: 0 };
     }
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
-        return Normalized { body, collapse: false, chat: None, sticky: None, input_len: 0 };
+        return Normalized { body, collapse: false, chat: None, prefix: None, input_len: 0 };
     };
     // 趁体已经解开算指纹：为此再解析一遍是白花的 CPU——真实流量里这个体有几百 KB。
     // **排在算指纹之前**：指纹里就含 tools 及其顺序，反过来的话前缀稳住了而落点还在跟着
     // 客户端那个乱序变——两件事必须用同一份顺序。
     let reordered = sort_tools && normalize_tool_order(&mut obj);
-    let sticky = prefix_fingerprint(&obj);
+    let prefix = prefix_parts(&obj);
     let input_len = obj.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
     let yes = Some(&serde_json::Value::Bool(true));
     let no = Some(&serde_json::Value::Bool(false));
@@ -743,14 +845,14 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
     let dropped = drop_unsupported_params(&mut obj);
     if !collapse && obj.get("store") == no && !dropped && !reordered {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
-        return Normalized { body, collapse, chat: None, sticky, input_len };
+        return Normalized { body, collapse, chat: None, prefix, input_len };
     }
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
-        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None, sticky, input_len },
+        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None, prefix, input_len },
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
-        Err(_) => Normalized { body, collapse, chat: None, sticky, input_len },
+        Err(_) => Normalized { body, collapse, chat: None, prefix, input_len },
     }
 }
 
@@ -938,6 +1040,10 @@ struct SessionCtx {
     /// 请求**进来那一刻**这个键的租约状态。见 [`store::CredentialStore::lease_state`] 上
     /// 那句「必须在选号之前取」。
     lease: store::LeaseState,
+    /// 请求**进来那一刻**四段分段哈希与上次比的结果。同上那句「必须在选号之前取」。
+    drift: store::PrefixDrift,
+    /// 四段分段哈希本身。转发成功后要拿它更新 memo（见 [`store::CredentialStore::note_prefix`]）。
+    prefix: Option<PrefixParts>,
     /// `input[]` 有几项。
     input_len: usize,
 }
@@ -956,10 +1062,16 @@ impl SessionCtx {
 /// - `hit`：上游报了命中的输入 token。
 /// - `first_turn`：第一次见这个会话键，而 `input[]` 只有一项——新对话的第一轮，本来就该
 ///   miss，不是问题。
-/// - `new_prefix`：第一次见这个键，但 `input[]` 已经好几项了。一段多轮对话以一个**从没见过
-///   的前缀身份**出现,意味着前缀本身在变——客户端每轮在改 `instructions` 或 `tools`（两者都
-///   进前缀，见 [`prefix_fingerprint`]）。这一类是纯亏：钱花了，缓存一次也命不中。
-///   （coban 刚重启、或租约条目被 GC 掉时也会落到这一类,那是它的假阳性来源。）
+/// - 第一次见这个键、而 `input[]` 已经好几项：一段多轮对话带着一个从没见过的前缀身份出现。
+///   到这里**再看四段分段哈希是哪一段变了**（[`store::PrefixDrift`]），拆成四类:
+///   - `model_switched`：换了模型。上游按模型分开存缓存，这次未命中是必然的，没什么可修。
+///   - `instructions_changed`：系统提示变了。真凶多半是提示里带了随时间走的东西——工作目录、
+///     git 分支、当天日期（日期这条每条对话每天恰好触发一次）。
+///   - `tools_changed`：工具集合或顺序动了（MCP 重连之类）。**只有这一类**是工具排序那个开关
+///     治得了的（见 [`normalize_tool_order`]）。
+///   - `new_conversation`：连这段对话的底子都没见过。真新对话、`codex resume`、上下文压缩，
+///     以及 coban 刚重启（memo 在内存里）都落在这里——**这一类是假阳性的去处**，把它与上面
+///     三类分开，剩下那三类才干净得能拿来定位。
 /// - `rotated`：这个键有租约，但这次没落在租约那个号上——原来那个号在冷却/RPM 满/被停用。
 ///   上游的 prompt cache 是按账号存的，换号就是从零开始。
 /// - `lease_expired`：租约过期了（会话停得太久），落点因此重新算过。
@@ -977,6 +1089,7 @@ impl SessionCtx {
 fn cache_reason(
     key: Option<&str>,
     lease: store::LeaseState,
+    drift: store::PrefixDrift,
     input_len: usize,
     cred_id: i64,
     usage: Option<Usage>,
@@ -995,7 +1108,18 @@ fn cache_reason(
         store::LeaseState::Live(id) if id != cred_id => "rotated",
         store::LeaseState::Live(_) => "upstream_cold",
         store::LeaseState::Absent if input_len <= 1 => "first_turn",
-        store::LeaseState::Absent => "new_prefix",
+        // 走到这里是「多轮对话 + 没见过的键」。总键只说得出「前缀变了」，分段哈希才说得出
+        // 是哪一段——而那四种的处置完全不同（一个必然、一个要改客户端、一个有开关可治、
+        // 一个压根不是问题）。
+        store::LeaseState::Absent => match drift {
+            store::PrefixDrift::Model => "model_switched",
+            store::PrefixDrift::Instructions => "instructions_changed",
+            store::PrefixDrift::Tools => "tools_changed",
+            // 四段都对得上，键却没见过：只可能是租约那张表先被 GC 掉了而 memo 还留着。
+            // 归到 lease_expired——落点确实重算过，那正是这一类的含义。
+            store::PrefixDrift::Same => "lease_expired",
+            store::PrefixDrift::NoBaseline => "new_conversation",
+        },
     }
 }
 
@@ -1020,26 +1144,80 @@ fn cache_reason(
 /// 客户端做过历史压缩（改写了开头那条）时指纹会变，落点也跟着变——那时上游的前缀哈希
 /// 同样已经变了，缓存本来就丢了，跟着换号不多亏什么。
 pub fn prefix_fingerprint(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    prefix_parts(obj).map(|p| p.key)
+}
+
+/// 会话键，**外加四段各自的短哈希**。
+///
+/// 总键只说得出「前缀变了」。变的是哪一段——换了模型、客户端改了 `instructions`、工具集或
+/// 顺序动了、还是压根是另一段对话——揉进一个哈希之后就分不出来了，而这四种的处置完全不同。
+/// 分段哈希配上 [`store::PrefixMemo`] 才把「没见过的前缀」从一次猜测变成一次诊断。
+///
+/// `head`（`input[0]` 的哈希）是这套东西的支点：对话越聊越长，但开头那一项不变，所以在其余
+/// 三段变掉、总键因此对不上的时候，还能靠它认出「这是同一段对话」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixParts {
+    /// 会话键。与只有总键那一版**逐字节一致**——它决定落点与上游 `session_id`，改一个 bit
+    /// 就是全池落点重算一遍、白丢一轮缓存。测试里钉了固定值防这件事。
+    pub key: String,
+    pub model: String,
+    pub instructions: String,
+    pub tools: String,
+    pub head: String,
+}
+
+impl PrefixParts {
+    pub fn segments(&self) -> store::PrefixSegments<'_> {
+        store::PrefixSegments {
+            head: &self.head,
+            model: &self.model,
+            instructions: &self.instructions,
+            tools: &self.tools,
+        }
+    }
+}
+
+pub fn prefix_parts(obj: &serde_json::Map<String, serde_json::Value>) -> Option<PrefixParts> {
     use sha2::{Digest, Sha256};
 
     // 没有 input 就没有会话可言（`models` 那类无体请求走到这里也是这一支）。
-    let head = obj.get("input")?.as_array()?.first()?;
+    let head_val = obj.get("input")?.as_array()?.first()?;
     let mut h = Sha256::new();
-    let mut feed = |label: &[u8], v: Option<&serde_json::Value>| {
+    let mut feed = |label: &[u8], v: Option<&serde_json::Value>| -> String {
+        // 序列化而不是取 as_str：`tools` 是结构，嵌套与顺序都要进哈希。
+        let bytes = v.and_then(|v| serde_json::to_vec(v).ok());
+        // **喂进总哈希的顺序与字节一个都不许动**，理由见 [`PrefixParts::key`]。分段哈希
+        // 另起一个 hasher，加它不影响总键。
         h.update(label);
         h.update([0u8]); // 分隔符：不同字段的内容不能因为拼接而串味
-        // 序列化而不是取 as_str：`tools` 是结构，嵌套与顺序都要进哈希。
-        if let Some(Ok(bytes)) = v.map(serde_json::to_vec) {
-            h.update(&bytes);
+        if let Some(b) = &bytes {
+            h.update(b);
         }
         h.update([0u8]);
+
+        // 分段哈希也带上标签：否则两段内容恰好相同时会算出同一个值，比对时分不清谁是谁。
+        // 取 8 字节——它只用来比「和上次一样吗」。
+        let mut seg = Sha256::new();
+        seg.update(label);
+        seg.update([0u8]);
+        if let Some(b) = &bytes {
+            seg.update(b);
+        }
+        crate::credentials::hex_lower(&seg.finalize()[..8])
     };
-    feed(b"model", obj.get("model"));
-    feed(b"instructions", obj.get("instructions"));
-    feed(b"tools", obj.get("tools"));
-    feed(b"head", Some(head));
+    let model = feed(b"model", obj.get("model"));
+    let instructions = feed(b"instructions", obj.get("instructions"));
+    let tools = feed(b"tools", obj.get("tools"));
+    let head = feed(b"head", Some(head_val));
+    drop(feed);
     // 取前 16 字节：它只用来当键，不做任何密码学承诺。
-    Some(crate::credentials::hex_lower(&h.finalize()[..16]))
+    Some(PrefixParts {
+        key: crate::credentials::hex_lower(&h.finalize()[..16]),
+        model,
+        instructions,
+        tools,
+        head,
+    })
 }
 
 fn upstream_url(path: &str, query: Option<&str>) -> String {
@@ -1496,6 +1674,7 @@ struct UsageLogGuard {
     /// **归因只能在这里算**：它要 `cached_tokens`，而那要等流走完才嗅探得到。
     session_key: Option<String>,
     lease: store::LeaseState,
+    drift: store::PrefixDrift,
     input_len: usize,
     path: String,
     ua: Option<String>,
@@ -1526,6 +1705,7 @@ impl Drop for UsageLogGuard {
             cache_reason: Some(cache_reason(
                 self.session_key.as_deref(),
                 self.lease,
+                self.drift,
                 self.input_len,
                 self.cred_id,
                 usage,
@@ -1578,6 +1758,7 @@ fn log_usage(
         cache_reason: Some(cache_reason(
             session.key(),
             session.lease,
+            session.drift,
             session.input_len,
             cred.id,
             usage,
@@ -2598,28 +2779,62 @@ mod tests {
     /// 池子里还能用的号找出来。卡住的后果就是客户端拿到一个「其实还有好号闲着」的 429。
     #[test]
     fn rate_limited_credentials_do_not_spend_the_retry_budget() {
-        let mut b = RotationBudget::new(2);
+        let mut b = RotationBudget::new(2, true);
         // 默认预算是 2，但限流可以一路换下去（真正的上限是 MAX_ATTEMPTS）。
         for _ in 0..MAX_ATTEMPTS * 2 {
-            assert!(b.allows(Reject::Credential));
+            assert!(b.allows(Reject::RateLimited));
         }
         // 链路故障仍旧只有 retry_max 次：那类失败慢、又不会自己收敛。
         assert!(b.allows(Reject::Upstream));
         assert!(b.allows(Reject::Upstream));
         assert!(!b.allows(Reject::Upstream));
-        // 上游预算花光了也不影响继续换限流的号——两类额度各记各的。
-        assert!(b.allows(Reject::Credential));
+        // 上游预算花光了也不影响继续换限流的号——各类额度各记各的。
+        assert!(b.allows(Reject::RateLimited));
     }
 
     /// `0` 是那个明确的关闭开关：一次都不换，上游的判决原样交回客户端。
     #[test]
     fn a_zero_budget_still_means_no_rotation_at_all() {
-        let mut b = RotationBudget::new(0);
+        let mut b = RotationBudget::new(0, true);
+        assert!(!b.allows(Reject::RateLimited));
         assert!(!b.allows(Reject::Credential));
         assert!(!b.allows(Reject::Upstream));
         // 负值（历史脏数据）按 0 算，不能变成「无限换」。
-        let mut b = RotationBudget::new(-3);
-        assert!(!b.allows(Reject::Credential));
+        let mut b = RotationBudget::new(-3, true);
+        assert!(!b.allows(Reject::RateLimited));
+    }
+
+    /// 关掉换号开关：撞限流一个号都不换（等待改在 [`RateLimitWait`] 里就地做），而链路
+    /// 故障照旧换——那与「这个号满没满」无关，跟着一起关掉只会让一条本可以打通的请求
+    /// 白白失败。
+    #[test]
+    fn turning_off_rate_limit_rotation_still_rotates_on_upstream_failures() {
+        let mut b = RotationBudget::new(2, false);
+        assert!(!b.allows(Reject::RateLimited));
+        // 坏号不在开关管辖之内：不换只会让一个被封的号把每条请求都拖死。
+        assert!(b.allows(Reject::Credential));
+        assert!(b.allows(Reject::Upstream));
+        assert!(b.allows(Reject::Upstream));
+        assert!(!b.allows(Reject::Upstream));
+        // 限流那一类始终是关的，不会因为上游预算花光而变。
+        assert!(!b.allows(Reject::RateLimited));
+    }
+
+    /// 就地等的两条边界：次数用完就不再等，以及**上游说要等的比上限还长就当场放弃**
+    /// ——那种 429 多半是额度用尽（几小时后才回血），挂着等只会让客户端自己先超时。
+    #[test]
+    fn waiting_in_place_is_bounded_by_both_the_count_and_the_ceiling() {
+        let mut w = RateLimitWait { left: 2, max_wait: 60 };
+        assert_eq!(w.allows(30), Some(Duration::from_secs(30)));
+        // 等得比上限久：不等，也**不扣**额度——这条请求就此把 429 交回客户端。
+        assert_eq!(w.allows(438_570), None);
+        assert_eq!(w.left, 1);
+        assert_eq!(w.allows(60), Some(Duration::from_secs(60)));
+        assert_eq!(w.allows(1), None);
+
+        // 开着换号开关时额度恒为 0：撞 429 立刻换号，一秒都不等。
+        let mut off = RateLimitWait { left: 0, max_wait: 60 };
+        assert_eq!(off.allows(1), None);
     }
 
     /// 额度用尽那种 429 常常不给 `retry-after`，恢复时刻只写在体里。取不到它就退回默认的
@@ -3031,6 +3246,71 @@ mod tests {
         assert!(v["data"][0]["created"].as_i64().unwrap() > 0, "留 0 会被显示成 1970 年");
     }
 
+    /// 会话键的**固定值**回归。
+    ///
+    /// 这个键决定落点与上游 `session_id`，改一个 bit 就是全池落点重算一遍、每段在跑的对话
+    /// 各丢一次整前缀。分段哈希是后来加的，加它时总键必须一字节不动——这三个值就是那次
+    /// 重构之前抄下来的。**任何让它们变的改动都得先想清楚代价**，别顺手更新期望值。
+    #[test]
+    fn the_session_key_never_changes_value() {
+        assert_eq!(
+            fp(r#"{"model":"m","instructions":"i","tools":[{"name":"t"}],"input":[{"role":"user","content":"hi"}]}"#).unwrap(),
+            "7dfebc4da2fb14c16d11e8edbd8231ca"
+        );
+        assert_eq!(
+            fp(r#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#).unwrap(),
+            "bf835d352a263ceb261c102605d7d4ab"
+        );
+        assert_eq!(fp(r#"{"input":[1]}"#).unwrap(), "a056ce87976b4301b4a3d2538f630262");
+    }
+
+    /// 分段哈希各认各的那一段：只动一段，就只有那一段的哈希变。
+    #[test]
+    fn each_segment_hash_tracks_only_its_own_field() {
+        let parts = |body: &str| {
+            let serde_json::Value::Object(obj) = serde_json::from_str(body).unwrap() else {
+                panic!("object")
+            };
+            prefix_parts(&obj).unwrap()
+        };
+        let base = parts(
+            r#"{"model":"m","instructions":"i","tools":[{"name":"t"}],"input":[{"role":"user","content":"hi"}]}"#,
+        );
+        let other_model = parts(
+            r#"{"model":"OTHER","instructions":"i","tools":[{"name":"t"}],"input":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert_ne!(base.model, other_model.model);
+        assert_eq!(base.instructions, other_model.instructions);
+        assert_eq!(base.tools, other_model.tools);
+        assert_eq!(base.head, other_model.head, "换模型不该动这段对话的身份");
+
+        let other_tools = parts(
+            r#"{"model":"m","instructions":"i","tools":[{"name":"OTHER"}],"input":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert_ne!(base.tools, other_tools.tools);
+        assert_eq!(base.model, other_tools.model);
+        assert_eq!(base.instructions, other_tools.instructions);
+
+        // **head 在对话长大时不能变**：这是整套诊断的支点——其余三段变掉、总键因此对不上时，
+        // 还得靠它认出「这是同一段对话」。
+        let grown = parts(
+            r#"{"model":"m","instructions":"i","tools":[{"name":"t"}],
+                "input":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]}"#,
+        );
+        assert_eq!(base.head, grown.head);
+        assert_eq!(base.key, grown.key);
+
+        // 两段内容恰好相同时也不能撞：分段哈希各自带标签。
+        let same =
+            parts(r#"{"model":"x","instructions":"x","input":[{"role":"user","content":"hi"}]}"#);
+        assert_ne!(same.model, same.instructions, "内容相同的两段不该算出同一个哈希");
+    }
+
+    /// 测试里只关心总键那一段（落点与上游 session_id 都跟着它走）。
+    fn key(n: &Normalized) -> Option<&str> {
+        n.prefix.as_ref().map(|p| p.key.as_str())
+    }
+
     fn fp(body: &str) -> Option<String> {
         let serde_json::Value::Object(obj) = serde_json::from_str(body).unwrap() else {
             panic!("object")
@@ -3097,7 +3377,11 @@ mod tests {
                 total_tokens: 100_001,
             })
         };
-        let r = |lease, input_len, usage| cache_reason(Some("k"), lease, input_len, A, usage);
+        use store::PrefixDrift as D;
+        // 大部分分支与前缀漂移无关，用 NoBaseline 走过场；漂移那几支单独在下一个测试里。
+        let r = |lease, input_len, usage| {
+            cache_reason(Some("k"), lease, D::NoBaseline, input_len, A, usage)
+        };
 
         // 命中优先于一切：上游都报了命中，前面那些原因就不必再猜。
         assert_eq!(r(LeaseState::Absent, 1, usage(90_000)), "hit");
@@ -3105,7 +3389,7 @@ mod tests {
 
         assert_eq!(r(LeaseState::Absent, 1, usage(0)), "first_turn");
         // 同样是「没见过这个键」，输入已经好几项就不是新对话，是前缀在变。
-        assert_eq!(r(LeaseState::Absent, 9, usage(0)), "new_prefix");
+        assert_eq!(r(LeaseState::Absent, 9, usage(0)), "new_conversation");
         assert_eq!(r(LeaseState::Live(B), 9, usage(0)), "rotated");
         assert_eq!(r(LeaseState::Live(A), 9, usage(0)), "upstream_cold");
         assert_eq!(r(LeaseState::Off, 9, usage(0)), "unattributed");
@@ -3119,8 +3403,46 @@ mod tests {
 
         // 没有会话身份的请求自成一类，**不能回 None**：那一列留空专指升级前的旧流水，
         // 让活着的请求也写 NULL 就把两件事混成了一桶。
-        assert_eq!(cache_reason(None, LeaseState::Absent, 0, A, usage(0)), "no_session");
-        assert_eq!(cache_reason(Some(""), LeaseState::Absent, 0, A, usage(0)), "no_session");
+        assert_eq!(
+            cache_reason(None, LeaseState::Absent, D::NoBaseline, 0, A, usage(0)),
+            "no_session"
+        );
+        assert_eq!(
+            cache_reason(Some(""), LeaseState::Absent, D::NoBaseline, 0, A, usage(0)),
+            "no_session"
+        );
+    }
+
+    /// 「没见过的键 + 多轮对话」这一支再按分段漂移拆成四类——这才是把一次猜测变成一次诊断
+    /// 的地方，四类的处置完全不同。
+    #[test]
+    fn a_never_seen_key_is_diagnosed_by_which_segment_drifted() {
+        use store::{LeaseState, PrefixDrift as D};
+        let usage = Some(Usage {
+            input_tokens: 100_000,
+            cached_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            total_tokens: 100_001,
+        });
+        let r = |drift| cache_reason(Some("k"), LeaseState::Absent, drift, 9, 7, usage);
+
+        assert_eq!(r(D::Model), "model_switched");
+        assert_eq!(r(D::Instructions), "instructions_changed");
+        assert_eq!(r(D::Tools), "tools_changed");
+        assert_eq!(r(D::NoBaseline), "new_conversation");
+        // 四段都没变而键没见过：租约表先被 GC 了，落点确实重算过。
+        assert_eq!(r(D::Same), "lease_expired");
+
+        // 漂移只在这一支起作用：第一轮仍然是 first_turn，租约还在时仍然按租约那几类走。
+        assert_eq!(
+            cache_reason(Some("k"), LeaseState::Absent, D::Instructions, 1, 7, usage),
+            "first_turn"
+        );
+        assert_eq!(
+            cache_reason(Some("k"), LeaseState::Live(7), D::Instructions, 9, 7, usage),
+            "upstream_cold"
+        );
     }
 
     /// 排 tools 的三件事：顺序被排定、指纹**跟着排完的顺序算**、已经有序时不动手。
@@ -3159,8 +3481,8 @@ mod tests {
         // **排过的那份与本来就有序的那份要算出同一个指纹**——这才是排序的目的：前缀稳了，
         // 落点也不能再跟着客户端那个乱序换。
         let already = plan_request("responses", Bytes::from_static(sorted), true).unwrap();
-        assert_eq!(on.sticky, already.sticky);
-        assert_ne!(off.sticky, on.sticky, "不排的那份指纹本来就该不一样");
+        assert_eq!(key(&on), key(&already));
+        assert_ne!(key(&off), key(&on), "不排的那份指纹本来就该不一样");
     }
 
     /// 已经有序时不许重新序列化：那会把整个 body 的 key 顺序改掉（见 Cargo.toml 里
@@ -3197,10 +3519,10 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(one.sticky, other.sticky, "server_label 撞了也得排得出确定的次序");
+        assert_eq!(key(&one), key(&other), "server_label 撞了也得排得出确定的次序");
     }
 
-    /// 两条线格式都要报出 `input[]` 的项数——`first_turn` 与 `new_prefix` 全靠它分开。
+    /// 两条线格式都要报出 `input[]` 的项数——`first_turn` 与「没见过的前缀」那几类全靠它分开。
     #[test]
     fn both_wire_formats_report_the_input_length() {
         let one = plan_request(
@@ -3238,7 +3560,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(n.sticky.is_some());
+        assert!(key(&n).is_some());
 
         let turn1 = plan_request(
             "chat/completions",
@@ -3257,8 +3579,8 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(turn1.sticky.is_some());
-        assert_eq!(turn1.sticky, turn2.sticky, "chat 那条路上会话长大也不能换落点");
+        assert!(key(&turn1).is_some());
+        assert_eq!(key(&turn1), key(&turn2), "chat 那条路上会话长大也不能换落点");
     }
 
     fn hm(pairs: &[(&str, &str)]) -> HeaderMap {

@@ -128,6 +128,9 @@ pub async fn run(
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
+        .route("/settings/rate-limit-rotate", post(set_rate_limit_rotate))
+        .route("/settings/rate-limit-wait-secs", post(set_rate_limit_wait_secs))
+        .route("/settings/rate-limit-wait-retry-max", post(set_rate_limit_wait_retry_max))
         .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
         .route("/settings/cooldown-secs", post(set_cooldown_secs))
         .route("/settings/session-lease-secs", post(set_session_lease_secs))
@@ -1031,6 +1034,12 @@ struct SettingsResp {
     env_managed: bool,
     default_rpm_limit: i64,
     rate_limit_retry_max: i64,
+    /// 撞 429 之后是换个号重发（true），还是就地等一等再发同一个号（false）。
+    rate_limit_rotate: bool,
+    /// 不换号时，一次就地重试最多愿意等多久（秒）。
+    rate_limit_wait_secs: i64,
+    /// 不换号时，同一个号最多就地重试几次。
+    rate_limit_wait_retry_max: i64,
     quota_pause_pct: i64,
     cooldown_secs: i64,
     /// 会话落点的租约时长（秒，0 = 关闭）。
@@ -1054,6 +1063,15 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
         default_rpm_limit: s.get_setting_i64(store::DEFAULT_RPM_LIMIT, 0),
         rate_limit_retry_max: s
             .get_setting_i64(store::RATE_LIMIT_RETRY_MAX, store::DEFAULT_RATE_LIMIT_RETRY_MAX),
+        rate_limit_rotate: s
+            .get_setting_i64(store::RATE_LIMIT_ROTATE, store::DEFAULT_RATE_LIMIT_ROTATE)
+            != 0,
+        rate_limit_wait_secs: s
+            .get_setting_i64(store::RATE_LIMIT_WAIT_SECS, store::DEFAULT_RATE_LIMIT_WAIT_SECS),
+        rate_limit_wait_retry_max: s.get_setting_i64(
+            store::RATE_LIMIT_WAIT_RETRY_MAX,
+            store::DEFAULT_RATE_LIMIT_WAIT_RETRY_MAX,
+        ),
         quota_pause_pct: s.get_setting_i64(store::QUOTA_PAUSE_PCT, store::DEFAULT_QUOTA_PAUSE_PCT),
         cooldown_secs: s.get_setting_i64(store::COOLDOWN_SECS, store::DEFAULT_COOLDOWN_SECS),
         session_lease_secs: s
@@ -1119,6 +1137,34 @@ async fn set_rate_limit_retry_max(
     Json(req): Json<IntReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     set_int_setting(state, store::RATE_LIMIT_RETRY_MAX, req.value, 0..=8).await
+}
+
+/// 开关：撞上游 429 之后换个号重发，还是就地等一等再发同一个号
+/// （见 `store::RATE_LIMIT_ROTATE`）。
+async fn set_rate_limit_rotate(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::RATE_LIMIT_ROTATE, req.value, 0..=1).await
+}
+
+/// 不换号时一次就地重试最多等多久（秒）。
+///
+/// 上限 3600：再往上就不是「等一等」而是把一条客户端请求挂死了——那种情形该让客户端
+/// 自己拿着 429 走，而不是在服务端占着连接。
+async fn set_rate_limit_wait_secs(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::RATE_LIMIT_WAIT_SECS, req.value, 1..=3600).await
+}
+
+/// 不换号时同一个号最多就地重试几次（`0` = 一次都不等）。
+async fn set_rate_limit_wait_retry_max(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::RATE_LIMIT_WAIT_RETRY_MAX, req.value, 0..=8).await
 }
 
 async fn set_quota_pause_pct(

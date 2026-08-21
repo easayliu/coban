@@ -15,6 +15,12 @@ export interface Settings {
   default_rpm_limit: number
   /** 撞上游限流后最多再换几个账号重试（0 = 不重试，把上游的 429 原样交回）。 */
   rate_limit_retry_max: number
+  /** 撞 429 之后是换个号重发（true，默认），还是就地等一等再发同一个号（false）。 */
+  rate_limit_rotate: boolean
+  /** 不换号时，一次就地重试最多愿意等多久（秒）。是上限，不是等待时长。 */
+  rate_limit_wait_secs: number
+  /** 不换号时，同一个号最多就地重试几次（0 = 一次都不等）。 */
+  rate_limit_wait_retry_max: number
   /** 额度用到百分之多少就暂停这个账号（0 = 不暂停）。 */
   quota_pause_pct: number
   /** 撞 429 后该账号冷却多久（秒）。 */
@@ -49,6 +55,22 @@ export async function setDefaultRpmLimit(limit: number): Promise<Settings> {
 
 export async function setRateLimitRetryMax(n: number): Promise<Settings> {
   const { data } = await api.post('/settings/rate-limit-retry-max', { value: n })
+  return data
+}
+
+/** 关掉即「撞 429 不换号」：改成在同一个号上等一等再发。 */
+export async function setRateLimitRotate(on: boolean): Promise<Settings> {
+  const { data } = await api.post('/settings/rate-limit-rotate', { value: on ? 1 : 0 })
+  return data
+}
+
+export async function setRateLimitWaitSecs(secs: number): Promise<Settings> {
+  const { data } = await api.post('/settings/rate-limit-wait-secs', { value: secs })
+  return data
+}
+
+export async function setRateLimitWaitRetryMax(n: number): Promise<Settings> {
+  const { data } = await api.post('/settings/rate-limit-wait-retry-max', { value: n })
   return data
 }
 

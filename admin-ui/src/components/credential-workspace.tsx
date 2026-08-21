@@ -49,7 +49,8 @@ import {
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { LiveTrafficMetric, OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
 import { Button, buttonVariants } from '@/components/ui/button'
-import { Card } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Card, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Empty,
   EmptyContent,
@@ -622,29 +623,32 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (
-    <div className="space-y-3 sm:space-y-4" data-slot="credential-workspace">
-      <section
-        className="overflow-hidden rounded-xl border bg-card shadow-xs/5"
-        aria-labelledby="page-title"
+    <div className="space-y-2 sm:space-y-3" data-slot="credential-workspace">
+      <Card
+        render={<section aria-labelledby="page-title" />}
+        className="overflow-hidden rounded-xl"
       >
-        <div
+        <CardHeader
           className={cn(
-            'grid gap-3 p-3 sm:p-4',
+            'grid gap-2 p-2.5 sm:p-3',
             (isLoading || count > 0) && 'xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center',
           )}
         >
           <div className="flex min-w-0 items-center justify-between gap-3 xl:justify-start">
             <div className="flex min-w-0 items-center gap-2.5">
-              <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight">
+              <CardTitle
+                render={<h1 id="page-title" />}
+                className="min-w-0 text-lg leading-tight tracking-tight"
+              >
                 {t('账号池', 'Account pool')}
-              </h1>
+              </CardTitle>
               {!isLoading && (
-                <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-2xs font-medium text-muted-foreground">
+                <Badge variant="secondary" size="sm" className="text-2xs">
                   {t(
                     `${formatNumber(count)} 个账号`,
                     `${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
                   )}
-                </span>
+                </Badge>
               )}
             </div>
             <div
@@ -894,7 +898,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </ToolbarGroup>
             </Toolbar>
           )}
-        </div>
+        </CardHeader>
 
         {isLoading ? (
           <section
@@ -1015,7 +1019,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             />
           </section>
         )}
-      </section>
+      </Card>
 
       <section className="min-w-0" aria-labelledby="account-list-title">
         <h2 id="account-list-title" className="sr-only">{t('账号列表', 'Account list')}</h2>

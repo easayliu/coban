@@ -54,9 +54,10 @@ pub struct Translated {
     pub include_usage: bool,
     /// 客户端请求的模型名。上游没报模型时用它回显。
     pub model: String,
-    /// 这条请求的会话指纹（见 [`crate::proxy`] 的 `prefix_fingerprint`）。**在这里算**是因为
-    /// 翻完的那份 Map 就在手上，为它把刚序列化出来的体再解析一遍是白花的 CPU。
-    pub sticky: Option<String>,
+    /// 这条请求的会话指纹，连同四段各自的短哈希（见 [`crate::proxy::prefix_parts`]）。
+    /// **在这里算**是因为翻完的那份 Map 就在手上，为它把刚序列化出来的体再解析一遍是白花
+    /// 的 CPU。
+    pub prefix: Option<crate::proxy::PrefixParts>,
     /// 翻出来的 `input[]` 有几项。给缓存归因用：第一轮只有一项，多轮会一直长
     /// （见 [`crate::proxy`] 的 `cache_reason`）。
     pub input_len: usize,
@@ -129,11 +130,11 @@ pub fn translate_request(raw: &[u8], sort_tools: bool) -> Result<Translated, Str
     if sort_tools {
         crate::proxy::normalize_tool_order(&mut out);
     }
-    let sticky = crate::proxy::prefix_fingerprint(&out);
+    let prefix = crate::proxy::prefix_parts(&out);
     let input_len = out.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
     let body = serde_json::to_vec(&Value::Object(out))
         .map_err(|e| format!("failed to build the upstream request: {e}"))?;
-    Ok(Translated { body: Bytes::from(body), stream, include_usage, model, sticky, input_len })
+    Ok(Translated { body: Bytes::from(body), stream, include_usage, model, prefix, input_len })
 }
 
 /// `messages[]` → (`instructions`, `input[]`)。
