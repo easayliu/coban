@@ -131,9 +131,13 @@ pub const CLIENT_API_KEY: &str = "client_api_key";
 pub const ADMIN_PASSWORD: &str = "admin_password_sha256";
 /// 全局默认的每账号 RPM 上限（0 = 不限）。
 pub const DEFAULT_RPM_LIMIT: &str = "default_rpm_limit";
-/// 撞上游限流后，最多再换几个账号重试。
+/// 一条请求被上游拒掉后最多再换几个账号——**只管链路/上游故障那一类**（连不上、
+/// token 刷不出来）。撞限流换号不受这个数字约束：那类拒绝会把号排掉并打上冷却，继续换
+/// 就是把号池里还能用的号找出来，只受一条请求的尝试硬顶约束（见 `proxy::RotationBudget`）。
+///
+/// `0` 仍是总开关：一次都不换，上游的判决（含 429）原样交回客户端。
 pub const RATE_LIMIT_RETRY_MAX: &str = "rate_limit_retry_max";
-/// 同上的默认值。0 表示不重试、把上游的 429 原样交回客户端。
+/// 同上的默认值。
 pub const DEFAULT_RATE_LIMIT_RETRY_MAX: i64 = 2;
 /// 额度用到百分之多少就暂停这个账号（0 = 不暂停）。
 pub const QUOTA_PAUSE_PCT: &str = "quota_pause_pct";
@@ -148,7 +152,11 @@ pub const DEFAULT_COOLDOWN_SECS: i64 = 60;
 pub const RPM_WINDOW_SECS: u64 = 60;
 
 /// 用量流水的保留期：超过就裁掉（终身口径落在 `credential_stats` 账本里，不受影响）。
-const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
+///
+/// 公开是因为它同时是**「能回看多远」的上限**：缓存命中率那条趋势线读的就是这张表
+/// （见 [`CredentialStore::cache_series`]），接口按它夹住请求的时间跨度，好过让人问一段
+/// 早被裁掉的历史、再收到一条无声变短的曲线。
+pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 
 /// 算出该账号实际生效的 RPM 上限。
 ///
@@ -297,6 +305,17 @@ pub struct UsagePage {
     pub total_cached_tokens: i64,
     /// 本轮翻页的锚点（Unix 秒），下一页原样带回。
     pub anchor: Option<i64>,
+}
+
+/// 缓存命中率趋势里的一个**小时桶**：`ts` 是这一小时的起点（Unix 秒）。
+///
+/// 与 [`UsagePage`] 上那两项同一个取舍——回两个原始数，比率由界面算：一个 300 token 的
+/// 小时里的「命中 0%」与 17K 前缀那种小时里的「命中 94%」是两件事，光看比率判断不了。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheBucket {
+    pub ts: i64,
+    pub input_tokens: i64,
+    pub cached_tokens: i64,
 }
 
 /// 一个额度窗口的**当前周期内**已经发生了什么。
@@ -1456,6 +1475,37 @@ impl CredentialStore {
         Ok(UsagePage { logs, total, total_cost, total_input_tokens, total_cached_tokens, anchor })
     }
 
+    /// 全池缓存命中率的**逐小时**流水合计，`since`（Unix 秒）之后的部分，按时间升序。
+    ///
+    /// 只回**有请求的那些小时**：没有请求的小时里「命中率」这件事根本不存在，回一个
+    /// `0 / 0` 会被画成一根落到底的柱子，读起来像「那会儿缓存崩了」。画图那头据此留空。
+    ///
+    /// **桶固定是小时**，不按前端要的跨度分桶：小时的边界与时区无关（整小时偏移下哪个时区
+    /// 都对得齐），而「天」的边界不是——服务端按 UTC 切出来的「一天」在 UTC+8 看是
+    /// 08:00–08:00。所以这里只切小时，要看几天一根由浏览器按它自己的时区把小时合起来。
+    /// 30 天也只有 720 个桶，而真实流量里非空的远少于此。
+    ///
+    /// 分母用 `input_tokens`（上游报的这个数本来就含命中那部分，见 [`CredentialStats`]），
+    /// 不是 `total_tokens`：输出 token 与缓存无关，掺进分母只会把命中率按「这一轮模型说了
+    /// 多少话」稀释。没嗅探到 usage 的行按 0 计入——`SUM` 本来就跳过 NULL。
+    pub fn cache_series(&self, since: i64) -> Result<Vec<CacheBucket>> {
+        const BUCKET_SECS: i64 = 3600;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT (ts / ?2) * ?2 AS bucket,
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_tokens), 0)
+               FROM usage_logs
+              WHERE ts >= ?1
+              GROUP BY bucket
+              HAVING SUM(input_tokens) > 0
+              ORDER BY bucket",
+        )?;
+        let rows = stmt.query_map(params![since, BUCKET_SECS], |r| {
+            Ok(CacheBucket { ts: r.get(0)?, input_tokens: r.get(1)?, cached_tokens: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// 裁掉过期的用量流水，返回删了几行。终身口径在账本里，不受影响。
     pub fn prune_usage_logs(&self) -> Result<usize> {
         let cutoff = now_secs() as i64 - USAGE_LOG_RETENTION_SECS;
@@ -1933,6 +1983,59 @@ mod tests {
         assert!(page.anchor.is_some());
         // 两条流水都没报 token：合计是 0 而不是 NULL——界面据此显示「没有可谈的缓存率」。
         assert_eq!((page.total_input_tokens, page.total_cached_tokens), (0, 0));
+    }
+
+    /// 缓存命中率趋势：**按小时分桶、跨账号求和、没请求的小时不出现**。
+    ///
+    /// 空桶不能回一个 `0 / 0`：画图那头会把它画成一根落到底的柱子，读起来像「那会儿缓存
+    /// 崩了」，而真相是那个小时一条请求都没有。
+    #[test]
+    fn cache_series_buckets_by_hour_and_skips_quiet_ones() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+        let now = now_secs() as i64;
+        let log = |cred_id: i64, ts: i64, input: Option<i64>, cached: Option<i64>| {
+            s.insert_usage_log(&UsageRecord {
+                cred_id: Some(cred_id),
+                has_usage: input.is_some(),
+                input_tokens: input,
+                cached_tokens: cached,
+                ..Default::default()
+            })
+            .unwrap();
+            // 落库用的是 unixepoch() 默认值，只能事后改 ts 来把流水摆到指定的小时里。
+            let conn = s.conn.lock();
+            conn.execute(
+                "UPDATE usage_logs SET ts = ?1 WHERE id = (SELECT MAX(id) FROM usage_logs)",
+                params![ts],
+            )
+            .unwrap();
+        };
+
+        // 同一个小时里的两个账号要合成一个桶：这条曲线讲的是「全池」。
+        let h0 = now / 3600 * 3600;
+        log(a.id, h0 + 10, Some(1_000), Some(900));
+        log(b.id, h0 + 20, Some(1_000), Some(100));
+        // 上一个小时只有一条。中间那个小时刻意留空。
+        log(a.id, h0 - 2 * 3600 + 30, Some(400), Some(0));
+        // 没嗅探到用量的那条（多半是 4xx）：它自己的小时里没有可谈的命中率，不该出现。
+        log(a.id, h0 - 5 * 3600, None, None);
+        // 早于 since 的不算。
+        log(a.id, h0 - 50 * 3600, Some(9_999), Some(9_999));
+
+        let series = s.cache_series(h0 - 10 * 3600).unwrap();
+        assert_eq!(series.len(), 2, "三个有请求的小时里，只有两个有可谈的命中率");
+        // 升序：画图直接按顺序铺，不必自己再排。
+        assert_eq!(series[0].ts, h0 - 2 * 3600);
+        assert_eq!((series[0].input_tokens, series[0].cached_tokens), (400, 0));
+        // 桶起点对齐到整小时，而不是那条流水自己的时间戳。
+        assert_eq!(series[1].ts, h0);
+        assert_eq!((series[1].input_tokens, series[1].cached_tokens), (2_000, 1_000));
+
+        // 跨度夹得更短就只剩最近那个桶；一条都没有时回空数组而不是报错。
+        assert_eq!(s.cache_series(h0).unwrap().len(), 1);
+        assert!(s.cache_series(now + 3600).unwrap().is_empty());
     }
 
     /// 删号要连带清掉账本与流水，否则 id 复用时新账号继承一段历史。

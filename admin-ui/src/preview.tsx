@@ -371,6 +371,40 @@ queryClient.setQueryData(['metrics'], {
   cached_tokens_total: previewCredentials.reduce((sum, c) => sum + c.stats.cached_tokens_total, 0),
 })
 
+/**
+ * 缓存命中率趋势的假数据：近 7 天逐小时。
+ *
+ * 刻意造出三种形态，因为图上这三样长得必须不一样：**有流量且高命中**（日常）、**有流量但
+ * 命中掉下去**（第 4 天，粘性被打断的样子）、**整段静默**（第 2 天下半夜，图上该留空而不是
+ * 画一根落到底的柱子）。
+ */
+const previewCacheSeries = (() => {
+  const hourNow = Math.floor(Date.now() / 1000 / 3600) * 3600
+  const points: { ts: number; input_tokens: number; cached_tokens: number }[] = []
+  for (let h = 7 * 24 - 1; h >= 0; h--) {
+    const ts = hourNow - h * 3600
+    const day = Math.floor(h / 24)
+    // 第 2 天的凌晨 0–8 点整段没有请求：后端不会回这些小时，这里也就不塞。
+    if (day === 5 && h % 24 < 8) continue
+    // 一天里的活跃时段之外流量稀薄，凌晨干脆没有。
+    const hourOfDay = new Date(ts * 1000).getHours()
+    if (hourOfDay < 8 && day !== 3) continue
+    const input = 6_000 + ((h * 733) % 9_000)
+    // 第 4 天命中率掉到六成上下（换过号，客户端手里的前缀对不上了）。
+    const hitRate = day === 3 ? 0.58 + ((h % 5) * 0.01) : 0.93 + ((h % 4) * 0.015)
+    points.push({ ts, input_tokens: input, cached_tokens: Math.round(input * hitRate) })
+  }
+  return { since: hourNow - 7 * 24 * 3600, bucket_secs: 3600, points }
+})()
+
+queryClient.setQueryData(['cache-series', 7 * 24], previewCacheSeries)
+queryClient.setQueryData(['cache-series', 24], {
+  ...previewCacheSeries,
+  since: previewCacheSeries.since,
+  points: previewCacheSeries.points.filter((p) => p.ts >= Math.floor(Date.now() / 1000) - 24 * 3600),
+})
+queryClient.setQueryData(['cache-series', 30 * 24], previewCacheSeries)
+
 const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   id: 1200 - index,
   ts: now - index * 73,

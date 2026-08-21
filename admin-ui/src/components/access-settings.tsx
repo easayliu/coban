@@ -495,8 +495,8 @@ export function LimitsSettingsContent() {
         <NumberSetting
           label={t('最多换号重试次数', 'Maximum retries across accounts')}
           description={t(
-            '0 表示不重试，把上游的 429 原样交回客户端。每次重试都要重发整个请求体，设得太大会让一条打不通的请求拖很久。',
-            'Set 0 to pass the upstream 429 straight back. Each retry resends the whole request body, so a large value makes a doomed request hang for a long time.',
+            '撞限流（429）时不受这个数字限制：那个号会被打上冷却，请求一路换到找出可用的号为止。这里管的是「连不上上游」那类故障——它慢、又要重发整个请求体，设得太大会让一条打不通的请求拖很久。0 表示完全不换号，把上游的判决（含 429）原样交回客户端。',
+            'Rate limits (429) are not bounded by this number: the account is cooled down and the request keeps rotating until it finds a usable one. This bounds unreachable-upstream failures instead — those are slow and resend the whole request body, so a large value makes a doomed request hang for a long time. Set 0 to disable rotation entirely and pass the upstream verdict (429 included) straight back.',
           )}
           value={data.rate_limit_retry_max}
           min={0}

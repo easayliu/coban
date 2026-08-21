@@ -37,6 +37,8 @@
   --color-success-foreground: var(--success-foreground);
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
+  /* 图表数据色，见下面 :root 里的注释——不与状态色共用。 */
+  --color-chart-1: var(--chart-1);
   /* 套餐档位专用色，见下面 :root 里的注释——不与状态色共用。 */
   --color-plan: var(--plan);
   --color-plan-foreground: var(--plan-foreground);
@@ -129,6 +131,12 @@
   --input: --alpha(var(--color-black) / 10%);
   --muted: --alpha(var(--color-black) / 4%);
   --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-black));
+  /* 图表数据色。同档位色一个道理：绿/琥珀/红是状态语义，柱子借过来会被读成「这一格健康
+     /告警」，而单序列图表要的恰恰是一个**不随取值变色**的固定色相——颜色跟着「这是哪条
+     序列」，不跟着「这个值高不高」（后者已经由柱高说了一遍）。故单开一族青。
+     深浅两个主题共用同一个值：cyan-600 在白底与深底上都同时满足亮度带、彩度下限与 3:1
+     对比度（用 dataviz 那个校验脚本量过，两边都全项通过），没必要为深色另挑一档。 */
+  --chart-1: var(--color-cyan-600);
   /* 套餐档位。绿/琥珀/红在这套界面里全是**状态**语义（健康/风险/故障），套餐借过来就会
      出现「绿色的 Pro」被读成「这个号很健康」。故档位单开一族紫，与状态色互不干涉；
      档位高低靠色相往洋红推进（Pro 蓝 → Max 紫 → Max 20x 洋红），见 tierBadgeVariant。 */
@@ -151,6 +159,9 @@
 
 .dark {
   --accent: --alpha(var(--color-white) / 4%);
+  /* 与浅色同值：cyan-600 在深底上同样过了亮度带与对比度（见 :root 处的注）。写在这里而不
+     是省掉，是为了让「深色这一档是挑过的」在代码里看得见——而不是被当成漏了一行。 */
+  --chart-1: var(--color-cyan-600);
   --accent-foreground: var(--color-neutral-100);
   --background: color-mix(in srgb, var(--color-neutral-950) 95%, var(--color-white));
   --border: --alpha(var(--color-white) / 6%);

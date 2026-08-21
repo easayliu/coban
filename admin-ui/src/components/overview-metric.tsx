@@ -1,14 +1,29 @@
-import type { ElementType } from 'react'
+import type { ElementType, ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 export function OverviewMetric({
-  label, value, status, icon: Icon, tone, active = false, onClick, className,
+  label, value, status, statusHint, trend, icon: Icon, tone, active = false, onClick, className,
 }: {
   label: string
   value: number | string
   status?: string
+  /**
+   * 整格的悬浮全文（可选）。
+   *
+   * 这一格在 lg 下只有一行的六分之一宽——值一大，status 就只剩一个「命…」，等于什么也没
+   * 说。带趋势的那格因此干脆不放 status，把该说的话放这里：**省掉的文案必须还有个地方能
+   * 读到全的**。挂在整格上而不是 status 那一段，为的就是没有 status 时它照样在。
+   */
+  statusHint?: string
+  /**
+   * 数值右边的迷你趋势（可选）。
+   *
+   * 只有「一段时间的量」才配得上一条趋势：`3 个可用` 那种当下状态画出来的曲线没有意义。
+   * 放在数值与 status 之间而不是另占一行——这一格的高度是四格一起排的，多一行就参差了。
+   */
+  trend?: ReactNode
   icon: ElementType<{ className?: string }>
   tone: 'ok' | 'bad' | 'warn' | 'neutral'
   active?: boolean
@@ -22,7 +37,7 @@ export function OverviewMetric({
     neutral: 'text-muted-foreground',
   }[tone]
   const content = (
-    <div className="flex min-h-16 items-center gap-3 px-3 py-2.5 sm:px-4">
+    <div className="flex min-h-16 items-center gap-3 px-3 py-2.5 sm:px-4" title={statusHint}>
       <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
         <Icon className={cn('size-4', iconClass)} aria-hidden />
       </span>
@@ -34,6 +49,7 @@ export function OverviewMetric({
           <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
             {value}
           </span>
+          {trend}
           {status && (
             <span className="min-w-0 truncate text-2xs text-muted-foreground" title={status}>
               {status}

@@ -26,10 +26,11 @@ use crate::web::AppState;
 
 /// 一次转发最多尝试几个凭证（含第一次）。
 ///
-/// 上限存在的意义是**不让一次客户端请求把所有账号轮一遍**：每次重试都要重发整个请求体，
-/// 账号多的时候一条打不通的请求能拖上几十秒，而客户端那头早就超时了。真正的换号次数
-/// 还受 [`store::RATE_LIMIT_RETRY_MAX`] 限制，这里只是硬顶。
-const MAX_ATTEMPTS: usize = 8;
+/// 这是硬顶，防的是号池很大时一条请求把整个池子走穿：每次换号都要重发整个请求体。
+/// 但它得**够走过一串已经没额度的号**——限流类拒绝是上游的瞬时快速拒绝（不生成、
+/// 不花钱），一条请求连撞五六个满额的号在真实号池里再普通不过，而顶太低的后果是
+/// 客户端拿到一个「其实还有好号能用」的 429（见 [`RotationBudget`]）。
+const MAX_ATTEMPTS: usize = 16;
 
 /// 记进日志的 UA 截断长度。完整 UA 可以很长，而认「谁在发」只需要前面那截。
 const UA_MAX_LEN: usize = 120;
@@ -94,13 +95,13 @@ pub async fn handle(
     let retry_max = state
         .store
         .get_setting_i64(store::RATE_LIMIT_RETRY_MAX, store::DEFAULT_RATE_LIMIT_RETRY_MAX);
-    // 允许的总尝试数 = 1 次首发 + retry_max 次换号，再被 MAX_ATTEMPTS 硬顶住。
-    let budget = ((retry_max.max(0) + 1) as usize).min(MAX_ATTEMPTS);
+    // 限流类拒绝一路换到号池走完（硬顶 MAX_ATTEMPTS），链路/上游故障由 retry_max 卡住。
+    let mut budget = RotationBudget::new(retry_max);
 
     let mut tried: Vec<i64> = Vec::new();
     let mut last: Option<Response> = None;
 
-    for attempt in 0..budget {
+    for attempt in 0..MAX_ATTEMPTS {
         let cred = match state.store.select(&tried, session_key.as_deref()) {
             Ok(c) => c,
             Err(e) => {
@@ -119,6 +120,10 @@ pub async fn handle(
                     "rpm limit reached, trying next"
                 );
                 last = Some(rate_limit_response(rl.retry_after_secs, &e.to_string()));
+                // 本地 RPM 满是限流的一种（而且连上游都没打），照 Credential 记。
+                if !budget.allows(Reject::Credential) {
+                    break;
+                }
                 continue;
             }
             return internal_error(&e);
@@ -142,14 +147,25 @@ pub async fn handle(
         .await
         {
             Ok(Outcome::Done(resp)) => return resp,
-            Ok(Outcome::TryNext(resp)) => {
+            Ok(Outcome::TryNext(reject, resp)) => {
+                let status = resp.status().as_u16();
+                last = Some(resp);
+                if !budget.allows(reject) {
+                    tracing::info!(
+                        cred_id = cred.id,
+                        attempt = attempt + 1,
+                        status,
+                        "upstream rejected this credential and the retry budget is spent; \
+                         handing the rejection back to the client"
+                    );
+                    break;
+                }
                 tracing::info!(
                     cred_id = cred.id,
                     attempt = attempt + 1,
-                    status = resp.status().as_u16(),
+                    status,
                     "upstream rejected this credential, trying the next one"
                 );
-                last = Some(resp);
             }
             Err(e) => {
                 tracing::warn!(cred_id = cred.id, error = %format!("{e:#}"), "forwarding failed");
@@ -158,10 +174,23 @@ pub async fn handle(
                     "upstream_error",
                     format!("{e:#}"),
                 ));
+                // 取不到 token（刷新失败）也归在这一类：换个号是有意义的，但它可能是
+                // 慢失败，不能无限换。
+                if !budget.allows(Reject::Upstream) {
+                    break;
+                }
             }
         }
     }
 
+    // 走到这里说明这条请求碰过的号全被拒了。attempts 是唯一能把「三个号都满额」和
+    // 「硬顶到了、池子里还有号」区分开的线索，日志里必须有。
+    if tried.len() >= MAX_ATTEMPTS {
+        tracing::warn!(
+            attempts = tried.len(),
+            "hit the per-request attempt cap; every credential tried was rejected"
+        );
+    }
     last.unwrap_or_else(|| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -200,8 +229,61 @@ pub async fn handle_chat(
 /// 一次转发的结果：定局，还是「换个号再来」。
 enum Outcome {
     Done(Response),
-    /// 上游拒了这个凭证（限流/额度/账号级错误）。附带的响应是兜底——重试全失败时交回它。
-    TryNext(Response),
+    /// 上游拒了这个凭证。附带的响应是兜底——换到最后全失败时交回它。
+    TryNext(Reject, Response),
+}
+
+/// 换号的理由。两类失败的代价与终止性都不一样，故要分开记（见 [`RotationBudget`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reject {
+    /// **这个号**现在不能用：限流、额度用尽、账号级错误。它当场被排掉（`exclude`）并
+    /// 打上冷却/停用，所以「再换一个」是严格向前走一遍号池，走得完、也走不回头。
+    Credential,
+    /// **这条链路或上游本身**的问题：连不上、出站被掐。换号有意义（逐账号代理各走各的
+    /// 出口），但它既不能证明哪个号坏了、也不会自己收敛，重发整个请求体的代价和超时
+    /// 风险全在这一类上。
+    Upstream,
+}
+
+/// 换号预算。
+///
+/// 分两类的理由：**限流不该由一个小数字来卡**。撞上限流的号已经被排掉并打了冷却，继续
+/// 换就是把号池里还能用的号找出来——这正是把一堆号挂在 coban 后面的全部意义；而一个默认
+/// 2 的预算会让「前三个号刚好都满额」变成客户端眼里的 429，哪怕后面还有十几个好号闲着。
+/// 于是限流类拒绝只受 [`MAX_ATTEMPTS`] 这道硬顶约束。
+///
+/// [`store::RATE_LIMIT_RETRY_MAX`] 管的是另一类：链路/上游故障。那类失败慢（超时）、
+/// 每次都要重发整个请求体、而且换号未必能好，正需要一个上限把注定打不通的请求早点判死。
+///
+/// `retry_max == 0` 仍是那个明确的关闭开关：一次都不换，上游的判决（含 429）原样交回
+/// 客户端，让它自己退避。
+struct RotationBudget {
+    rotate: bool,
+    upstream_left: usize,
+}
+
+impl RotationBudget {
+    fn new(retry_max: i64) -> Self {
+        let n = retry_max.max(0);
+        Self { rotate: n > 0, upstream_left: n as usize }
+    }
+
+    /// 这次失败之后还要不要再换一个号。会扣掉相应的额度。
+    fn allows(&mut self, reject: Reject) -> bool {
+        if !self.rotate {
+            return false;
+        }
+        match reject {
+            Reject::Credential => true,
+            Reject::Upstream => match self.upstream_left {
+                0 => false,
+                n => {
+                    self.upstream_left = n - 1;
+                    true
+                }
+            },
+        }
+    }
 }
 
 /// 用指定凭证发一次。
@@ -265,11 +347,14 @@ async fn forward_once(
             Err(e) => {
                 // 连接层失败不算这个账号的错（除非它配了个坏代理，而那在建客户端时就报了），
                 // 换个号重试一次是有意义的——尤其逐账号代理各走各的出口。
-                return Ok(Outcome::TryNext(error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_unreachable",
-                    format!("could not reach upstream: {e}"),
-                )));
+                return Ok(Outcome::TryNext(
+                    Reject::Upstream,
+                    error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_unreachable",
+                        format!("could not reach upstream: {e}"),
+                    ),
+                ));
             }
         };
 
@@ -289,14 +374,23 @@ async fn forward_once(
 
         if let Some(reason) = detect_account_error(status, &bytes) {
             state.store.mark_banned(cred.id, &reason)?;
-            return Ok(Outcome::TryNext(error_passthrough(status, &up_headers, bytes, chat)));
+            return Ok(Outcome::TryNext(
+                Reject::Credential,
+                error_passthrough(status, &up_headers, bytes, chat),
+            ));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let secs = retry_after_secs(&up_headers).unwrap_or_else(|| {
-                state.store.get_setting_i64(store::COOLDOWN_SECS, store::DEFAULT_COOLDOWN_SECS)
-            });
+            let secs = rate_limit_cooldown(state, &up_headers, &bytes);
+            tracing::info!(
+                cred_id = cred.id,
+                cooldown_secs = secs,
+                "upstream rate limited this credential, cooling it down and trying the next one"
+            );
             state.store.note_rate_limited(cred.id, secs);
-            return Ok(Outcome::TryNext(error_passthrough(status, &up_headers, bytes, chat)));
+            return Ok(Outcome::TryNext(
+                Reject::Credential,
+                error_passthrough(status, &up_headers, bytes, chat),
+            ));
         }
         // 上游解不开客户端捎来的加密推理：摘掉再发一遍。**不换号**——密文绑在产出它的那个
         // 号上，换到第三个号一样解不开；也不能就这么把 400 交回去——客户端下一轮还会把同一
@@ -1063,6 +1157,58 @@ fn retry_after_secs(headers: &wreq::header::HeaderMap) -> Option<i64> {
         .filter(|v| *v > 0)
 }
 
+/// 撞 429 之后这个号该冷却多久（秒）。
+///
+/// 三级取值：`retry-after` 头 → 体里的恢复提示（见 [`reset_hint_secs`]）→ 设置里的固定值。
+///
+/// 中间那一级是必须的：额度用尽那种 429（`usage_limit_reached`）**常常不给
+/// `retry-after`**，恢复时刻只写在体里，而固定值默认 60 秒——对一个几小时后才回血的号来说
+/// 太短，它一分钟后就回到候选里，把后面每条请求的换号次数又耗在同一个号上一次。
+fn rate_limit_cooldown(state: &AppState, headers: &wreq::header::HeaderMap, body: &[u8]) -> i64 {
+    retry_after_secs(headers).or_else(|| reset_hint_secs(body)).unwrap_or_else(|| {
+        state.store.get_setting_i64(store::COOLDOWN_SECS, store::DEFAULT_COOLDOWN_SECS)
+    })
+}
+
+/// 限流体里可能写着的「多久之后恢复」字段名。
+///
+/// 上游把它塞在哪一层是会变的（见过 `detail`、`error`、顶层三种），所以按**键名**在整个
+/// 体里找，而不是钉死几条 JSON 路径——钉死的话上游换一层嵌套就等于这个功能悄悄没了，
+/// 表现是号池明明有好号、客户端却隔一分钟被拒一次。
+const RESET_HINT_KEYS: &[&str] =
+    &["resets_in_seconds", "reset_after_seconds", "retry_after_seconds", "retry_after"];
+
+/// 在一段错误体里找恢复提示（秒）。
+///
+/// 深度封顶是防着上游哪天把整段对话回显在错误体里：那时递归的代价与体的大小成正比，
+/// 而要找的字段从来只在最外面几层。
+fn reset_hint_secs(body: &[u8]) -> Option<i64> {
+    fn secs(v: &serde_json::Value) -> Option<i64> {
+        // 字符串写法（`"resets_in_seconds":"3600"`）也认：同一个字段两种写法都见过，
+        // 只认数字的话取不到就退回那个太短的固定值，而那正是要修的毛病。
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            .map(|n| n.ceil() as i64)
+            .filter(|n| *n > 0)
+    }
+    fn walk(v: &serde_json::Value, depth: u8) -> Option<i64> {
+        if depth == 0 {
+            return None;
+        }
+        match v {
+            serde_json::Value::Object(m) => m
+                .iter()
+                .find_map(|(k, val)| {
+                    RESET_HINT_KEYS.contains(&k.as_str()).then(|| secs(val)).flatten()
+                })
+                .or_else(|| m.values().find_map(|val| walk(val, depth - 1))),
+            serde_json::Value::Array(a) => a.iter().find_map(|val| walk(val, depth - 1)),
+            _ => None,
+        }
+    }
+    walk(&serde_json::from_slice::<serde_json::Value>(body).ok()?, 6)
+}
+
 /// 额度用过阈值就把这个号暂停到窗口重置，**真的停了才返回 `true`**。
 ///
 /// 阈值默认 90%：留出余量，免得一条长请求跑到一半正好把额度撞穿——那时上游是直接掐断
@@ -1817,6 +1963,15 @@ pub async fn probe(state: &AppState, cred: &Credential, model: &str) -> ProbeRep
                     let mut sniffer = UsageSniffer::default();
                     sniffer.feed(&bytes);
                     log_probe_usage(state, cred, status, &sniffer, &quota, started);
+                    // 冷却是在读体之前按头打的（读体会把响应消费掉，而体可能读不完）。
+                    // 体读到了、头又没给 retry-after 时，以体里的恢复提示为准把它顶掉——
+                    // 理由同 [`rate_limit_cooldown`]。
+                    if status == StatusCode::TOO_MANY_REQUESTS
+                        && retry_after.is_none()
+                        && let Some(secs) = reset_hint_secs(&bytes)
+                    {
+                        state.store.note_rate_limited(cred.id, secs);
+                    }
                     // 命中封号特征照真实流量停用：判定器与转发共用同一个，测试报出「已封禁」
                     // 的同时列表里也变红，而不是弹窗一个结论、卡片另一个。
                     if let Some(reason) = detect_account_error(status, &bytes) {
@@ -2258,6 +2413,68 @@ mod tests {
         assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
         // 带 tools 只是多一份因模型而异的校验面，探测不需要。
         assert!(v.get("tools").is_none());
+    }
+
+    /// 限流换号**不能被那个小预算卡住**：撞满额的号已经被排掉并打了冷却，继续换才能把
+    /// 池子里还能用的号找出来。卡住的后果就是客户端拿到一个「其实还有好号闲着」的 429。
+    #[test]
+    fn rate_limited_credentials_do_not_spend_the_retry_budget() {
+        let mut b = RotationBudget::new(2);
+        // 默认预算是 2，但限流可以一路换下去（真正的上限是 MAX_ATTEMPTS）。
+        for _ in 0..MAX_ATTEMPTS * 2 {
+            assert!(b.allows(Reject::Credential));
+        }
+        // 链路故障仍旧只有 retry_max 次：那类失败慢、又不会自己收敛。
+        assert!(b.allows(Reject::Upstream));
+        assert!(b.allows(Reject::Upstream));
+        assert!(!b.allows(Reject::Upstream));
+        // 上游预算花光了也不影响继续换限流的号——两类额度各记各的。
+        assert!(b.allows(Reject::Credential));
+    }
+
+    /// `0` 是那个明确的关闭开关：一次都不换，上游的判决原样交回客户端。
+    #[test]
+    fn a_zero_budget_still_means_no_rotation_at_all() {
+        let mut b = RotationBudget::new(0);
+        assert!(!b.allows(Reject::Credential));
+        assert!(!b.allows(Reject::Upstream));
+        // 负值（历史脏数据）按 0 算，不能变成「无限换」。
+        let mut b = RotationBudget::new(-3);
+        assert!(!b.allows(Reject::Credential));
+    }
+
+    /// 额度用尽那种 429 常常不给 `retry-after`，恢复时刻只写在体里。取不到它就退回默认的
+    /// 60 秒，那个号一分钟后回到候选里，再把下一条请求的换号次数耗在它身上一次。
+    #[test]
+    fn the_cooldown_falls_back_to_the_reset_hint_in_the_body() {
+        // 上游 2026-08 的原话，一字未改：额度用满那种 429 **没有 `retry-after` 头**，
+        // 恢复时刻只写在 `error.resets_in_seconds` 里（这里是 5 天）。少了这一级，那个号
+        // 60 秒后就回到候选，把后面每条请求的换号次数又耗在它身上一次。
+        let real = br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1787743750,"eligible_promo":null,"resets_in_seconds":438570}}"#;
+        assert_eq!(reset_hint_secs(real), Some(438570));
+        // 同一段体走判定器：它是限流，不是账号级错误——判成后者会把一个只是用满了的号
+        // 直接停用，而它几天后自己就回血了。
+        assert!(detect_account_error(StatusCode::TOO_MANY_REQUESTS, real).is_none());
+
+        // 见过的三种嵌法都要认出来。
+        assert_eq!(
+            reset_hint_secs(
+                br#"{"detail":{"type":"usage_limit_reached","resets_in_seconds":7200}}"#
+            ),
+            Some(7200)
+        );
+        assert_eq!(
+            reset_hint_secs(
+                br#"{"error":{"message":"limit reached","reset_after_seconds":"900"}}"#
+            ),
+            Some(900)
+        );
+        assert_eq!(reset_hint_secs(br#"{"retry_after":1.2}"#), Some(2), "秒数向上取整");
+        // 没有提示、不是 JSON、提示不是个正数：都交给上层退回配置里的固定值。
+        assert!(reset_hint_secs(br#"{"detail":"You have hit your usage limit."}"#).is_none());
+        assert!(reset_hint_secs(b"<html>attention required</html>").is_none());
+        assert!(reset_hint_secs(br#"{"resets_in_seconds":0}"#).is_none());
+        assert!(reset_hint_secs(br#"{"resets_in_seconds":"soon"}"#).is_none());
     }
 
     /// 上游拒绝的形状不止一种：JSON 的取 `error.type`/`error.message`，非 JSON（CDN 拦截页、

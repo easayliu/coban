@@ -466,6 +466,77 @@ export function formatPercent(rate: number | null): string {
   return `${rounded}%`
 }
 
+/** 趋势图的分桶粒度。小时用于近 24 小时，天用于更长的跨度。 */
+export type CacheGranularity = 'hour' | 'day'
+
+/** 趋势图里的一格。`hasTraffic` 为 false 时这一格没有请求，命中率**不存在**（不是 0）。 */
+export interface CacheSlot {
+  /** 这一格的起点（Unix 秒），按**浏览器本地时区**对齐。 */
+  ts: number
+  inputTokens: number
+  cachedTokens: number
+  hasTraffic: boolean
+}
+
+/**
+ * 把后端那串逐小时的点铺成**连续的**若干格，供趋势图直接按顺序画。
+ *
+ * 两件事只能在这里做，服务端做不了：
+ * - **补齐空格**。后端只回有请求的小时（见 `CacheSeries.points` 的注），而图上必须留出
+ *   静默时段的位置——否则两根相邻的柱子看着像连续的两小时，实际中间隔了半天。
+ * - **按本地时区合「天」**。服务端按 UTC 切出来的一天在 UTC+8 看是 08:00–08:00；这里用
+ *   `Date` 逐日回退，顺带把夏令时那两天的 23/25 小时算对。
+ *
+ * 落在最早那一格之前的点直接丢掉：那是请求跨度之外的东西，硬塞进第一格会让它凭空变胖。
+ */
+export function bucketCacheSeries(
+  points: readonly { ts: number; input_tokens: number; cached_tokens: number }[],
+  granularity: CacheGranularity,
+  slots: number,
+  nowMs: number = Date.now(),
+): CacheSlot[] {
+  const localDayStart = (ms: number) => {
+    const d = new Date(ms)
+    d.setHours(0, 0, 0, 0)
+    return d
+  }
+  // 先摆出格子的起点，从最近那一格往回数。
+  const starts: number[] = []
+  if (granularity === 'hour') {
+    const last = Math.floor(nowMs / 1000 / 3600) * 3600
+    for (let i = slots - 1; i >= 0; i--) starts.push(last - i * 3600)
+  } else {
+    const cursor = localDayStart(nowMs)
+    // 先回退到最早那一天，再逐日往前推：`setDate` 认日历，夏令时那天不会漂一小时。
+    cursor.setDate(cursor.getDate() - (slots - 1))
+    for (let i = 0; i < slots; i++) {
+      starts.push(Math.floor(cursor.getTime() / 1000))
+      cursor.setDate(cursor.getDate() + 1)
+    }
+  }
+
+  const out: CacheSlot[] = starts.map((ts) => ({
+    ts,
+    inputTokens: 0,
+    cachedTokens: 0,
+    hasTraffic: false,
+  }))
+  const indexOf = new Map(starts.map((ts, i) => [ts, i]))
+  for (const p of points) {
+    const key =
+      granularity === 'hour'
+        ? Math.floor(p.ts / 3600) * 3600
+        : Math.floor(localDayStart(p.ts * 1000).getTime() / 1000)
+    const i = indexOf.get(key)
+    if (i == null) continue
+    out[i].inputTokens += p.input_tokens
+    out[i].cachedTokens += p.cached_tokens
+    // 后端已经把「没有可谈的命中率」的小时滤掉了，能落进来的就是有流量的。
+    out[i].hasTraffic = true
+  }
+  return out
+}
+
 /** 美元金额格式化：极小额多留几位小数，便于看清单次费用。 */
 export function formatUsd(v: number): string {
   if (!v || v <= 0) return '$0.00'

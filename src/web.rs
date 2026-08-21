@@ -119,6 +119,7 @@ pub async fn run(
         .route("/credentials/{id}/usage", get(list_credential_usage))
         .route("/usage", get(list_usage))
         .route("/metrics", get(get_metrics))
+        .route("/metrics/cache-series", get(get_cache_series))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
@@ -896,6 +897,42 @@ async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>,
         input_tokens_total: input_tokens,
         cached_tokens_total: cached_tokens,
     }))
+}
+
+#[derive(Deserialize)]
+struct CacheSeriesQuery {
+    /// 回看多少小时。缺省 7 天——比 24 小时更能看出「调完粘性有没有效果」，又不至于把
+    /// 一次调整摊薄在 30 天里。
+    #[serde(default = "default_cache_series_hours")]
+    hours: i64,
+}
+
+fn default_cache_series_hours() -> i64 {
+    7 * 24
+}
+
+#[derive(Serialize)]
+struct CacheSeriesResp {
+    /// 这条曲线的起点（Unix 秒）。**由服务端回**而不是让前端自己算：夹过之后的真实起点
+    /// 可能比它要的短（流水只留 30 天），x 轴该照真实的那个画。
+    since: i64,
+    /// 桶宽，固定 3600。写进响应而不是让前端假定：哪天服务端改了分桶，画图那头不该跟着错。
+    bucket_secs: i64,
+    points: Vec<store::CacheBucket>,
+}
+
+/// 全池缓存命中率的逐小时流水合计。比率不在这里算，见 [`store::CacheBucket`]。
+async fn get_cache_series(
+    State(state): State<AppState>,
+    Query(q): Query<CacheSeriesQuery>,
+) -> Result<Json<CacheSeriesResp>, ApiError> {
+    // 上限就是流水的保留期：问得更远也只能拿到被裁剩下的那一段，不如把跨度如实夹住，
+    // 好过回一条无声变短的曲线。
+    let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
+    let hours = q.hours.clamp(1, max_hours);
+    let since = crate::credentials::now_secs() as i64 - hours * 3600;
+    let points = state.store.cache_series(since).map_err(internal)?;
+    Ok(Json(CacheSeriesResp { since, bucket_secs: 3600, points }))
 }
 
 // ---------- 设置 ----------

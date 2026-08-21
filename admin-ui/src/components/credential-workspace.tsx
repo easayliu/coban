@@ -22,6 +22,16 @@ import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
+import {
+  CacheHitSparkline,
+  aggregateCacheHitRate,
+  cacheTotalsText,
+} from '@/components/cache-hit-chart'
+import {
+  CacheHitTrendDialog,
+  DEFAULT_CACHE_RANGE,
+  useCacheSeries,
+} from '@/components/cache-hit-trend-dialog'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialLoadingState } from '@/components/credential-loading'
 import {
@@ -68,7 +78,7 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { useI18n, type Language } from '@/lib/i18n'
 import { useDebounced } from '@/lib/use-debounced'
-import { cacheHitRate, cn, displayCredentialLabel, extractError, formatPercent, formatTokens } from '@/lib/utils'
+import { cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
 
 export type CredentialFilterKey =
   | 'all'
@@ -340,13 +350,19 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   // 实时指标单独轮询，10 秒一次：全局 RPM 与在途并发都是秒级变化的量，跟着账号列表那份
   // 30 秒的节奏走就成了「一直在看十几秒前的现场」。这个接口只有两条查询，拉得起。
   const metricsQuery = useQuery({ queryKey: ['metrics'], queryFn: getMetrics, refetchInterval: 10_000 })
-  // 全池缓存命中率：**按 token 加权**（两个终身累计相除），不是各账号命中率的平均——后者会
-  // 让一个只跑过两条小请求的号与主力号等权，一眼看去像是命中率崩了。数据还没到 / 一条都没
-  // 跑过时是 null，那时显示 `—`，而不是一个看着像坏消息的 0%。
-  const poolCacheRate = cacheHitRate(
-    metricsQuery.data?.input_tokens_total,
-    metricsQuery.data?.cached_tokens_total,
-  )
+  /**
+   * 全池缓存命中率：**一段时间**（默认近 7 天）的，不是终身累计的。
+   *
+   * 终身那个数是个几乎不动的分数——跑了一个月之后，今天把粘性调好或调坏，它当天最多挪
+   * 零点几个百分点，等于看不见。而这一格存在的意义恰恰是「我刚改的东西有没有用」，所以
+   * 口径必须是窗口。终身那个留着，作为参照写在趋势对话框的脚注里。
+   *
+   * 按 token 加权（两个合计相除），不是各账号/各时段命中率的平均——后者会让一个只跑过两条
+   * 小请求的号与主力号等权，一眼看去像是命中率崩了。
+   */
+  const cacheSeries = useCacheSeries(DEFAULT_CACHE_RANGE)
+  const poolCache = aggregateCacheHitRate(cacheSeries.slots)
+  const [cacheTrendOpen, setCacheTrendOpen] = useState(false)
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
   const filterItems = useMemo(
@@ -829,21 +845,31 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               active={filter === 'paused'}
               onClick={() => selectMetric('paused')}
             />
-            {/* 缓存命中率与右边的实时流量一样不来自账号列表、也点不动：它讲的是「转发出去的
-                请求质量如何」。摆在实时流量左边——两格都是流量的属性，凑在一起读。
+            {/* 缓存命中率不来自账号列表，点开是趋势而不是筛选——它讲的是「转发出去的请求质量
+                如何」，而那是随时间走的东西，一个当下的数字看不出「改动有没有用」。摆在实时
+                流量左边：两格都是流量的属性，凑在一起读。
                 窄屏各占一整行：这一格的 status 是一串 token 数，挤成半格就只剩省略号。 */}
             <OverviewMetric
               className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0"
-              label={t('缓存命中率', 'Cache hit rate')}
-              value={formatPercent(poolCacheRate)}
-              status={poolCacheRate == null
-                ? t('暂无用量', 'No usage yet')
+              label={t('缓存命中率 · 近 7 天', 'Cache hit rate · 7d')}
+              value={formatPercent(poolCache.rate)}
+              trend={
+                poolCache.rate == null ? undefined : (
+                  <CacheHitSparkline slots={cacheSeries.slots} className="shrink-0" />
+                )
+              }
+              // 有数时不放 status：这一格塞不下第三样东西，两个 token 数会被截成「命…」。
+              // 它们跟着 statusHint 进悬浮提示，也在点开的趋势里。
+              status={poolCache.rate == null ? t('暂无用量', 'No usage yet') : undefined}
+              statusHint={poolCache.rate == null
+                ? undefined
                 : t(
-                    `命中 ${formatTokens(metricsQuery.data?.cached_tokens_total ?? 0)} / 输入 ${formatTokens(metricsQuery.data?.input_tokens_total ?? 0)}`,
-                    `${formatTokens(metricsQuery.data?.cached_tokens_total ?? 0)} of ${formatTokens(metricsQuery.data?.input_tokens_total ?? 0)} input`,
+                    `${cacheTotalsText(poolCache.cachedTokens, poolCache.inputTokens, t)}（按 token 加权，不是各账号命中率的平均）。点开看趋势。`,
+                    `${cacheTotalsText(poolCache.cachedTokens, poolCache.inputTokens, t)} (token-weighted, not an average of per-account rates). Click for the trend.`,
                   )}
               icon={DatabaseZapIcon}
-              tone={poolCacheRate == null ? 'neutral' : poolCacheRate >= 0.5 ? 'ok' : 'warn'}
+              tone={poolCache.rate == null ? 'neutral' : poolCache.rate >= 0.5 ? 'ok' : 'warn'}
+              onClick={() => setCacheTrendOpen(true)}
             />
             {/* 唯一一格不来自账号列表、也点不动的指标：它讲的是「此刻代理在干什么」，
                 而不是「池子里有几个号处于某状态」。窄屏独占一整行，别把它挤成半格。 */}
@@ -990,6 +1016,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           )}
         </div>
       </section>
+
+      {/* 趋势对话框挂在最外层：它讲的是全池，不属于上面任何一段。终身口径顺手传进去当参照。 */}
+      <CacheHitTrendDialog
+        open={cacheTrendOpen}
+        onOpenChange={setCacheTrendOpen}
+        metrics={metricsQuery.data}
+      />
     </div>
   )
 }
