@@ -224,7 +224,7 @@ export function CredentialUsageDialog({
             </div>
             <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">
               {t(
-                '流水仅保留最近 30 天；卡片累计花费来自终身账本，因此两者无需相等。',
+                '流水仅保留最近 30 天；卡片上的累计花费来自历史账本，因此两者无需相等。',
                 'Logs are retained for 30 days; the card uses the lifetime ledger, so the totals are not expected to match.',
               )}
             </p>

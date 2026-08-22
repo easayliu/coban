@@ -35,6 +35,19 @@ const MAX_ATTEMPTS: usize = 16;
 /// 记进日志的 UA 截断长度。完整 UA 可以很长，而认「谁在发」只需要前面那截。
 const UA_MAX_LEN: usize = 120;
 
+/// 解析不出恢复时刻时，额度类暂停退回的固定值（秒）。
+///
+/// 15 分钟：短到「万一猜错了、其实早就该回血」不至于白关一个号，长到不会每分钟把同一个
+/// 号放回去再撞一次墙。两处共用（按阈值预停与撞上额度墙），各写一份必然会写出两个数。
+const QUOTA_PAUSE_FALLBACK_SECS: i64 = 15 * 60;
+
+/// 上游错误体记进日志的截断长度。那句给人看的话从来不长，长的是它回显的请求内容。
+const UPSTREAM_MSG_MAX: usize = 300;
+
+/// `debug` 那行原样打印请求体的截断长度。够看清头部的字段与前几条消息，又不至于把一条
+/// 几百 KB 的对话整个刷进日志。
+const REJECTED_BODY_MAX: usize = 4096;
+
 /// 转发入口。
 pub async fn handle(
     State(state): State<AppState>,
@@ -501,6 +514,31 @@ async fn forward_once(
             ));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
+            // 额度用尽与突发限流是两件事，处置也就不一样，见 [`detect_usage_limit`]。
+            if detect_usage_limit(&bytes) {
+                let secs = usage_limit_pause_secs(&up_headers, &bytes, &quota);
+                tracing::warn!(
+                    cred_id = cred.id,
+                    pause_secs = secs,
+                    "upstream says this credential's usage limit is reached; \
+                     pausing it until the quota resets"
+                );
+                if let Err(e) = state.store.pause_for_rate_limit(cred.id, secs) {
+                    // 落库失败就退回进程内冷却：这一轮别再选中它，比什么都不做强。
+                    tracing::warn!(
+                        cred_id = cred.id,
+                        error = %format!("{e:#}"),
+                        "could not pause the credential; falling back to an in-memory cooldown"
+                    );
+                    state.store.note_rate_limited(cred.id, secs);
+                }
+                // **不就地等**：恢复时刻在几小时之后，而这个号已经被停用了——在一个停用的
+                // 号上等着重发，等于把刚下的判决当场推翻。
+                return Ok(Outcome::TryNext(
+                    Reject::RateLimited,
+                    error_passthrough(status, &up_headers, bytes, chat),
+                ));
+            }
             let secs = rate_limit_cooldown(state, &up_headers, &bytes);
             // 冷却先打上，两条路都要：换号那条靠它把这个号排出选号，就地等那条靠它让
             // **别的**请求别再撞同一堵墙——而等的时长与冷却是同一个数，睡醒时它自己就
@@ -551,6 +589,28 @@ async fn forward_once(
             continue;
         }
         // 其余（400/404/422…）是这条请求本身的问题，换号也不会好，原样交回。
+        //
+        // **这一行是唯一的排查材料**：原样交回之后 coban 这边什么都不剩，用量流水里只有
+        // 一个光秃秃的 400，而客户端那头通常只显示一句「请求失败」。上游那句话 + 请求体的
+        // 形状 + 谁发的，三样凑齐才定位得到是哪个接入方写错了哪个字段。
+        tracing::warn!(
+            cred_id = cred.id,
+            status = status.as_u16(),
+            path = %path,
+            ua = %ua_of(headers).unwrap_or_default(),
+            upstream = %upstream_message(&bytes),
+            body = %body_shape(&fwd_body),
+            "upstream rejected the request itself; it is the request that is wrong, not the account"
+        );
+        // 形状不够用时的下一步。默认不打：请求体里是用户的整段对话。
+        tracing::debug!(
+            cred_id = cred.id,
+            body = %String::from_utf8_lossy(&fwd_body)
+                .chars()
+                .take(REJECTED_BODY_MAX)
+                .collect::<String>(),
+            "the body upstream rejected"
+        );
         return Ok(Outcome::Done(error_passthrough(status, &up_headers, bytes, chat)));
     };
 
@@ -805,9 +865,10 @@ fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized,
 
 /// 把 `responses` 请求体钉成上游要的样子：`store: false`、`stream: true`。
 ///
-/// 上游对这两项都是硬约束，且各自的 400 长得一模一样地不讲道理：
+/// 上游对这几项都是硬约束，且各自的 400 长得一模一样地不讲道理：
 /// - `store` 漏传或传 `true` → `Store must be set to false`（会话不落在 ChatGPT 侧）；
-/// - `stream` 漏传或传 `false` → `Stream must be set to true`（这条路径只出 SSE）。
+/// - `stream` 漏传或传 `false` → `Stream must be set to true`（这条路径只出 SSE）；
+/// - `input` 给一段裸文本 → `Input must be a list`（见 [`normalize_input_shape`]）。
 ///
 /// codex CLI 两项都带对了，但照 OpenAI 官方 Responses API 写的客户端不会——那边 `store`
 /// 默认 `true`、`stream` 默认 `false`，两条默认值正好都踩在雷上。改写只此一处：这是上游的
@@ -833,7 +894,9 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
     };
     // 趁体已经解开算指纹：为此再解析一遍是白花的 CPU——真实流量里这个体有几百 KB。
     // **排在算指纹之前**：指纹里就含 tools 及其顺序，反过来的话前缀稳住了而落点还在跟着
-    // 客户端那个乱序变——两件事必须用同一份顺序。
+    // 客户端那个乱序变——两件事必须用同一份顺序。裸文本的 `input` 同理，得先包成列表，
+    // 否则指纹与 `input_len` 认的是一个上游根本不会接受的形状。
+    let rewrote_input = normalize_input_shape(&mut obj);
     let reordered = sort_tools && normalize_tool_order(&mut obj);
     let prefix = prefix_parts(&obj);
     let input_len = obj.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
@@ -842,7 +905,7 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
     let collapse = obj.get("stream") != yes;
     // 先扫参数、再判快路径：要不要重新序列化取决于**真的丢掉了东西**，而不是某个字段在不在。
     let dropped = drop_unsupported_params(&mut obj);
-    if !collapse && obj.get("store") == no && !dropped && !reordered {
+    if !collapse && obj.get("store") == no && !dropped && !reordered && !rewrote_input {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
         return Normalized { body, collapse, chat: None, prefix, input_len };
     }
@@ -853,6 +916,32 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
         Err(_) => Normalized { body, collapse, chat: None, prefix, input_len },
     }
+}
+
+/// `input` 给的是一段裸文本时，包成上游要的那一条用户消息。回「是否真的改过」。
+///
+/// OpenAI 官方 Responses API 允许 `input` 直接给字符串（`input: "hi"` 是那条消息的简写，
+/// 官方 SDK 的第一个示例就是这么写的），而订阅这条路径只认列表，回的是
+/// `Input must be a list`——客户端那头看到的只是一句「请求失败」，指不到是哪个字段。
+/// 与钉 `store`/`stream` 同一个取舍：这是上游的硬约束而不是用户的选择，让每个接入方各自
+/// 去踩一遍没有意义。codex CLI 本来就发列表，这段对它是空动作。
+///
+/// **只认字符串这一种**。列表原样放过；别的形状（数字、对象、null）不猜——那不是官方
+/// 允许的写法，替它包一层只会把一个明确的 400 变成一段语义可疑的请求。
+fn normalize_input_shape(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(text) = obj.get("input").and_then(|v| v.as_str()).map(str::to_owned) else {
+        return false;
+    };
+    // 内容块的形状照 [`crate::chat`] 翻出来的那份：两条线格式发上去的用户消息必须长得
+    // 一样，否则同一段对话走两条路会算出两个指纹，缓存白丢一次。
+    obj.insert(
+        "input".to_owned(),
+        serde_json::json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }],
+        }]),
+    );
+    true
 }
 
 /// 上游拒收、且**丢了客户端察觉不到**的参数。逐个实测过，回的都是
@@ -1283,6 +1372,60 @@ fn ua_of(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.chars().take(UA_MAX_LEN).collect())
 }
 
+/// 上游错误体里那句**给人看的话**。见过的几种嵌法都认，都取不到就退回截断的原文。
+///
+/// 单独抽出来是因为原文常常是一整段带回显的 JSON，而排查只需要那一句
+/// （`Input must be a list`、`Unsupported parameter: temperature`……）。
+fn upstream_message(body: &[u8]) -> String {
+    let text = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            ["/error/message", "/detail/message", "/message", "/detail"]
+                .iter()
+                .find_map(|ptr| v.pointer(ptr).and_then(|m| m.as_str()).map(str::to_owned))
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    text.chars().take(UPSTREAM_MSG_MAX).collect()
+}
+
+/// 一份请求体的**形状**：顶层字段名 + 类型 + 长度，不含任何内容。
+///
+/// 上游把请求本身判死（400/422）时，这是排查的第一手材料——`Input must be a list` 这类
+/// 形状错，看一眼 `input=string(23)` 就定位到了，不必去猜是哪个客户端怎么写的。
+///
+/// **只报形状不报内容**：请求体里是用户的整段对话，不该为了查一条 400 把它写进日志。
+/// 要原文另有一行 `debug`（`RUST_LOG=coban=debug`）。布尔与数字照原样打——`stream=bool(false)`
+/// 正是要看的东西，而它们不可能是对话内容；字符串只报字符数，唯独 `model` 例外，那是排查
+/// 时最要紧的一个字段，也不可能是用户内容。
+///
+/// 字段顺序**照客户端发来的原样**（`preserve_order`），不排序：顺序本身就是「这是哪个
+/// 客户端」的线索，排一遍等于把它抹掉。
+fn body_shape(body: &[u8]) -> String {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice::<serde_json::Value>(body)
+    else {
+        return format!("<not a JSON object, {} bytes>", body.len());
+    };
+    obj.iter()
+        .map(|(k, v)| match (k.as_str(), v) {
+            ("model", serde_json::Value::String(m)) => format!("model={m}"),
+            _ => format!("{k}={}", value_shape(v)),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 一个 JSON 值的类型与规模，见 [`body_shape`]。
+fn value_shape(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null".to_owned(),
+        serde_json::Value::Bool(b) => format!("bool({b})"),
+        serde_json::Value::Number(n) => format!("number({n})"),
+        serde_json::Value::String(s) => format!("string({})", s.chars().count()),
+        serde_json::Value::Array(a) => format!("array[{}]", a.len()),
+        serde_json::Value::Object(o) => format!("object{{{}}}", o.len()),
+    }
+}
+
 // ---------- 响应构造 ----------
 
 /// 按上游响应构造回给客户端的响应头。
@@ -1491,6 +1634,47 @@ fn retry_after_secs(headers: &wreq::header::HeaderMap) -> Option<i64> {
         .filter(|v| *v > 0)
 }
 
+/// 这条 429 是不是「额度用尽」（`usage_limit_reached`）。
+///
+/// 与突发限流的区别只有一条，但那一条决定了处置方式：**恢复时刻在几小时甚至几天之后**。
+/// 那种号打一个进程内冷却是不够的——
+/// - 冷却表在内存里，重启就没了，那个号立刻回到候选里再撞一次墙；
+/// - 页面上它显示成「冷却中，还有 N 秒」，而 N 是个五位数，读起来像是出了故障；
+/// - 冷却本来的用途是「几十秒后再来试试」，用它表达「这个号这周用完了」是名不副实。
+///
+/// 所以这一类改走 [`CredentialStore::pause_for_rate_limit`]：按恢复时刻**落库**暂停，
+/// 到点由选号那头惰性放回池子（`resume_due`），界面上显示「限流暂停，X 时自动恢复」，
+/// 也不算作需要人处理的账号。突发限流仍走冷却——几十秒的事，落库反而太重。
+///
+/// 判据取上游自己给的 `type`，同时认那句 message。2026-08 实测原话：
+/// `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached",
+/// "plan_type":"pro","resets_at":…,"resets_in_seconds":438570}}`。两个都认是因为只认一个的话，
+/// 上游哪天改掉其中之一，这个功能就悄悄没了——而表现是那个号每分钟回来撞一次墙。
+fn detect_usage_limit(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("usage_limit_reached") || text.contains("usage limit has been reached")
+}
+
+/// 额度用尽的号该暂停到多久之后（秒）。
+///
+/// 四级取值：`retry-after` 头 → 体里的恢复提示（`resets_in_seconds`）→ **这次响应带的额度
+/// 快照**（`x-codex-*-reset-at`）→ 保守的固定值。
+///
+/// 第三级是这一类独有的：额度用尽那种 429 常常不给 `retry-after`，而它**照样带那组限流头**
+/// （见 [`config`] 里 `RL_PRIMARY_RESET_AT` 那条注），于是体里没写恢复时刻时还能从头里读到。
+/// 全都取不到才退回固定值——猜一个错的恢复时刻，要么让号提前放出来继续撞墙，要么把它多关
+/// 几个小时。
+fn usage_limit_pause_secs(
+    headers: &wreq::header::HeaderMap,
+    body: &[u8],
+    quota: &QuotaSnapshot,
+) -> i64 {
+    retry_after_secs(headers)
+        .or_else(|| reset_hint_secs(body))
+        .or_else(|| quota.secs_until_reset())
+        .unwrap_or(QUOTA_PAUSE_FALLBACK_SECS)
+}
+
 /// 撞 429 之后这个号该冷却多久（秒）。
 ///
 /// 三级取值：`retry-after` 头 → 体里的恢复提示（见 [`reset_hint_secs`]）→ 设置里的固定值。
@@ -1560,7 +1744,7 @@ fn maybe_pause_on_quota(state: &AppState, cred: &Credential, quota: &QuotaSnapsh
         return false;
     }
     // 暂停到窗口重置为止；解析不出重置时刻就退回一个保守的固定值。
-    let secs = quota.secs_until_reset().unwrap_or(15 * 60);
+    let secs = quota.secs_until_reset().unwrap_or(QUOTA_PAUSE_FALLBACK_SECS);
     tracing::warn!(
         cred_id = cred.id,
         used_pct = used,
@@ -2836,6 +3020,34 @@ mod tests {
         assert_eq!(off.allows(1), None);
     }
 
+    /// 额度用尽那种 429 不该只打个进程内冷却：恢复时刻在几小时甚至几天之后，而冷却重启即失、
+    /// 界面上还显示成一个五位数的「还有 N 秒」。它该按恢复时刻落库暂停，到点自己回池子。
+    #[test]
+    fn a_usage_limit_429_is_told_apart_from_a_burst_rate_limit() {
+        // 上游 2026-08 的原话，一字未改。
+        let exhausted = br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1787743750,"resets_in_seconds":438570}}"#;
+        assert!(detect_usage_limit(exhausted));
+        // message 那半边单独也认得出来：只认 type 的话，上游改个字这功能就悄悄没了。
+        assert!(detect_usage_limit(br#"{"detail":"The usage limit has been reached"}"#));
+
+        // 突发限流不能被误判成额度用尽——那会把一个几十秒就回血的号关上一刻钟。
+        assert!(!detect_usage_limit(
+            br#"{"error":{"type":"rate_limit_exceeded","message":"Too many requests"}}"#
+        ));
+        assert!(!detect_usage_limit(b""));
+
+        // 暂停时长按体里的恢复提示走（这里是 5 天多），而不是那个 15 分钟的兜底。
+        let none = wreq::header::HeaderMap::new();
+        let empty = QuotaSnapshot::default();
+        assert_eq!(usage_limit_pause_secs(&none, exhausted, &empty), 438_570);
+        // 体里什么都没写时退回固定值：猜一个错的恢复时刻，要么提前放出来继续撞墙、
+        // 要么白关几个小时。
+        assert_eq!(
+            usage_limit_pause_secs(&none, br#"{"error":{"type":"usage_limit_reached"}}"#, &empty),
+            QUOTA_PAUSE_FALLBACK_SECS
+        );
+    }
+
     /// 额度用尽那种 429 常常不给 `retry-after`，恢复时刻只写在体里。取不到它就退回默认的
     /// 60 秒，那个号一分钟后回到候选里，再把下一条请求的换号次数耗在它身上一次。
     #[test]
@@ -3519,6 +3731,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(key(&one), key(&other), "server_label 撞了也得排得出确定的次序");
+    }
+
+    /// 上游把请求本身判死时，日志里那两样东西必须真的指得到病灶：上游那句话，以及
+    /// 请求体的形状——而形状里**不能有对话内容**，那是用户的东西。
+    #[test]
+    fn the_rejected_request_is_described_without_leaking_its_content() {
+        // 上游 400 的原话（形状照 `Input must be a list` 那次）。
+        let err = br#"{"error":{"message":"Input must be a list","type":"invalid_request_error"}}"#;
+        assert_eq!(upstream_message(err), "Input must be a list");
+        // 解不出结构就退回原文，别把唯一的线索吞掉。
+        assert_eq!(upstream_message(b"upstream is angry"), "upstream is angry");
+
+        // 普通字符串再取字节：byte string 字面量只认 ASCII，而这里要的正是一段中文内容。
+        let shape = body_shape(
+            r#"{"model":"gpt-5","input":"写一句睡前故事","stream":false,"temperature":0.7,
+                "tools":[{"name":"a"},{"name":"b"}],"text":{"verbosity":"low"},"metadata":null}"#
+                .as_bytes(),
+        );
+        // 病灶一眼可见：input 是字符串不是列表。
+        assert!(shape.contains("input=string(7)"), "{shape}");
+        // 型号照打（排查最要紧的一个字段，且不可能是用户内容），布尔与数字也照打。
+        assert!(shape.contains("model=gpt-5"), "{shape}");
+        assert!(shape.contains("stream=bool(false)"), "{shape}");
+        assert!(shape.contains("temperature=number(0.7)"), "{shape}");
+        assert!(shape.contains("tools=array[2]"), "{shape}");
+        assert!(shape.contains("text=object{1}"), "{shape}");
+        assert!(shape.contains("metadata=null"), "{shape}");
+        // **一个字的对话内容都不许出现**。
+        assert!(!shape.contains("睡前"), "{shape}");
+        // 字段顺序照客户端发来的原样，那本身就是「这是哪个客户端」的线索。
+        assert!(shape.starts_with("model=gpt-5 input="), "{shape}");
+
+        // 非 JSON 体不崩，报个长度就够了。
+        assert_eq!(body_shape(b"not json at all"), "<not a JSON object, 15 bytes>");
+    }
+
+    /// `input` 给一段裸文本是官方 SDK 的头号写法（`client.responses.create(input="hi")`），
+    /// 而订阅这条路径只认列表，原样转上去就是一句 `Input must be a list`。
+    #[test]
+    fn a_bare_string_input_is_wrapped_into_the_list_upstream_wants() {
+        let n =
+            plan_request("responses", Bytes::from_static(br#"{"model":"m","input":"hi"}"#), false)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
+        assert_eq!(v["input"][0]["role"], "user");
+        assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(v["input"][0]["content"][0]["text"], "hi");
+        // 包完才算指纹与项数：算在包之前的话，认的是一个上游根本不会接受的形状。
+        assert_eq!(n.input_len, 1);
+        assert!(key(&n).is_some());
+        // 顺手确认 store/stream 也一并钉上了——重新序列化那条路要走全。
+        assert_eq!(v["store"], false);
+        assert_eq!(v["stream"], true);
+
+        // 与 chat 那条路翻出来的用户消息**逐字节同形**：不同形的话，同一段对话走两条线
+        // 格式会算出两个指纹，缓存白丢一次。
+        let via_chat = plan_request(
+            "chat/completions",
+            Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#),
+            false,
+        )
+        .unwrap();
+        let c: serde_json::Value = serde_json::from_slice(&via_chat.body).unwrap();
+        assert_eq!(v["input"], c["input"]);
+
+        // 列表原样放过，别的形状不猜——判 400 是上游的事。
+        let untouched = plan_request(
+            "responses",
+            Bytes::from_static(
+                br#"{"model":"m","store":false,"stream":true,"input":{"role":"user"}}"#,
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            &untouched.body[..],
+            br#"{"model":"m","store":false,"stream":true,"input":{"role":"user"}}"#
+        );
     }
 
     /// 两条线格式都要报出 `input[]` 的项数——`first_turn` 与「没见过的前缀」那几类全靠它分开。

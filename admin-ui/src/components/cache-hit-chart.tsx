@@ -184,23 +184,48 @@ export function CacheHitColumns({
               })}
             </div>
 
-            {/* 读数悬在图上方：一个节点跟着焦点走，而不是给每根柱子挂一个 tooltip 实例。
-                值在前、时段在后——看的人已经知道自己指着哪一格，要的是那个数。 */}
-            {active != null && (
-              <div
-                role="status"
-                aria-live="off"
-                className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 -translate-y-full rounded-lg border bg-popover px-2 py-1 text-2xs leading-4 text-popover-foreground shadow-md"
-                style={{
-                  // 贴边的两格会把气泡顶出画布，夹在 [8%, 92%] 之内。
-                  left: `${Math.min(92, Math.max(8, ((active + 0.5) / slots.length) * 100))}%`,
-                }}
-              >
-                <p className="font-semibold tabular-nums">{readouts[active].rate}</p>
-                <p className="text-muted-foreground tabular-nums">{readouts[active].when}</p>
-                <p className="text-muted-foreground tabular-nums">{readouts[active].detail}</p>
-              </div>
-            )}
+            {/* 读数：一个节点跟着焦点走，而不是给每根柱子挂一个 tooltip 实例。
+                值在前、时段在后——看的人已经知道自己指着哪一格，要的是那个数。
+
+                **画在图里面，不画在图上方。** 上方那版会被外面的滚动容器裁掉半截
+                （对话框的正文是 ScrollArea），表现是气泡缺了顶、还压在上一段说明文字上。
+                盖住柱顶不是问题：要读的那个数就在气泡里。 */}
+            {active != null && (() => {
+              // 横向三挡对齐。只夹 `left` 是不够的：气泡宽度是 max-content，最右那一格
+              // 居中摆会整个溢出画布——而画布外面就是那个会裁的滚动容器。贴边的两成格子
+              // 改成把气泡的边对齐图的边，中间的照常居中。
+              const pos = (active + 0.5) / slots.length
+              const anchor = pos < 0.2 ? 'start' : pos > 0.8 ? 'end' : 'center'
+              return (
+                <div
+                  role="status"
+                  aria-live="off"
+                  className={cn(
+                    'pointer-events-none absolute top-1 z-10 rounded-lg border bg-popover px-2 py-1',
+                    'text-2xs leading-4 text-popover-foreground shadow-md',
+                    // `w-max` 是关键：绝对定位默认按「到容器右边还剩多少」收缩，最右那一格
+                    // 只剩几十像素，于是每个数字断成一行，气泡被撑成一根竖条（还因此变高、
+                    // 更容易被裁）。`max-w` 兜住窄屏，那时才允许折行。
+                    'w-max max-w-[min(16rem,100%)]',
+                    anchor === 'center' && '-translate-x-1/2',
+                  )}
+                  style={
+                    anchor === 'start'
+                      ? { left: 0 }
+                      : anchor === 'end'
+                        ? { right: 0 }
+                        : { left: `${pos * 100}%` }
+                  }
+                >
+                  {/* 率与时段并到一行：气泡越矮越不容易挡住柱子，也越不容易顶出画布。 */}
+                  <p className="flex items-baseline gap-1.5 tabular-nums">
+                    <span className="font-semibold">{readouts[active].rate}</span>
+                    <span className="text-muted-foreground">{readouts[active].when}</span>
+                  </p>
+                  <p className="text-muted-foreground tabular-nums">{readouts[active].detail}</p>
+                </div>
+              )
+            })()}
           </div>
 
           {/* 刻度绝对定位、按格心对齐：让它跟着格子等分（每格 flex-1 + truncate）的话，

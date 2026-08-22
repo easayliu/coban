@@ -1320,7 +1320,8 @@ impl CredentialStore {
     /// 规则（依次）：
     /// 1. 把 `resume_at` 到点的号惰性启用回来——**只动 `resume_at` 非空的那些**，
     ///    人工关掉的号绝不能被自动打开；
-    /// 2. 跳过停用的、还在冷却中的、RPM 已打满的；
+    /// 2. 跳过停用的、还在冷却中的、RPM 已打满的——**限流暂停的号仍参与「最快什么时候
+    ///    有号」的估算**，那是整池都在等额度重置时唯一能给客户端的有用信息；
     /// 3. 优先级小者优先；同档内取**最久未使用**的那个（按账本的 `last_used_at`），
     ///    这样同档账号是轮流用而不是把第一个榨干。
     ///
@@ -1361,7 +1362,21 @@ impl CredentialStore {
         let mut candidates: Vec<(i64, i64, i64)> = Vec::new(); // (priority, last_used_at, id)
 
         for c in &all {
-            if c.disabled || exclude.contains(&c.id) {
+            if exclude.contains(&c.id) {
+                continue;
+            }
+            if c.disabled {
+                // 限流暂停的号带着恢复时刻，它得参与「最快什么时候有号」的估算：整池都在
+                // 等额度重置时，客户端该收到一个带 `retry-after` 的 429，而不是一句「没有
+                // 可用账号」——后者读起来像是配置错了，实际上等一等就好。
+                //
+                // 人工停用与封号不算：那两种没有 `resume_at`，等下去也不会好，报一个会到期
+                // 的秒数等于给客户端一个永远兑现不了的承诺。
+                if let Some(left) =
+                    c.resume_at.map(|at| at as i64 - now_secs() as i64).filter(|l| *l > 0)
+                {
+                    soonest = Some(soonest.map_or(left, |s: i64| s.min(left)));
+                }
                 continue;
             }
             let cooling = self.cooldown_secs(c.id);
@@ -2504,6 +2519,33 @@ mod tests {
         let err = s.select(&[], None).unwrap_err();
         let rl = err.downcast_ref::<AllRateLimited>().expect("should be AllRateLimited");
         assert!(rl.retry_after_secs <= 10, "should report the soonest: {}", rl.retry_after_secs);
+    }
+
+    /// 整池都在等额度重置时，客户端该拿到一个带 `retry-after` 的 429，而不是一句「没有可用
+    /// 账号」——后者读起来像是配置错了，实际上等一等就好。人工停用的号不给这个承诺：它没有
+    /// 到期时刻，报一个秒数等于骗客户端再来一次。
+    #[test]
+    fn a_pool_waiting_on_quota_resets_still_reports_when_it_comes_back() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+        s.pause_for_rate_limit(a.id, 3600).unwrap();
+        s.pause_for_rate_limit(b.id, 120).unwrap();
+
+        let err = s.select(&[], None).unwrap_err();
+        let rl = err.downcast_ref::<AllRateLimited>().expect("should be AllRateLimited");
+        assert!(
+            (60..=120).contains(&rl.retry_after_secs),
+            "should report the soonest reset: {}",
+            rl.retry_after_secs
+        );
+
+        // 人工停用的号一律不参与：全池只剩它时就是「没有可用账号」，不是「等一等」。
+        let s = store();
+        let m = add(&s, "manual");
+        s.set_disabled(m.id, true).unwrap();
+        let err = s.select(&[], None).unwrap_err();
+        assert!(err.downcast_ref::<AllRateLimited>().is_none(), "{err:#}");
     }
 
     /// 手动启用要抹掉自动停用的痕迹，否则一个陈旧的判定会把号再关回去。

@@ -177,7 +177,7 @@ export function CacheHitTrendDialog({
             </p>
             {lifetime != null && (
               <p className="ms-auto text-2xs text-muted-foreground tabular-nums">
-                {t(`终身 ${formatPercent(lifetime)}`, `${formatPercent(lifetime)} lifetime`)}
+                {t(`历史累计 ${formatPercent(lifetime)}`, `${formatPercent(lifetime)} lifetime`)}
               </p>
             )}
           </section>
