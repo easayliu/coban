@@ -411,6 +411,12 @@ export interface ResetResult {
   credits: ResetCredits | null
   /** 有没有把这个号从限流暂停里放回轮转（false = 它本来就没被暂停）。 */
   resumed: boolean
+  /**
+   * 有没有把额度读数归零（false = 这个号还没有任何快照，或上游明说一个窗口都没重置）。
+   *
+   * 与 `resumed` 是两件事：一个号可以「没被暂停过」但读数是 100%，也可以反过来。
+   */
+  quota_cleared: boolean
   /** 兑换后的凭证视图：兑换会顺手解除限流暂停与冷却，列表据此立刻摘掉那枚徽章。 */
   credential: Credential
 }
@@ -419,7 +425,8 @@ export interface ResetResult {
  * 兑一张重置券，把这个号的额度窗口重置掉。
  *
  * **不可撤销**：券花掉就没有，上游不退，所以调用前要二次确认。成功后后端顺手解除限流
- * 暂停与冷却（额度重置了却还在暂停里，等于白花一张），人工停用与封号不碰。
+ * 暂停与冷却（额度重置了却还在暂停里，等于白花一张）、并把额度读数归零（窗口当场就归零了，
+ * 读数还停在 100% 会让人以为券白花了），人工停用与封号不碰。
  */
 export async function consumeResetCredit(id: number): Promise<ResetResult> {
   const { data } = await api.post<ResetResult>(`/credentials/${id}/reset-credits/consume`, undefined, {

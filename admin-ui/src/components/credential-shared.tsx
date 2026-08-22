@@ -683,6 +683,8 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void) {
           result.windows_reset != null
             ? t(`重置了 ${result.windows_reset} 个额度窗口`, `${result.windows_reset} quota window(s) reset`)
             : null,
+          // 归零那句要说出来：卡片上的条子当场从满格掉到 0，不解释一句会让人以为读数坏了。
+          result.quota_cleared ? t('额度读数已归零', 'quota reading zeroed') : null,
           result.resumed ? t('已放回轮转', 'back in the rotation') : null,
           left != null
             ? t(`还剩 ${left} 张券`, `${left} credit(s) left`)

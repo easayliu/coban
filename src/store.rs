@@ -1745,6 +1745,47 @@ impl CredentialStore {
         Ok(())
     }
 
+    /// 把这个号的额度快照按「窗口刚刚被重置」改写：报过的那几个窗口已用归零、重置时刻
+    /// 清空。返回是否真的改了（`false` = 这个号还没有任何快照可改）。
+    ///
+    /// 兑换重置券成功后调用。不改的话卡片上仍写着「主额度 100%」，一直到这个号下次真的
+    /// 转发一条请求才更新——而重置这张券花掉正是为了让人**现在**就敢用它，一个停在 100%
+    /// 的读数会让人以为券白花了，再点一次就是第二张。
+    ///
+    /// 三条边界：
+    /// - **只归零上游报过的窗口**（`Some(_) → Some(0)`）：从没报过的那个窗口仍是 `None`。
+    ///   补一个 0 上去等于替上游说了它没说过的话，而界面上 `None` 与 `0%` 长得不一样。
+    /// - **窗口长度留着**：那是账号属性，重置一次不会变，界面的列名靠它算。
+    /// - **重置时刻清掉**：新的重置时刻只有上游知道，按「现在 + 窗口长度」编一个会让窗口
+    ///   统计的起点跟着错（见 [`parse_reset_at`] 那条注）。清空只是少一段倒计时，编一个
+    ///   是给出错的数——下一条真实响应会把它带回来。
+    ///
+    /// credits 那一组不动：那是「还剩几张券」，由 [`Self::save_reset_credits`] 单独维护。
+    pub fn note_quota_reset(&self, cred_id: i64) -> Result<bool> {
+        let conn = self.conn.lock();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT quota_raw FROM credential_stats WHERE cred_id = ?1",
+                params![cred_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(mut q) = raw.and_then(|r| serde_json::from_str::<QuotaSnapshot>(&r).ok()) else {
+            return Ok(false);
+        };
+        q.primary_used_pct = q.primary_used_pct.map(|_| 0.0);
+        q.secondary_used_pct = q.secondary_used_pct.map(|_| 0.0);
+        q.primary_reset_at = None;
+        q.secondary_reset_at = None;
+        conn.execute(
+            "UPDATE credential_stats SET snapshot_ts = unixepoch(), quota_raw = ?1 \
+             WHERE cred_id = ?2",
+            params![serde_json::to_string(&q)?, cred_id],
+        )?;
+        Ok(true)
+    }
+
     /// 取某个凭证的账本。
     pub fn stats_of(&self, cred_id: i64) -> Result<CredentialStats> {
         let conn = self.conn.lock();
@@ -2546,6 +2587,39 @@ mod tests {
         s.set_disabled(m.id, true).unwrap();
         let err = s.select(&[], None).unwrap_err();
         assert!(err.downcast_ref::<AllRateLimited>().is_none(), "{err:#}");
+    }
+
+    /// 兑掉一张重置券之后，账本里那份额度读数得跟着归零——否则卡片一直写着「100%」，
+    /// 让人以为券白花了，再点一次就是第二张。
+    #[test]
+    fn a_quota_reset_zeroes_the_reading_without_inventing_one() {
+        let s = store();
+        let a = add(&s, "a");
+        // 上游只报了主窗口那一组：次窗口整组是空的（真实流量里常见，见 config 那条注）。
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(a.id),
+            quota: Some(QuotaSnapshot {
+                primary_used_pct: Some(100.0),
+                primary_window_minutes: Some(10080),
+                primary_reset_at: Some("1787743750".to_owned()),
+                credits_balance: Some(3.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(s.note_quota_reset(a.id).unwrap());
+        let q = s.stats_of(a.id).unwrap().quota.unwrap();
+        assert_eq!(q.primary_used_pct, Some(0.0), "报过的窗口归零");
+        assert_eq!(q.secondary_used_pct, None, "没报过的窗口不能被补出一个 0 来");
+        assert_eq!(q.primary_window_minutes, Some(10080), "窗口长度是账号属性，重置不会变");
+        assert_eq!(q.primary_reset_at, None, "新的重置时刻只有上游知道，不编");
+        assert_eq!(q.credits_balance, Some(3.0), "credits 那一组与额度窗口无关");
+
+        // 从没转发过的号没有快照可改，报 false 而不是凭空造一份。
+        let b = add(&s, "b");
+        assert!(!s.note_quota_reset(b.id).unwrap());
     }
 
     /// 手动启用要抹掉自动停用的痕迹，否则一个陈旧的判定会把号再关回去。

@@ -50,6 +50,11 @@ pub struct ResetOutcome {
     pub credits: Option<ResetCredits>,
     /// 有没有把这个号从「限流暂停」里放回轮转（`false` = 它本来就没被限流暂停）。
     pub resumed: bool,
+    /// 有没有把额度快照归零（`false` = 这个号还没有任何快照，或上游明说一个窗口都没重置）。
+    ///
+    /// 与 `resumed` 分开报：一个号可以「没被暂停过」但额度读数是 100%，也可以反过来。
+    /// 界面据此决定要不要在成功文案里说「额度读数已归零」。
+    pub quota_cleared: bool,
 }
 
 /// 查这个号还剩几张重置券，并把读数落库。
@@ -129,6 +134,26 @@ pub async fn consume(state: &AppState, cred: &Credential) -> Result<ResetOutcome
         ),
     }
     state.store.clear_cooldown(cred.id);
+
+    // 窗口当场归零了，账本里那份读数也得跟上——否则卡片一直写着「主额度 100%」，直到这个
+    // 号下次真的转发一条请求才更新，而券正是为了让人现在就敢用它才花掉的。
+    //
+    // 上游明说「一个窗口都没重置」时不动：那种情况下改成 0 是编数。没报 `windows_reset`
+    // （字段缺失）仍然归零——这一族接口的字段是会变的，而这条路已经拿到 2xx 了。
+    if outcome.windows_reset == Some(0) {
+        tracing::warn!(
+            cred_id = cred.id,
+            "the upstream redeemed a credit but reset no window; leaving the quota reading alone"
+        );
+    } else {
+        match state.store.note_quota_reset(cred.id) {
+            Ok(cleared) => outcome.quota_cleared = cleared,
+            Err(e) => tracing::error!(
+                cred_id = cred.id, error = %format!("{e:#}"),
+                "redeemed the credit but could not zero the stored quota reading"
+            ),
+        }
+    }
 
     outcome.credits = match query(state, cred).await {
         Ok(credits) => Some(credits),
