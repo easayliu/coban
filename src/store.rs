@@ -1539,6 +1539,39 @@ impl CredentialStore {
 // ---------- token 刷新 ----------
 
 impl CredentialStore {
+    /// **强刷**一次 token，不看本地那份有效期。返回新的 access_token。
+    ///
+    /// 只在上游明确回了 401 之后走这条路：那时本地记的过期时刻就是错的——token 被提前
+    /// 吊销、或两边的钟差得多。照 [`Self::valid_access_token`] 那套判断，只会一直拿着一个
+    /// 已经作废的 token 去撞同一堵墙，而每一条请求都变成客户端眼里的 401。
+    ///
+    /// 仍走同一把每账号刷新锁，并且**比对撞 401 用的那个 token**：一个号同时在飞十条请求、
+    /// 十条各撞一次 401 时，真正的刷新只该发生一次，等到锁的那九条直接拿走新的那个。少了
+    /// 这道比对，一次 401 风暴就是十次刷新——上游那头看着像在爆破。
+    pub async fn refresh_access_token(
+        &self,
+        clients: &crate::clients::ClientPool,
+        cred: &Credential,
+        rejected: &str,
+    ) -> Result<String> {
+        let lock = self.refresh_lock(cred.id);
+        let _guard = lock.lock().await;
+        let fresh = self.get(cred.id)?.context("credential was deleted while refreshing")?;
+        if fresh.access_token != rejected {
+            return Ok(fresh.access_token);
+        }
+        let client = clients.for_credential(&fresh)?;
+        let set = refresh_with_retry(&client, &fresh.refresh_token).await?;
+        self.update_tokens(
+            fresh.id,
+            &set.access_token,
+            &set.refresh_token,
+            set.expires_at,
+            set.id_token.as_deref(),
+        )?;
+        Ok(set.access_token)
+    }
+
     /// 取该凭证当前可用的 access_token，必要时先刷新。
     ///
     /// 刷新走**每凭证一把锁**：并发刷新会让后完成的那次把已被作废的 refresh_token 写回

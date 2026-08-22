@@ -424,7 +424,7 @@ async fn forward_once(
 ) -> anyhow::Result<Outcome> {
     let session_key = session.key();
     let client = state.clients.for_credential(cred)?;
-    let token = state.store.valid_access_token(&state.clients, cred).await?;
+    let mut token = state.store.valid_access_token(&state.clients, cred).await?;
 
     // chat 模式下**不带来访的 query**：那串是给 `/v1/chat/completions` 的，接在
     // `responses` 后面只是往上游送一堆它不认识的参数。
@@ -447,6 +447,8 @@ async fn forward_once(
     // **同一个号**再发一遍（见 [`strip_encrypted_reasoning`]）。所以体与头都得留着重用。
     let mut fwd_body = body.clone();
     let mut stripped = false;
+    // 撞 401 之后强刷过一次 token 没有：只给一次，刷完还是 401 就是这个号真的坏了。
+    let mut token_refreshed = false;
     // 这个会话在这个号上已经吃过一次「解不开」：直接摘掉，省下那次注定 400 的往返
     // （见 [`StaleReasoningMemo`]）。
     if stale_reasoning_known(&state.stale_reasoning, session_key, cred.id)
@@ -513,6 +515,63 @@ async fn forward_once(
                 error_passthrough(status, &up_headers, bytes, chat),
             ));
         }
+        // 401：上游不认这个号的鉴权。**它必须退出调度**——留在池子里的话，之后每一条落到
+        // 它身上的请求都是同一个 401，而客户端那头看到的只是「请求失败」，与「服务挂了」
+        // 分不开。
+        //
+        // 但先给一次强刷的机会：本地记的有效期可能就是错的（两边的钟差得多、或上游提前
+        // 让它失效），那种情况下换一个 token 就好了，停用一个其实能用的号才是更大的损失。
+        // 刷完再撞一次 401 才是定论。
+        //
+        // **上游把话说死了的那几种除外**（见 [`DEAD_AUTH_HINTS`]）：授权整个被作废时，
+        // refresh_token 换回来的是一个同样不被认的 token，那一趟往返每条请求都要白等一遍。
+        //
+        // **403 不在此列**（仍只按 [`detect_account_error`] 的关键词判）：401 说的是「你是
+        // 谁我不认」，那必然是这个号的事；而 403 可能来自边缘（Cloudflare 的机器人拦截页
+        // 就是 403），那时被拒的是这条出站链路，不是账号——照 401 那样处置，一次风控能把
+        // 整个号池一次性停光。
+        if status == StatusCode::UNAUTHORIZED {
+            // 上游把话说死了的那几种（见 [`DEAD_AUTH_HINTS`]）直接停用，不刷。
+            if !detect_dead_auth(&bytes) && !token_refreshed {
+                token_refreshed = true;
+                match state.store.refresh_access_token(&state.clients, cred, &token).await {
+                    Ok(fresh) if fresh != token => {
+                        tracing::info!(
+                            cred_id = cred.id,
+                            "upstream rejected this credential's token; refreshed it and \
+                             retrying once on the same credential"
+                        );
+                        token = fresh;
+                        // 只换鉴权那一项：整份重建会把前面按 collapse/chat 钉过的
+                        // accept 与 content-type 一起抹掉。
+                        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                            fwd_headers.insert(HeaderName::from_static("authorization"), v);
+                        }
+                        continue;
+                    }
+                    // 刷出来还是同一个（并发时别人刚刷过、而那个也被拒了）：没救了。
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        cred_id = cred.id,
+                        error = %format!("{e:#}"),
+                        "upstream rejected this credential's token and refreshing it failed"
+                    ),
+                }
+            }
+            let reason = format!("upstream 401: {}", upstream_message(&bytes));
+            tracing::warn!(
+                cred_id = cred.id,
+                reason = %reason,
+                refreshed = token_refreshed,
+                "upstream will not authenticate this credential; taking it out of the rotation"
+            );
+            state.store.mark_banned(cred.id, &reason)?;
+            return Ok(Outcome::TryNext(
+                Reject::Credential,
+                error_passthrough(status, &up_headers, bytes, chat),
+            ));
+        }
+
         if status == StatusCode::TOO_MANY_REQUESTS {
             // 额度用尽与突发限流是两件事，处置也就不一样，见 [`detect_usage_limit`]。
             if detect_usage_limit(&bytes) {
@@ -1588,7 +1647,36 @@ const BAN_STATES: &[&str] =
     &["suspend", "ban", "deactivat", "disabled", "terminated", "revoked", "not active"];
 const BAN_SUBJECTS: &[&str] = &["account", "organization", "workspace", "subscription"];
 
-/// 判断这次非 2xx 是不是账号级问题，是则返回原因（入库到 `ban_reason`）。
+/// 401 里那些**刷新也救不回来**的说法。命中即当场停用，连那一次强刷都省掉。
+///
+/// 头一条是实测原话：`Encountered invalidated oauth token for user, failing request`。它说的
+/// 是整个授权被作废了（改了密码、撤销了授权、会话被踢），而不是「这个 access_token 过期
+/// 了」——拿 refresh_token 再换一次，换回来的是一个同样不被认的 token。
+///
+/// 省掉那一趟不是为了快：这个号还在池子里，**每一条**落到它身上的请求都要先陪它刷一次、
+/// 再撞一次 401，而结局从第一条起就已经定了。
+///
+/// 只放「上游明说凭证作废」这一类。像 `token expired` 那种不许进——它正是强刷能治好的
+/// 那一种，进了这份清单就等于把一个换个 token 就能用的号直接停掉。
+const DEAD_AUTH_HINTS: &[&str] = &[
+    "invalidated oauth token",
+    "invalid_grant",
+    "token has been revoked",
+    "token was revoked",
+    "token is no longer valid",
+];
+
+/// 这次 401 的鉴权是不是已经死透了，见 [`DEAD_AUTH_HINTS`]。
+fn detect_dead_auth(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    DEAD_AUTH_HINTS.iter().any(|k| text.contains(k))
+}
+
+/// 判断这次非 2xx 是不是**一眼可辨**的账号级问题，是则返回原因（入库到 `ban_reason`）。
+///
+/// 命中这里的一律当场停用、不做任何补救：账号被停/被封不是换个 token 就能好的事。
+/// 关键词没命中的 401 走 [`forward_once`] 里那条「先强刷一次 token」的路——那种 401 更
+/// 可能只是凭证过期，不该与「这个账号被封了」同等处置。
 fn detect_account_error(status: StatusCode, body: &[u8]) -> Option<String> {
     if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return None;
@@ -3931,8 +4019,9 @@ mod tests {
         assert!(out.get("session_id").is_some());
     }
 
-    /// 只有「主体 + 状态」两类词同时命中才算账号级问题——单看 unauthorized 会把
-    /// 一次普通的 token 过期误判成封号，把好账号关掉。
+    /// 只有「主体 + 状态」两类词同时命中才算**一眼可辨**的账号级问题：那一类当场停用、
+    /// 不做补救。一次普通的 token 过期不该走这条路——它先该被强刷一次 token 试试
+    /// （见 [`forward_once`] 里那段 401 处置），刷完再撞 401 才停用。
     #[test]
     fn account_error_needs_both_subject_and_state() {
         let banned = br#"{"error":{"message":"Your account has been suspended"}}"#;
@@ -3940,9 +4029,37 @@ mod tests {
 
         let expired = br#"{"error":{"message":"unauthorized: token expired"}}"#;
         assert!(detect_account_error(StatusCode::UNAUTHORIZED, expired).is_none());
+        // 那条路停用时写进 ban_reason 的原因：得能指到「上游说了什么」，一句光秃秃的
+        // 「401」在页面上等于没说。
+        assert_eq!(
+            format!("upstream 401: {}", upstream_message(expired)),
+            "upstream 401: unauthorized: token expired"
+        );
 
         // 状态码不对就不判，哪怕文本命中。
         assert!(detect_account_error(StatusCode::TOO_MANY_REQUESTS, banned).is_none());
+        // 403 也不按 401 那套处置：机器人拦截页就是 403，照 401 处置会把整池一次停光。
+        let edge = b"<html><title>Attention Required! | Cloudflare</title></html>";
+        assert!(detect_account_error(StatusCode::FORBIDDEN, edge).is_none());
+    }
+
+    /// 「授权整个被作废」与「这个 token 过期了」得分开：前者刷新是白刷——换回来的是一个
+    /// 同样不被认的 token，而这个号还在池子里，**每一条**落到它身上的请求都要先陪它刷一次
+    /// 再撞一次 401，结局从第一条起就定了。
+    #[test]
+    fn a_dead_oauth_grant_skips_the_refresh_attempt() {
+        // 实测原话。
+        assert!(detect_dead_auth(b"Encountered invalidated oauth token for user, failing request"));
+        // 包在 JSON 里、大小写不一样也得认出来。
+        assert!(detect_dead_auth(
+            br#"{"error":{"message":"Encountered INVALIDATED OAuth token for user"}}"#
+        ));
+        assert!(detect_dead_auth(br#"{"error":"invalid_grant"}"#));
+
+        // 这一种恰恰是强刷能治好的，绝不能进那份清单——进了就等于把一个换个 token
+        // 就能用的号直接停掉。
+        assert!(!detect_dead_auth(br#"{"error":{"message":"unauthorized: token expired"}}"#));
+        assert!(!detect_dead_auth(b""));
     }
 
     /// 上游解不开请求里捎来的加密推理时那句 400 要认出来：认不出来，这段会话从此每一轮都
