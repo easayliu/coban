@@ -105,16 +105,16 @@ export type CredentialTierFilterKey = 'all' | PlanKey
 export type CredentialViewMode = 'card' | 'list'
 
 /**
- * 每页条数**取 12 的倍数**，不是 10 / 20 / 50。
+ * 每页条数用整数档（10 / 20 / 50）——报数用的数字，读起来就该是圆的。
  *
- * 窄屏的卡片是网格，列数在 1 / 2 之间走（见下面那张网格的注）。每页 10 个撞上非整除的列数就
- * 会在最后一行留空格——三列时是「3+3+3+1」，右边空两格，看着像加载失败或数据缺了一块。
+ * 曾经改成 12 / 24 / 48：那时卡片网格最多三列，每页 10 个会排成「3+3+3+1」，最后一行右边空
+ * 两格，像加载失败或数据缺了一块，所以让条数被列数整除。**卡片改成最多两列之后这个理由就没了**
+ * ——10 / 20 / 50 都能被 1 和 2 整除，两种列数下最后一行都是满的。
  *
- * 通行做法是让每页条数被常见列数整除（12 能被 1/2/3/4/6 整除，列数将来怎么变都是整行），而
- * **不是**把最后一行的卡片拉宽填满：那会让同一页里的卡片不一样大，卡片之间就没法照着同一个
- * 位置比读数了。表格不在乎整除，12/24/48 对它只是行数。
+ * 真要再放开到三列，宁可回来动这里，也**不要**把最后一行的卡片拉宽填满：那会让同一页里的卡片
+ * 不一样大，卡片之间就没法照着同一个位置比读数了。表格不在乎整除，这三个数对它只是行数。
  */
-export const CREDENTIAL_PAGE_SIZES = [12, 24, 48] as const
+export const CREDENTIAL_PAGE_SIZES = [10, 20, 50] as const
 export type CredentialPageSize = (typeof CREDENTIAL_PAGE_SIZES)[number]
 
 const PAGE_SIZE_ITEMS = CREDENTIAL_PAGE_SIZES.map((size) => ({
@@ -1212,7 +1212,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                `@sm/card` 断点**（Tailwind 的 `--container-sm` = 24rem）——卡片到这个宽度才
                展开成「头像 + 页脚单行 + 额度两列」，再窄就退成更高的堆叠版。所以门槛不是随手
                挑的：跨过去的那一刻，两张卡刚好都还是展开态。
-               列数固定成 2 之后，每页条数（12 / 24 / 48，见 [CREDENTIAL_PAGE_SIZES]）照样整行。 */
+               列数固定成 2 之后，每页条数（10 / 20 / 50，见 [CREDENTIAL_PAGE_SIZES]）都除得开，
+               最后一行不会留空格。 */
             <ul className="relative grid list-none grid-cols-1 items-stretch gap-3 p-0 min-[52rem]:grid-cols-2 sm:gap-4">
               {pageItems.map((item) => (
                 <CredentialCard
