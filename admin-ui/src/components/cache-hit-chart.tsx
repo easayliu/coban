@@ -1,6 +1,6 @@
 import { useId, useState } from 'react'
 import { useI18n } from '@/lib/i18n'
-import { cacheHitRate, cn, formatPercent, formatTokens, type CacheGranularity, type CacheSlot } from '@/lib/utils'
+import { cacheHitRate, cn, formatCompactNumber, formatPercent, type CacheGranularity, type CacheSlot } from '@/lib/utils'
 
 /**
  * 缓存命中率趋势图：一格一根柱子，柱高就是那一格的命中率。
@@ -352,7 +352,7 @@ export function cacheTotalsText(
   t: (zh: string, en: string) => string,
 ): string {
   return t(
-    `命中 ${formatTokens(cachedTokens)} / 输入 ${formatTokens(inputTokens)}`,
-    `${formatTokens(cachedTokens)} of ${formatTokens(inputTokens)} input`,
+    `命中 ${formatCompactNumber(cachedTokens)} / 输入 ${formatCompactNumber(inputTokens)}`,
+    `${formatCompactNumber(cachedTokens)} of ${formatCompactNumber(inputTokens)} input`,
   )
 }

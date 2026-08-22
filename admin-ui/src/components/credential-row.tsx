@@ -33,7 +33,7 @@ import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/tab
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   cacheHitRate, cn, displayCredentialLabel, formatCompactNumber, formatCountdown, formatFullTime,
-  formatPercent, formatTokens, formatUsd, relativeTime,
+  formatPercent, formatUsd, relativeTime,
 } from '@/lib/utils'
 
 /**
@@ -434,7 +434,7 @@ export const CredentialRow = memo(function CredentialRow({
         <TableCell className={cn(COL.requests, 'text-right tabular-nums')}>
           <Tooltip>
             <TooltipTrigger render={<span className="cursor-default" />}>
-              {formatCompactNumber(cred.stats.request_total, locale)}
+              {formatCompactNumber(cred.stats.request_total)}
             </TooltipTrigger>
             <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
               {t(
@@ -447,7 +447,7 @@ export const CredentialRow = memo(function CredentialRow({
         <TableCell className={cn(COL.tokens, 'text-right tabular-nums')}>
           <Tooltip>
             <TooltipTrigger render={<span className="cursor-default" />}>
-              {formatTokens(tokens)}
+              {formatCompactNumber(tokens)}
             </TooltipTrigger>
             <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
               {t(

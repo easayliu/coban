@@ -1,6 +1,6 @@
 import { type CacheReasonStat } from '@/api/metrics'
 import { useI18n } from '@/lib/i18n'
-import { cn, formatPercent, formatTokens } from '@/lib/utils'
+import { cn, formatCompactNumber, formatPercent } from '@/lib/utils'
 
 /**
  * 缓存结局的对照表：后端那几个标识 → 人话，以及「看见它该做什么」。
@@ -196,8 +196,8 @@ export function CacheReasonBreakdown({ reasons }: { reasons: CacheReasonStat[] }
         <h3 className="text-xs font-medium">{t('未命中都花在哪了', 'Where the misses went')}</h3>
         <p className="text-2xs text-muted-foreground tabular-nums">
           {t(
-            `共白付 ${formatTokens(total)} 输入 token`,
-            `${formatTokens(total)} input tokens paid uncached`,
+            `共白付 ${formatCompactNumber(total)} 输入 token`,
+            `${formatCompactNumber(total)} input tokens paid uncached`,
           )}
         </p>
       </div>
@@ -218,7 +218,7 @@ export function CacheReasonBreakdown({ reasons }: { reasons: CacheReasonStat[] }
                 </span>
               </div>
               <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
-                {formatTokens(w)} · {formatPercent(share)}
+                {formatCompactNumber(w)} · {formatPercent(share)}
               </span>
               {/* 条子横跨两列：数字在上、条子在下，窄屏上也不会把名字挤成一个字。 */}
               <div

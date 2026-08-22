@@ -1858,6 +1858,11 @@ fn maybe_pause_on_quota(state: &AppState, cred: &Credential, quota: &QuotaSnapsh
 pub struct UsageSniffer {
     /// 上一块结尾那半行（chunk 边界不保证落在换行上）。
     pending: String,
+    /// 这一行已经判定不用再攒了（不可能带用量，或超了上限），丢到行尾为止。
+    ///
+    /// **必须丢到换行**：把半行的残渣留在 `pending` 里，下一段字节会被接在一个 JSON
+    /// 中途的位置上，之后整条流的行边界全错位。
+    skipping: bool,
     /// 最后一次看到的用量。取最后一个而不是第一个：`response.completed` 才是终值，
     /// 中途的 `response.in_progress` 也可能带 usage，但那是不完整的读数。
     pub usage: Option<Usage>,
@@ -1893,9 +1898,37 @@ impl Usage {
     }
 }
 
-/// 单行 SSE `data:` 的长度上限。超过就丢弃这一行——正常的事件行是几 KB 级别，
-/// 一个不带换行的巨大响应体会把 `pending` 撑成无界缓冲。
-const MAX_SSE_LINE: usize = 1024 * 1024;
+/// 攒到这个长度还没出现 [`may_carry_usage`] 那两个键名，就放弃这一行。
+///
+/// 巨行都出在 `response.output_item.done`（推理条目的 `encrypted_content` 是一大段
+/// base64）与各种 `*.delta` 上，而它们压根不带 `"model"`/`"usage"`——**正文撞不上这个判据**：
+/// 正文是 JSON 字符串，里头的引号是转义的，拼不出带引号的键名。所以这一步筛掉的正是那些
+/// 又大又没用的行，而终局事件的 `"model"` 在开头几百字节就出现了，留 256KB 的余量足够
+/// 扛住上游调整字段顺序。
+const SNIFF_DECIDE_AT: usize = 256 * 1024;
+
+/// 单行 SSE `data:` 的长度硬上限，超过就放弃这一行。
+///
+/// **不能设成「正常事件行的量级」**：非 lite 的模型（实测 `gpt-5.5`/`gpt-5.4` 的
+/// `use_responses_lite` 是 false）会把整段 `output` 连 `encrypted_content` 一起塞在
+/// `response.completed` 里，一个长回合的终局事件轻易上 MB。之前这里是 1MB，而流式路径是
+/// 按 chunk 喂的——终局事件还没等到换行就先撞上限被清空，于是 `model`/`usage`/`cost`
+/// 三样一起变成空，只有非流式那条路（整个体一把喂进来，`while` 先把长行 drain 掉）躲过。
+/// 表现是**同一个模型走流式就没有计费，走非流式就有**。
+///
+/// 现在只有「看着像终局事件」的行才可能攒到这里（见 [`SNIFF_DECIDE_AT`]），所以放宽到
+/// 16MB 也不会给并发流各挂一份响应体——真攒到这个数说明上游的形状变了，那时宁可丢一条
+/// 记录也不能把内存吃穿，故仍留一道硬墙并记一条 warn。
+const MAX_SSE_LINE: usize = 16 * 1024 * 1024;
+
+/// 这一行有没有可能带上我们要的两样东西。
+///
+/// 嗅探的两处判断（攒到一半要不要放弃、整行到手要不要付一次 JSON 解析）用的是同一个判据，
+/// 故只留这一处——各写一遍的话，放弃的条件比解析的条件严，就会出现「攒着不解析」或者更糟的
+/// 「该攒的中途丢了」。
+fn may_carry_usage(data: &str) -> bool {
+    data.contains("\"usage\"") || data.contains("\"model\"")
+}
 
 impl UsageSniffer {
     /// 喂一块响应字节。
@@ -1905,14 +1938,54 @@ impl UsageSniffer {
         }
         // SSE 是 UTF-8；多字节字符被切在 chunk 边界时 lossy 会产生替换字符，但那只会
         // 出现在正文里，不影响我们要找的 ASCII 结构。
-        self.pending.push_str(&String::from_utf8_lossy(chunk));
-        while let Some(idx) = self.pending.find('\n') {
-            let line: String = self.pending.drain(..=idx).collect();
-            self.consume_line(line.trim_end());
+        let text = String::from_utf8_lossy(chunk);
+        let mut rest = text.as_ref();
+        loop {
+            // 上一行还在丢弃中：先跳到它的换行为止。
+            if self.skipping {
+                match rest.find('\n') {
+                    Some(idx) => {
+                        self.skipping = false;
+                        rest = &rest[idx + 1..];
+                    }
+                    None => return,
+                }
+            }
+            match rest.find('\n') {
+                Some(idx) => {
+                    self.pending.push_str(&rest[..idx]);
+                    let line = std::mem::take(&mut self.pending);
+                    self.consume_line(line.trim_end());
+                    rest = &rest[idx + 1..];
+                }
+                None => {
+                    self.pending.push_str(rest);
+                    self.check_pending();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 半行攒到一定长度后决定还要不要继续攒。
+    fn check_pending(&mut self) {
+        if self.pending.len() >= SNIFF_DECIDE_AT && !may_carry_usage(&self.pending) {
+            self.drop_line();
+            return;
         }
         if self.pending.len() > MAX_SSE_LINE {
-            self.pending.clear();
+            tracing::warn!(
+                len = self.pending.len(),
+                "giving up on an oversized SSE line; this request will have no usage or cost"
+            );
+            self.drop_line();
         }
+    }
+
+    /// 放弃当前这一行：清掉已攒的部分，并记着要把剩下的字节丢到换行为止。
+    fn drop_line(&mut self) {
+        self.pending.clear();
+        self.skipping = true;
     }
 
     fn consume_line(&mut self, line: &str) {
@@ -1920,7 +1993,7 @@ impl UsageSniffer {
         let data = data.trim();
         // 先用一次廉价的子串判断挡掉绝大多数事件行（增量文本），只有可能带 usage 的
         // 才付一次 JSON 解析——解析每一行的话，一次长回复要解析几千次。
-        if !data.contains("\"usage\"") && !data.contains("\"model\"") {
+        if !may_carry_usage(data) {
             return;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return };
@@ -4167,11 +4240,84 @@ mod tests {
     }
 
     /// 一条没有换行的巨大响应体不能把 pending 撑成无界缓冲。
+    ///
+    /// 钉的是**硬墙那一道**：这一行带着 `"model"`，所以躲过了 [`SNIFF_DECIDE_AT`] 那一层
+    /// （见 `sniffer_drops_a_giant_useless_line_and_resyncs`），只剩 [`MAX_SSE_LINE`] 拦它。
     #[test]
     fn sniffer_caps_the_pending_buffer() {
         let mut s = UsageSniffer::default();
-        s.feed(&Bytes::from("x".repeat(MAX_SSE_LINE + 1024)));
-        assert!(s.pending.len() <= MAX_SSE_LINE);
+        s.feed(&Bytes::from("data: {\"model\":\"gpt-5.5\",\"x\":\"".to_owned()));
+        let mb = "x".repeat(1024 * 1024);
+        for _ in 0..(MAX_SSE_LINE / mb.len() + 2) {
+            s.feed(&Bytes::from(mb.clone()));
+            assert!(s.pending.len() <= MAX_SSE_LINE + mb.len(), "{}", s.pending.len());
+        }
+        assert!(s.pending.is_empty(), "撞了硬墙就该把这一行丢掉");
+    }
+
+    /// **非 lite 的模型把整段 output 塞在终局事件里，那一行能有好几 MB**——它必须照样被读出
+    /// 用量。这里是真出过的那个 bug：上限 1MB 时，流式（按 chunk 喂）的终局事件还没等到换行
+    /// 就被清空，于是 model/usage/cost 三样一起空，而非流式（整个体一把喂）却是好的。所以
+    /// 这条测试钉的是「两条路读出来的必须一样」。
+    #[test]
+    fn sniffer_keeps_usage_from_a_giant_completed_event() {
+        // 形状照实测：encrypted_content 是一大段 base64，`model` 在 `output` 之前，
+        // `usage` 在最后。
+        let blob = "A".repeat(3 * 1024 * 1024);
+        let line = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"model\":\"gpt-5.5\",\
+             \"output\":[{{\"type\":\"reasoning\",\"encrypted_content\":\"{blob}\"}}],\
+             \"usage\":{{\"input_tokens\":1000,\"input_tokens_details\":{{\"cached_tokens\":900}},\
+             \"output_tokens\":50,\"output_tokens_details\":{{\"reasoning_tokens\":40}},\
+             \"total_tokens\":1050}}}}}}\n"
+        );
+
+        // 流式：按 64KB 分块喂（真实 chunk 就是这个量级）。
+        let mut streamed = UsageSniffer::default();
+        for c in line.as_bytes().chunks(64 * 1024) {
+            streamed.feed(&Bytes::from(c.to_vec()));
+        }
+        // 非流式：整个体一把喂。
+        let mut whole = UsageSniffer::default();
+        whole.feed(&Bytes::from(line.clone().into_bytes()));
+
+        assert_eq!(streamed.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(streamed.usage, whole.usage, "流式与非流式必须读出同一份用量");
+        let u = streamed.usage.expect("流式路径也要拿到用量");
+        assert_eq!(
+            (u.input_tokens, u.cached_tokens, u.output_tokens, u.reasoning_tokens, u.total_tokens),
+            (1000, 900, 50, 40, 1050)
+        );
+    }
+
+    /// 巨行里真正没用的那些（`output_item.done` 的密文、各种 delta）要早早放弃，且**放弃之后
+    /// 得跳到行尾**——把半行残渣留在缓冲里，后面的字节会接在 JSON 中途，从此整条流的行边界
+    /// 全错位，终局事件也就跟着读不到了。
+    #[test]
+    fn sniffer_drops_a_giant_useless_line_and_resyncs() {
+        let mut s = UsageSniffer::default();
+        let big = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"reasoning\",\
+             \"encrypted_content\":\"{}\"}}}}\n",
+            "A".repeat(4 * 1024 * 1024)
+        );
+        let chunk = 64 * 1024;
+        for c in big.as_bytes().chunks(chunk) {
+            s.feed(&Bytes::from(c.to_vec()));
+            assert!(
+                s.pending.len() <= SNIFF_DECIDE_AT + chunk,
+                "没用的巨行不该越攒越多：{}",
+                s.pending.len()
+            );
+        }
+        // 丢完那一行之后，下一行照样要读得出来。
+        s.feed(&Bytes::from(
+            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.5\",\
+             \"usage\":{\"input_tokens\":9,\"output_tokens\":2}}}\n"
+                .to_owned(),
+        ));
+        assert_eq!(s.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(s.usage.map(|u| u.input_tokens), Some(9));
     }
 
     #[test]

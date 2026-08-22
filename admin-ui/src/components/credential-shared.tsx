@@ -12,7 +12,7 @@ import {
 } from '@/api/credentials'
 import {
   cn, displayCredentialLabel, extractError, formatClockTime, formatCompactNumber, formatCountdown,
-  formatFullTime, formatTokens, formatUsd, localizeBackendMessage,
+  formatFullTime, formatUsd, localizeBackendMessage,
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import {
@@ -824,7 +824,7 @@ export function QuotaMeter({
         <dl className="flex min-w-0 flex-wrap items-center gap-1">
           <QuotaFact
             label={t('请求数', 'Requests')}
-            value={formatCompactNumber(w.usage.requests, locale)}
+            value={formatCompactNumber(w.usage.requests)}
             hint={w.usage.requests.toLocaleString(locale)}
             suffix="req"
           />
@@ -834,7 +834,7 @@ export function QuotaMeter({
               一个带 $），那三个字母只会把这行本就不宽的地方再挤掉一截。 */}
           <QuotaFact
             label={t('总 token', 'Total tokens')}
-            value={formatTokens(w.usage.tokens)}
+            value={formatCompactNumber(w.usage.tokens)}
             hint={t(
               `${w.usage.tokens.toLocaleString(locale)}（输入 + 输出，上游 usage 口径；输入已含命中缓存的部分、输出已含 reasoning，不重复计）`,
               `${w.usage.tokens.toLocaleString(locale)} (input + output per the upstream usage fields; input already includes cache hits and output already includes reasoning, so nothing is double counted)`,
@@ -870,11 +870,11 @@ export function QuotaMeter({
         <dl className="flex min-w-0 items-center gap-1 truncate text-[.625rem] text-muted-foreground tabular-nums">
           <dt className="sr-only">{t('请求数', 'Requests')}</dt>
           <dd className="shrink-0">
-            {formatCompactNumber(w.usage.requests, locale)}
+            {formatCompactNumber(w.usage.requests)}
             <span className="ml-0.5" aria-hidden>req</span>
           </dd>
           <dt className="sr-only">{t('总 token', 'Total tokens')}</dt>
-          <dd className="shrink-0 before:mr-1 before:content-['·']">{formatTokens(w.usage.tokens)}</dd>
+          <dd className="shrink-0 before:mr-1 before:content-['·']">{formatCompactNumber(w.usage.tokens)}</dd>
           <dt className="sr-only">{t('等价费用', 'Equivalent cost')}</dt>
           <dd className="truncate before:mr-1 before:content-['·']">{formatUsd(w.usage.cost_usd)}</dd>
           {estimate?.costUsd != null && (

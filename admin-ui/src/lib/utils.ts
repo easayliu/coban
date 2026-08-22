@@ -389,29 +389,17 @@ export function formatCountdown(targetSecs: number, nowSecs: number): string {
 }
 
 /**
- * 大数字压成一眼可读的短形式：`3542` → `3.5K`（英文）/`3542` → `3542`、`12000` → `1.2万`
- * （中文，随 locale 走）。
+ * 大数字压成一眼可读的短形式：`842` / `11K` / `1.2M` / `3.4B`，**不随界面语言变**。
  *
- * 只用于空间紧张、量级比精确值更有用的地方（卡片上的请求数）。要对数的场合仍用
- * `toLocaleString`——`3.5K` 看不出到底是 3542 还是 3549。
+ * token 数与请求数走同一份实现，是因为它们成对出现（卡片页脚、窗口配额那一行、账号表
+ * 的相邻两列）。刻意不用 `Intl` 的 `notation: 'compact'`：中文 locale 下它给的是
+ * 「1.1 万」「121 万」，而 token 那一侧的量纲到处都是 K/M——官方价目表按 MTok 计价，紧挨着
+ * 的费用就是那份价目算出来的。一行里两个数用两套量纲，就没法互相印证。同理不做本地化千分位。
+ *
+ * 只用于空间紧张、量级比精确值更有用的地方。精确值放 `title`（用 `toLocaleString`）：
+ * `1.2M` 看不出是 1.15M 还是 1.24M，`11K` 也看不出是 10,501 还是 11,499。
  */
-export function formatCompactNumber(n: number, locale: string): string {
-  return new Intl.NumberFormat(locale, {
-    notation: 'compact',
-    maximumFractionDigits: 1,
-  }).format(n)
-}
-
-/**
- * Token 数压成 `842` / `931K` / `1.2M` / `3.4B`，**不随界面语言变**。
- *
- * 刻意不走 {@link formatCompactNumber}：中文 locale 下它会给出「121万」，而 token 的量纲
- * 到处都是 K/M——官方价目表按 MTok 计价，卡片上紧挨着的就是那份价目算出来的费用，两个数换算
- * 单位不一致就没法互相印证。同理不做本地化千分位。
- *
- * 精确值放 `title`（用 `toLocaleString`）：`1.2M` 看不出是 1.15M 还是 1.24M。
- */
-export function formatTokens(n: number): string {
+export function formatCompactNumber(n: number): string {
   const abs = Math.abs(n)
   if (abs < 1_000) return String(Math.round(n))
   const units = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']] as const
@@ -456,7 +444,7 @@ export function cacheHitRate(
  *
  * 留那一位是有用的：prompt cache 的命中率日常在 90% 以上，`96.2%` 与 `96.8%` 之间差的是
  * 真金白银（命中部分按十分之一计价），四舍五入成同一个 `96%` 就看不出调整粘性有没有效果。
- * 不本地化：紧挨着的 token 数也不本地化（见 {@link formatTokens}）。
+ * 不本地化：紧挨着的 token 数也不本地化（见 {@link formatCompactNumber}）。
  */
 export function formatPercent(rate: number | null): string {
   if (rate == null) return '—'

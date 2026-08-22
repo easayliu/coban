@@ -100,7 +100,7 @@ export const CredentialCard = memo(function CredentialCard({
   const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
   const rpmLive = cred.rpm > 0
   const requests = cred.stats.request_total
-  const requestsText = formatCompactNumber(requests, locale)
+  const requestsText = formatCompactNumber(requests)
   // 页脚三组数字（请求数 / 累计费用 / RPM）在窄卡片上排一行还是两行，按字符数定。
   // 这与 Luban 的卡片布局保持一致：超出窄屏容量时，上行「请求数 · 开关」、下行「费用 · RPM」。
   const footerChars = requestsText.length
