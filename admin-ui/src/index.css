@@ -319,6 +319,12 @@
       padding-right: max(2rem, env(safe-area-inset-right));
     }
   }
+
+  /* 画布上限就守在 80rem，**表格与卡片共用**。
+     曾经给表格放宽到 96rem：表格是宽了，但切回卡片视图时整页（含头部、页脚）跟着缩回 80rem，
+     切换一次页面宽度就跳一次——两个视图共处一页时，画布必须是同一个数，宽度差是比多一两列更
+     刺眼的问题。表格因此只放它装得下的列（见 credential-row 的 [COL]）。 */
+
 }
 
 @media (prefers-reduced-motion: reduce) {

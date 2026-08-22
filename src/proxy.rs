@@ -103,7 +103,7 @@ pub async fn handle(
     let upstream_path: &str = if chat.is_some() { config::RESPONSES_PATH } else { &path };
 
     // 会话键。同时决定两件事：这条请求落在**哪个号**上，以及对上游呈现**哪个 `session_id`**
-    // ——后者就是上游 prompt cache 的键（见 prefix_fingerprint）。两件事必须用同一个键：
+    // ——后者就是上游 prompt cache 的键（见 prefix_parts）。两件事必须用同一个键：
     // 落点变了而 session_id 没变（或反之），缓存照样丢。
     //
     // 客户端自报的会话 id 优先——那是真的会话身份；实测三个真实 codex 客户端一个都不发，
@@ -1144,7 +1144,7 @@ fn note_stale_reasoning(memo: &StaleReasoningMemo, session_key: Option<&str>, cr
 
 /// 把 `tools[]` 按名字排定序，返回**顺序是否真的动过**。
 ///
-/// 为什么要排：工具定义**连同顺序**都进上游的 prompt cache 前缀（见 [`prefix_fingerprint`]
+/// 为什么要排：工具定义**连同顺序**都进上游的 prompt cache 前缀（见 [`prefix_parts`]
 /// 里那份官方口径）。客户端每轮把工具列表顺序打乱一次，就是每轮 100% 未命中——而且指纹跟着
 /// 变、落点也换，两头一起丢。排一遍就把一个不稳定的客户端强行稳住。
 ///
@@ -1224,7 +1224,7 @@ impl SessionCtx {
 /// - `lease_expired`：租约过期了（会话停得太久），落点因此重新算过。
 /// - `upstream_cold`：租约有效、落点也没变、前缀身份也没变，上游那边就是没有。要么它自己的
 ///   缓存过期了，要么这个键被**假共享**了——两条开头完全一样的对话会算出同一个指纹、共用
-///   同一个上游 session，交替请求互相踢掉对方（见 [`prefix_fingerprint`] 的注）。
+///   同一个上游 session，交替请求互相踢掉对方（见 [`prefix_parts`] 的注）。
 /// - `no_usage`：没嗅探到用量（错误响应、客户端提前断开）。谈不上命中与否。
 /// - `unattributed`：租约机制被关掉了（`session_lease_secs = 0`），上面那几类分不出来。
 /// - `no_session`：这条请求压根没有会话身份（体里没有 `input`，`models` 那类）。
@@ -1270,7 +1270,37 @@ fn cache_reason(
     }
 }
 
-/// 从（已经是 Responses 形状的）请求体里算一个**会话指纹**。
+/// 会话键，**外加四段各自的短哈希**。
+///
+/// 总键只说得出「前缀变了」。变的是哪一段——换了模型、客户端改了 `instructions`、工具集或
+/// 顺序动了、还是压根是另一段对话——揉进一个哈希之后就分不出来了，而这四种的处置完全不同。
+/// 分段哈希配上 [`store::PrefixMemo`] 才把「没见过的前缀」从一次猜测变成一次诊断。
+///
+/// `head`（`input[0]` 的哈希）是这套东西的支点：对话越聊越长，但开头那一项不变，所以在其余
+/// 三段变掉、总键因此对不上的时候，还能靠它认出「这是同一段对话」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixParts {
+    /// 会话键。**逐字节都是约定**：它决定落点与上游 `session_id`，改一个 bit 就是全池落点
+    /// 重算一遍、白丢一轮缓存。测试里钉了固定值防这件事。
+    pub key: String,
+    pub model: String,
+    pub instructions: String,
+    pub tools: String,
+    pub head: String,
+}
+
+impl PrefixParts {
+    pub fn segments(&self) -> store::PrefixSegments<'_> {
+        store::PrefixSegments {
+            head: &self.head,
+            model: &self.model,
+            instructions: &self.instructions,
+            tools: &self.tools,
+        }
+    }
+}
+
+/// 从（已经是 Responses 形状的）请求体里算这条请求的**会话键**与四段分段哈希。
 ///
 /// 上游的 prompt cache 键是「`prompt_cache_key` + 前缀哈希」，而这条后端把
 /// `prompt_cache_key` 换成了**从 `session_id` 头派生**的值——实测：body 里传的那个被忽略
@@ -1290,40 +1320,6 @@ fn cache_reason(
 ///
 /// 客户端做过历史压缩（改写了开头那条）时指纹会变，落点也跟着变——那时上游的前缀哈希
 /// 同样已经变了，缓存本来就丢了，跟着换号不多亏什么。
-pub fn prefix_fingerprint(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    prefix_parts(obj).map(|p| p.key)
-}
-
-/// 会话键，**外加四段各自的短哈希**。
-///
-/// 总键只说得出「前缀变了」。变的是哪一段——换了模型、客户端改了 `instructions`、工具集或
-/// 顺序动了、还是压根是另一段对话——揉进一个哈希之后就分不出来了，而这四种的处置完全不同。
-/// 分段哈希配上 [`store::PrefixMemo`] 才把「没见过的前缀」从一次猜测变成一次诊断。
-///
-/// `head`（`input[0]` 的哈希）是这套东西的支点：对话越聊越长，但开头那一项不变，所以在其余
-/// 三段变掉、总键因此对不上的时候，还能靠它认出「这是同一段对话」。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrefixParts {
-    /// 会话键。与只有总键那一版**逐字节一致**——它决定落点与上游 `session_id`，改一个 bit
-    /// 就是全池落点重算一遍、白丢一轮缓存。测试里钉了固定值防这件事。
-    pub key: String,
-    pub model: String,
-    pub instructions: String,
-    pub tools: String,
-    pub head: String,
-}
-
-impl PrefixParts {
-    pub fn segments(&self) -> store::PrefixSegments<'_> {
-        store::PrefixSegments {
-            head: &self.head,
-            model: &self.model,
-            instructions: &self.instructions,
-            tools: &self.tools,
-        }
-    }
-}
-
 pub fn prefix_parts(obj: &serde_json::Map<String, serde_json::Value>) -> Option<PrefixParts> {
     use sha2::{Digest, Sha256};
 
@@ -1377,7 +1373,7 @@ fn upstream_url(path: &str, query: Option<&str>) -> String {
 
 /// 构造发往上游的头：来访头去掉逐跳/鉴权项后照抄，再补上这个凭证的身份。
 ///
-/// `fingerprint` 是这条请求的会话键（见 [`prefix_fingerprint`]）。它决定派生出来的
+/// `fingerprint` 是这条请求的会话键（见 [`prefix_parts`]）。它决定派生出来的
 /// `session_id`，而那正是上游 prompt cache 的键——**不能在这里就地从头里取**：绝大多数
 /// 客户端不发会话头，那样算出来的指纹恒为空，于是一个号上所有会话共用同一个 cache key。
 fn build_forward_headers(
@@ -3687,7 +3683,7 @@ mod tests {
         let serde_json::Value::Object(obj) = serde_json::from_str(body).unwrap() else {
             panic!("object")
         };
-        prefix_fingerprint(&obj)
+        prefix_parts(&obj).map(|p| p.key)
     }
 
     /// 指纹**必须在会话长大时保持不变**——整个粘性机制就架在这一条上：codex 每轮把历史

@@ -1,7 +1,7 @@
 import type { ElementType, ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { HINT_FOCUS_RING, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 export function OverviewMetric({
   label, value, status, statusHint, trend, icon: Icon, tone, active = false, onClick, className,
@@ -101,9 +101,10 @@ export function LiveTrafficMetric({
   return (
     <Tooltip>
       <TooltipTrigger
-        render={<div />}
+        render={<div tabIndex={0} />}
         className={cn(
           'flex min-h-16 min-w-0 cursor-help items-center gap-3 px-3 py-2.5 text-left sm:px-4',
+          HINT_FOCUS_RING,
           className,
         )}
       >

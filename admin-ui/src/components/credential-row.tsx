@@ -3,17 +3,21 @@ import { ChevronDownIcon, ChevronUpIcon, EllipsisIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
+import { CredentialRenameDialog } from '@/components/credential-rename-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import {
+  accountIdTitle,
   ConnectivityTestDialog,
   CredentialMenuContent,
   DeferredMount,
   DeleteCredentialDialog,
   ResetQuotaDialog,
   evaluateCredential,
+  isRangeSelect,
   planBadgeVariant,
   planLabel,
+  proxyTitle,
   QuotaMeter,
   quotaCapacityEstimate,
   quotaWindowLabel,
@@ -30,10 +34,9 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Switch } from '@/components/ui/switch'
 import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { HINT_FOCUS_RING, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
-  cacheHitRate, cn, displayCredentialLabel, formatCompactNumber, formatCountdown, formatFullTime,
-  formatPercent, formatUsd, relativeTime,
+  cn, displayCredentialLabel, formatCountdown, formatFullTime, formatUsd, relativeTime,
 } from '@/lib/utils'
 
 /**
@@ -44,8 +47,8 @@ const COL = {
   select: 'w-10',
   account: 'w-auto',
   status: 'w-32',
-  // 优先级从 w-20 收到 w-16：装的只是一枚 `P0` 徽章，多出来的宽度让给下面新增的两列，
-  // 免得 account 那一格（唯一的 w-auto）被挤到账号名整行截断。
+  // 装的只是一枚 `P0` 徽章，w-16 够；省下的宽度归 account 那一格（唯一的 w-auto），
+  // 免得账号名整行截断。
   priority: 'w-16',
   plan: 'w-24',
   // 额度两列的宽度由**条子上面那行**定，不是条子定：`1.5K req · 143M · $1,053.68` 这种
@@ -54,11 +57,37 @@ const COL = {
   quotaSecondary: 'w-40',
   rpm: 'w-24',
   recent: 'w-24',
-  // 累计三兄弟：请求数 / token 数 / 花费，挨着放才好互相印证（几条请求、多少 token、
-  // 折成多少钱）。都是紧凑记数（`1.2K` / `931K`），w-20 够用。
-  requests: 'w-20',
-  tokens: 'w-20',
+  /**
+   * 累计花费。**终身累计只留这一列**。
+   *
+   * 请求数与 token 数原来也在这里（各 4.5rem）。画布是 76rem（.page-frame 80rem 减左右各 2rem，
+   * 表格与卡片共用同一个数，见 index.css 那条注），其余各列之和已经 64.5rem——把那两列放回来
+   * 就是 73.5rem，账号名那一格只剩 40 来个像素，整行全是省略号。
+   *
+   * 按列优先级挑剩下谁（宽表放不下时按决策价值分档：Ant Design 的 `responsive`、Carbon /
+   * Spectrum 的 hide-at-breakpoint 都是这一套）：调度时要盯的是状态、额度、RPM、花费，请求数与
+   * token 数是「看一眼就够」的量。它们仍在「用量」弹窗和窄屏卡片的页脚里，工具栏的排序菜单也
+   * 照旧能按它们排。
+   */
   cost: 'w-24',
+  /**
+   * 启用开关。**行尾、紧挨着 ⋯ 菜单**，不在账号那一格里。
+   *
+   * 数据表的通行排法是：前缘只放身份（勾选框 + 主标识），行内操作一律靠后缘（Material 的
+   * row actions、Carbon 的 overflow menu、Polaris IndexTable 的 trailing actions 都是这个
+   * 位置）。开关放在最前面有三处不划算：
+   *
+   * - 扫视是从左边起头的，那个位置该给账号名，不该给一个控件；
+   * - 它与全选勾选框贴在一起，两个相邻热区一个是「选中」一个是「立刻停掉这个号」，误点的
+   *   代价差得太远；
+   * - 读屏顺序上，控件出现在它所属的那一行还没被念出来之前。
+   *
+   * 状态那一列讲的是「现在怎么了」（停用 / 额度用尽 / 冷却中），这一列是**改它的手柄**，
+   * 两者分开：菜单里没有启用/停用项，所以开关必须留在表面。
+   *
+   * w-14：开关本体 30px（`--thumb-size` 4 那档）加左右内边距刚好，列头「启用」也是这个宽。
+   */
+  toggle: 'w-14',
   action: 'w-10',
 } as const
 
@@ -67,14 +96,14 @@ const COL = {
  * ——同一个 100% 在两处长得不一样，会让人以为是两个不同的量。
  *
  * 窗口用量那三项（请求数 / token / 等价费用）也照卡片摆在条子上方，只是压成一行小字
- * ——它们讲的是**当前这个窗口**，右边那几列是终身累计，两个口径必须能对照着看。
+ * ——它们讲的是**当前这个窗口**，而右边「累计花费」那列是终身累计，两个口径必须能对照着看。
  *
  * 距重置的倒计时直接跟在进度条后面，方便不打开悬浮提示也能看到；绝对重置时刻、窗口用量
  * 精确值和快照时刻仍放在悬浮提示里。快照时刻既然在这份提示里，就**不给共用组件传
  * snapshotTs**，否则它会在触发区内再挂一个原生 title，两层提示一起冒出来。
  *
  * 与卡片不同，**没报告的窗口也要占位**：表格列宽固定，摘掉单元格会让整行错位，
- * 所以这里显式写「—」，由 title 说明是「上游没报这个窗口」还是「还没有快照」。
+ * 所以这里显式写「—」，由提示说明是「上游没报这个窗口」还是「还没有快照」。
  */
 function ListQuotaMeter({
   credentialLabel,
@@ -95,15 +124,22 @@ function ListQuotaMeter({
   const { t, language, locale } = useI18n()
   const label = quotaWindowLabel(w, language)
   if (!w.reported) {
+    // 与有数据那一格同一套提示（Tooltip 而不是原生 title）：一格里两种提示，键盘还只认其中
+    // 一种，说不通。这一格更需要解释——光一个「—」看不出是「上游没报这个窗口」还是「还没快照」。
     return (
-      <span
-        className="text-muted-foreground text-xs"
-        title={hasSnapshot
-          ? t(`上游没有报告 ${label} 窗口`, `Upstream does not report a ${label} window`)
-          : t('还没有额度快照', 'No quota snapshot yet')}
-      >
-        —
-      </span>
+      <Tooltip>
+        <TooltipTrigger
+          render={<span tabIndex={0} />}
+          className={cn('text-muted-foreground text-xs', HINT_FOCUS_RING)}
+        >
+          —
+        </TooltipTrigger>
+        <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+          {hasSnapshot
+            ? t(`上游没有报告 ${label} 窗口`, `Upstream does not report a ${label} window`)
+            : t('还没有额度快照', 'No quota snapshot yet')}
+        </TooltipPopup>
+      </Tooltip>
     )
   }
   const windowTitle = quotaWindowTitle(w.windowMinutes, language)
@@ -115,7 +151,7 @@ function ListQuotaMeter({
     : generic
   return (
     <Tooltip>
-      <TooltipTrigger render={<div className="min-w-0" />}>
+      <TooltipTrigger render={<div tabIndex={0} className={cn('min-w-0', HINT_FOCUS_RING)} />}>
         <QuotaMeter
           credentialLabel={credentialLabel}
           window={w}
@@ -251,7 +287,7 @@ export function CredentialListHeader({
     sort === key ? ({ 'aria-sort': dir === 'asc' ? 'ascending' : 'descending' } as const) : {}
 
   return (
-    <TableHeader className="hidden xl:table-header-group">
+    <TableHeader>
       <TableRow>
         {/* 勾选那列不自己改左内边距：卡片式表格给首列的 td 补了 `border-s`，并把
             padding-inline-start 减掉那 1px，让内容仍落在 px-2.5 这条线上。该规则带
@@ -294,14 +330,13 @@ export function CredentialListHeader({
         <TableHead className={COL.recent} {...sortProps('recent')}>
           {sortable(t('最近使用', 'Last used'), 'recent')}
         </TableHead>
-        <TableHead className={cn(COL.requests, 'text-right')} {...sortProps('requests')}>
-          {sortable(t('请求数', 'Requests'), 'requests', true)}
-        </TableHead>
-        <TableHead className={cn(COL.tokens, 'text-right')} {...sortProps('tokens')}>
-          {sortable(t('token 数', 'Tokens'), 'tokens', true)}
-        </TableHead>
         <TableHead className={cn(COL.cost, 'text-right')} {...sortProps('cost')}>
           {sortable(t('累计花费', 'Total cost'), 'cost', true)}
+        </TableHead>
+        <TableHead className={cn(COL.toggle, 'text-center')}>
+          <span title={t('启用 / 停用该账号', 'Enable or disable this account')}>
+            {t('启用', 'Enabled')}
+          </span>
         </TableHead>
         <TableHead className={COL.action}>
           <span className="sr-only">{t('操作', 'Actions')}</span>
@@ -324,7 +359,8 @@ export const CredentialRow = memo(function CredentialRow({
   now: number
   selectable?: boolean
   selected?: boolean
-  onSelectedChange?: (id: number, next: boolean) => void
+  /** `extend`：按着 shift 点的，勾选从锚点到这一行之间整段（见 credential-workspace）。 */
+  onSelectedChange?: (id: number, next: boolean, extend?: boolean) => void
   /** 与表头同一份判断，见 [CredentialListHeader] 上那条注。 */
   quotaColumns?: { primary: boolean; secondary: boolean }
   /**
@@ -333,7 +369,8 @@ export const CredentialRow = memo(function CredentialRow({
    */
   quotaTitles?: { primary: string | null; secondary: string | null }
 }) {
-  const { t, language, locale } = useI18n()
+  const { t, language } = useI18n()
+  const [renameOpen, setRenameOpen] = useState(false)
   const [proxyOpen, setProxyOpen] = useState(false)
   const [rpmOpen, setRpmOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
@@ -342,15 +379,11 @@ export const CredentialRow = memo(function CredentialRow({
   const [testing, setTesting] = useState(false)
 
   const actions = useCredentialActions(cred)
-  const { toggle, remove, rename, consumeReset } = actions
+  const { toggle, remove, consumeReset } = actions
   const { quota, status } = evaluateCredential(cred, now, language)
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const lastUsed = cred.stats.last_used_at
-  // **cached 不另加**：上游报的 input 已经含它，三个一起加会把命中缓存的会话凭空放大一倍。
-  const tokens = cred.stats.input_tokens_total + cred.stats.output_tokens_total
-  // 这个号的终身缓存命中率。只进 token 那一格的悬浮提示：列宽是写死的（见 COL），
-  // 再加一列会把唯一自适应的账号名那格挤到整行截断。
-  const credCacheRate = cacheHitRate(cred.stats.input_tokens_total, cred.stats.cached_tokens_total)
+  // token 累计量与缓存命中率不在这张表上（见 [COL] 的 `cost`），要看去「用量」弹窗。
 
   return (
     <>
@@ -359,32 +392,60 @@ export const CredentialRow = memo(function CredentialRow({
           {selectable && (
             <Checkbox
               checked={selected}
-              onCheckedChange={(next) => onSelectedChange?.(cred.id, !!next)}
+              onCheckedChange={(next, details) => onSelectedChange?.(
+                cred.id,
+                !!next,
+                isRangeSelect(details.event),
+              )}
               aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
             />
           )}
         </TableCell>
+        {/* 身份格：主标识 + 一行副标识。**不放头像**——表格这边一行只有一个字母的圆圈，
+            信息量抵不上它吃掉的 42px（卡片那边尺寸够、留着）。这一列是唯一自适应的，填空靠
+            副标识那行，不靠装饰。
+            副标识照抄卡片的组成（`#3 · …9f31d0`），两个视图对同一个号说同一套话。
+            首列之后**只放身份**，控件一个都不放：开关已经搬到行尾（见 [COL] 的 `toggle`）。 */}
         <TableCell className={COL.account}>
-          <div className="flex min-w-0 items-center gap-2">
-            <Switch
-              checked={!cred.disabled}
-              onCheckedChange={(next) => toggle.mutate(!next)}
-              aria-label={switchTitle(cred, language)}
-              title={switchTitle(cred, language)}
-            />
-            <div className="min-w-0">
-              <div className="truncate text-sm font-medium">{credentialLabel}</div>
-              <div className="truncate text-xs text-muted-foreground">
-                {cred.account_id_masked}
-                {cred.proxy && ` · ${t('代理', 'proxy')}`}
+          {/* **整格一个提示**，不是分挂在三处原生 `title` 上。表格里以「格」为提示单位是常规
+              做法（整行做触发区，扫表时会到处乱弹），而原生 title 只认鼠标悬停，键盘用户一句
+              也拿不到。这一格要解释的三件事本来就是同一件：这个号是谁——名字（会被截断）、
+              账号标识（掩码尾段单看认不出）、怎么出网（代理地址不该常驻表面）。 */}
+          <Tooltip>
+            <TooltipTrigger
+              render={<div tabIndex={0} />}
+              className={cn('min-w-0', HINT_FOCUS_RING)}
+            >
+              <div className="truncate text-sm font-medium leading-snug">{credentialLabel}</div>
+              <div className="flex min-w-0 items-center gap-1.5 overflow-hidden text-xs text-muted-foreground">
+                {/* coban 自己的行号：改名、同名、掩码尾段也撞车时，只有它是绝对的。 */}
+                <span className="shrink-0 tabular-nums">#{cred.id}</span>
+                <span aria-hidden="true">·</span>
+                <span className="min-w-0 truncate tabular-nums">{cred.account_id_masked}</span>
+                {cred.proxy && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="shrink-0">{t('代理', 'proxy')}</span>
+                  </>
+                )}
               </div>
-            </div>
-          </div>
+            </TooltipTrigger>
+            {/* 顺序与格子里那两行对应。名字放头一行并加粗：这一格最常被截断的就是它。
+                账号那行传了 credentialLabel，备注本来就是邮箱时不再重复念一遍邮箱
+                （见 [accountIdTitle]）。 */}
+            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+              <span className="block font-medium">{credentialLabel}</span>
+              <span className="block">{accountIdTitle(cred, language, credentialLabel)}</span>
+              {cred.proxy && <span className="block">{proxyTitle(cred.proxy, language)}</span>}
+            </TooltipPopup>
+          </Tooltip>
         </TableCell>
         <TableCell className={COL.status}>
           <Tooltip>
             <TooltipTrigger
-              render={<Badge variant={status.variant} className="cursor-default">{status.label}</Badge>}
+              render={
+                <Badge variant={status.variant} tabIndex={0} className="cursor-help">{status.label}</Badge>
+              }
             />
             <TooltipPopup className="max-w-72">{status.detail}</TooltipPopup>
           </Tooltip>
@@ -420,45 +481,36 @@ export const CredentialRow = memo(function CredentialRow({
           </TableCell>
         )}
         <TableCell className={cn(COL.rpm, 'text-right tabular-nums')}>
-          <span title={t('最近 60 秒 / 生效上限', 'Last 60s / effective limit')}>
-            {cred.rpm}
-            <span className="text-muted-foreground">
-              {' / '}
-              {cred.rpm_limit_effective > 0 ? cred.rpm_limit_effective : '∞'}
-            </span>
-          </span>
+          <Tooltip>
+            <TooltipTrigger render={<span tabIndex={0} />} className={HINT_FOCUS_RING}>
+              {cred.rpm}
+              <span className="text-muted-foreground">
+                {' / '}
+                {cred.rpm_limit_effective > 0 ? cred.rpm_limit_effective : '∞'}
+              </span>
+            </TooltipTrigger>
+            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+              {t(
+                '斜杠左边是最近 60 秒经这个账号转发的请求数，右边是生效的上限（∞ = 不限）',
+                'Left of the slash: requests forwarded through this account in the last 60 seconds. Right: the effective limit (∞ = unlimited)',
+              )}
+            </TooltipPopup>
+          </Tooltip>
         </TableCell>
         <TableCell className={cn(COL.recent, 'text-xs text-muted-foreground')}>
           {lastUsed ? relativeTime(lastUsed, now, language) : '—'}
         </TableCell>
-        <TableCell className={cn(COL.requests, 'text-right tabular-nums')}>
-          <Tooltip>
-            <TooltipTrigger render={<span className="cursor-default" />}>
-              {formatCompactNumber(cred.stats.request_total)}
-            </TooltipTrigger>
-            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-              {t(
-                `经这个账号转发过 ${cred.stats.request_total.toLocaleString(locale)} 条请求（含失败的）`,
-                `${cred.stats.request_total.toLocaleString(locale)} requests forwarded through this account (failures included)`,
-              )}
-            </TooltipPopup>
-          </Tooltip>
-        </TableCell>
-        <TableCell className={cn(COL.tokens, 'text-right tabular-nums')}>
-          <Tooltip>
-            <TooltipTrigger render={<span className="cursor-default" />}>
-              {formatCompactNumber(tokens)}
-            </TooltipTrigger>
-            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-              {t(
-                `累计 ${tokens.toLocaleString(locale)} token：输入 ${cred.stats.input_tokens_total.toLocaleString(locale)}（其中命中缓存 ${cred.stats.cached_tokens_total.toLocaleString(locale)}，命中率 ${formatPercent(credCacheRate)}）+ 输出 ${cred.stats.output_tokens_total.toLocaleString(locale)}`,
-                `${tokens.toLocaleString(locale)} tokens total: ${cred.stats.input_tokens_total.toLocaleString(locale)} input (${cred.stats.cached_tokens_total.toLocaleString(locale)} cache hits, ${formatPercent(credCacheRate)} hit rate) + ${cred.stats.output_tokens_total.toLocaleString(locale)} output`,
-              )}
-            </TooltipPopup>
-          </Tooltip>
-        </TableCell>
         <TableCell className={cn(COL.cost, 'text-right tabular-nums')}>
           {formatUsd(cred.stats.cost_total_usd)}
+        </TableCell>
+        <TableCell className={cn(COL.toggle, 'text-center')}>
+          {/* aria-label 里带账号名：读屏一路 tab 过来时，这一格与它管的那一行早就隔了十列。 */}
+          <Switch
+            checked={!cred.disabled}
+            onCheckedChange={(next) => toggle.mutate(!next)}
+            aria-label={`${credentialLabel} — ${switchTitle(cred, language)}`}
+            title={switchTitle(cred, language)}
+          />
         </TableCell>
         <TableCell className={COL.action}>
           <Menu>
@@ -471,12 +523,9 @@ export const CredentialRow = memo(function CredentialRow({
             <CredentialMenuContent
               cred={cred}
               actions={actions}
-              onRename={() => {
-                // 列表行没有内联编辑位（列宽固定），改名走一次 prompt 就够——它只是个
-                // 备注，真要精修可以去卡片视图。
-                const next = window.prompt(t('账号备注', 'Account label'), cred.label)
-                if (next?.trim()) rename.mutate(next.trim())
-              }}
+              // 行里没有内联编辑位（列宽是写死的），所以走弹窗——不是原生 prompt：桌面已经
+              // 没有卡片视图可切，这是宽屏唯一的改名路径（见 [CredentialRenameDialog]）。
+              onRename={() => setRenameOpen(true)}
               onRpmLimit={() => setRpmOpen(true)}
               onProxy={() => setProxyOpen(true)}
               onUsage={() => setUsageOpen(true)}
@@ -488,6 +537,14 @@ export const CredentialRow = memo(function CredentialRow({
         </TableCell>
       </TableRow>
 
+      <DeferredMount open={renameOpen}>
+        <CredentialRenameDialog
+          cred={cred}
+          open={renameOpen}
+          onOpenChange={setRenameOpen}
+          rename={actions.rename}
+        />
+      </DeferredMount>
       <DeferredMount open={rpmOpen}>
         <CredentialRpmDialog cred={cred} open={rpmOpen} onOpenChange={setRpmOpen} rpmLimit={actions.rpmLimit} />
       </DeferredMount>

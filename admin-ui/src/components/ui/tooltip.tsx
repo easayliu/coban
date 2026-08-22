@@ -18,6 +18,20 @@ export function TooltipTrigger(
   return <TooltipPrimitive.Trigger data-slot="tooltip-trigger" {...props} />;
 }
 
+/**
+ * 非交互元素当触发区时要补的那圈键盘焦点环，**同时必须给它 `tabIndex={0}`**。
+ *
+ * TooltipTrigger 不传 `render` 时渲染成 `<button>`：能聚焦，键盘 Tab 停上去提示就打开。
+ * 一旦用 `render={<span />}` / `render={<div />}` 换成非交互元素，它就退出了焦点序列——
+ * 鼠标划过看得到的那段话，键盘用户一辈子看不到（WCAG 1.4.13 要求 hover 与 focus 两条路
+ * 都拿得到）。用了 badgeVariants 的触发区自带焦点环，那种只补 tabIndex 就够。
+ *
+ * **触屏仍然拿不到**：base-ui 的 tooltip 只在 hover 或 `:focus-visible` 下开，手指点一下
+ * 给的是普通 focus。所以触屏也要看的信息不能只放在提示里——那要换成点开的 popover，是另一件事。
+ */
+export const HINT_FOCUS_RING =
+  "rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background";
+
 export function TooltipPopup({
   className,
   align = "center",

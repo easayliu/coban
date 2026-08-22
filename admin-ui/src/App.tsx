@@ -29,8 +29,8 @@ import { AddAccount } from '@/components/add-account'
 import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
-import { LanguageSwitcher } from '@/components/language-switcher'
-import { ThemeSwitcher } from '@/components/theme-switcher'
+import { LanguageMenuItems, LanguageSwitcher } from '@/components/language-switcher'
+import { ThemeMenuItems, ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
@@ -229,6 +229,10 @@ function App() {
               <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">Codex Gateway</div>
             </div>
           </div>
+          {/* 窄屏头部只留**一个主操作 + 一个溢出菜单**：主操作（添加账号）常驻，其余全收进
+              ⋮ 里点开。移动端顶栏的通行分法就是这样——一排四枚图标按钮里，语言和外观是
+              「设置一次就不再碰」的东西，占着常驻位只是把主操作挤窄；收进菜单后它们反而从
+              「猜图标」变成了带名字带对勾的选项。 */}
           <div className="flex items-center gap-2 sm:hidden">
             <Button
               size="icon-lg"
@@ -238,20 +242,22 @@ function App() {
             >
               <PlusIcon />
             </Button>
-            <LanguageSwitcher compact />
-            <ThemeSwitcher compact />
             <Menu>
               <MenuTrigger
                 className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
                 disabled={isBootstrapping}
-                aria-label={t('更多操作', 'More actions')}
+                aria-label={t('菜单', 'Menu')}
               >
                 <EllipsisVerticalIcon />
               </MenuTrigger>
-              <MenuPopup align="end" className="w-44">
+              <MenuPopup align="end" className="w-52">
                 <MenuItem onClick={() => openSettings('access')}>
                   <SettingsIcon />{t('系统设置', 'System settings')}
                 </MenuItem>
+                <MenuSeparator />
+                <ThemeMenuItems />
+                <MenuSeparator />
+                <LanguageMenuItems />
                 {authState?.configured && pw && (
                   <>
                     <MenuSeparator />

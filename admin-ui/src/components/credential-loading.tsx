@@ -37,7 +37,9 @@ export function CredentialLoadingState({
 function CardSkeletons({ selectable, count }: { selectable: boolean; count: number }) {
   return (
     <ul
-      className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4"
+      // 与真列表同一套列数（最多两列，1 → 2 的门槛 52rem，见 credential-workspace 那条注）：
+      // 骨架和真数据列数不一样的话，加载完会整片重排一次。
+      className="relative grid list-none grid-cols-1 items-stretch gap-3 p-0 min-[52rem]:grid-cols-2 sm:gap-4"
       aria-hidden="true"
     >
       {Array.from({ length: count }, (_, index) => (
@@ -80,10 +82,12 @@ function CardSkeletons({ selectable, count }: { selectable: boolean; count: numb
               </section>
             </CardPanel>
 
-            {/* 页脚：请求数按钮 · 累计费用 · RPM，开关钉在最右，见 credential-card 的 CardFooter。 */}
+            {/* 页脚：请求数 · 累计费用 · RPM，开关钉在最右，见 credential-card 的 CardFooter。
+                三项现在都是「图标 + 数字」的同一种块，骨架也就画成同高的三条——请求数那格原来
+                是颗按钮（h-9），骨架跟着画高一截，真数据一来页脚会矮下去抖一下。 */}
             <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-2.5 sm:py-3">
               <div className="flex min-w-0 items-center gap-3 @sm/card:gap-4">
-                <Skeleton className="h-9 w-20 sm:h-8" />
+                <Skeleton className="h-4 w-14" />
                 <Skeleton className="h-4 w-16" />
                 <Skeleton className="h-4 w-16" />
               </div>
@@ -111,9 +115,13 @@ function QuotaSkeleton() {
 }
 
 function TableSkeletons({ selectable, count }: { selectable: boolean; count: number }) {
+  /**
+   * 列宽照抄真表格的 [COL]（credential-row）：勾选 / 账号 / 状态 / 优先级 / 套餐 / 两个额度 /
+   * RPM / 最近使用 / 花费 / 开关 / 操作。骨架与真数据列宽不一致的话，加载完整张表会横向重排一次。
+   */
   const desktopColumns = selectable
-    ? 'grid-cols-[2rem_minmax(10rem,1fr)_8rem_5rem_6rem_8rem_8rem_8rem_6rem_6rem_2.5rem]'
-    : 'grid-cols-[0.75rem_minmax(10rem,1fr)_8rem_5rem_6rem_8rem_8rem_8rem_6rem_6rem_2.5rem]'
+    ? 'grid-cols-[2.5rem_minmax(10rem,1fr)_8rem_4rem_6rem_10rem_10rem_6rem_6rem_6rem_3.5rem_2.5rem]'
+    : 'grid-cols-[0.75rem_minmax(10rem,1fr)_8rem_4rem_6rem_10rem_10rem_6rem_6rem_6rem_3.5rem_2.5rem]'
 
   return (
     <div className="overflow-hidden">
@@ -125,12 +133,13 @@ function TableSkeletons({ selectable, count }: { selectable: boolean; count: num
           <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-12" /></div>
-          <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
-          <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
-          <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-12" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-8" /></div>
           <div className="px-2.5" />
         </div>
         <div className="divide-y">
@@ -142,22 +151,18 @@ function TableSkeletons({ selectable, count }: { selectable: boolean; count: num
               <div className="flex justify-center">
                 {selectable && <Skeleton className="size-4" />}
               </div>
+              {/* 身份格：名字一行 + `#3 · …9f31d0` 一行。 */}
               <div className="min-w-0 space-y-2 px-2.5">
                 <Skeleton className="h-3.5 w-4/5" />
                 <div className="flex items-center gap-2">
-                  <Skeleton className="h-2.5 w-12" />
+                  <Skeleton className="h-2.5 w-8" />
                   <Skeleton className="h-2.5 w-16" />
                 </div>
               </div>
-              <div className="px-2.5">
-                <Skeleton className="h-5 w-9 rounded-full" />
-              </div>
-              <div className="px-2.5">
-                <Skeleton className="h-4 w-8" />
-              </div>
-              <div className="px-2.5">
-                <Skeleton className="h-6 w-16 rounded-md" />
-              </div>
+              {/* 状态 / 优先级 / 套餐：三枚徽章。 */}
+              <div className="px-2.5"><Skeleton className="h-5 w-16 rounded-md" /></div>
+              <div className="px-2.5"><Skeleton className="h-5 w-8 rounded-md" /></div>
+              <div className="px-2.5"><Skeleton className="h-5 w-12 rounded-md" /></div>
               {Array.from({ length: 2 }, (_, quotaIndex) => (
                 <div key={quotaIndex} className="min-w-0 space-y-2 px-2.5">
                   <div className="flex items-center justify-between gap-2">
@@ -167,15 +172,12 @@ function TableSkeletons({ selectable, count }: { selectable: boolean; count: num
                   <Skeleton className="h-1.5 w-full rounded-full" />
                 </div>
               ))}
-              <div className="min-w-0 space-y-1.5 px-2.5">
-                <Skeleton className="h-3 w-10" />
-                <Skeleton className="h-2.5 w-8" />
-              </div>
-              <div className="min-w-0 px-2.5">
-                <Skeleton className="h-3 w-14" />
-              </div>
-              <div className="px-2.5">
-                <Skeleton className="h-4 w-14" />
+              <div className="min-w-0 px-2.5"><Skeleton className="h-3 w-12" /></div>
+              <div className="min-w-0 px-2.5"><Skeleton className="h-3 w-14" /></div>
+              <div className="px-2.5"><Skeleton className="h-4 w-14" /></div>
+              {/* 行尾：开关，再是 ⋯ 菜单。 */}
+              <div className="flex justify-center px-2.5">
+                <Skeleton className="h-5 w-9 rounded-full" />
               </div>
               <div className="flex justify-end px-2.5">
                 <Skeleton className="size-6 rounded-md" />

@@ -19,7 +19,9 @@ import {
   relativeTime,
 } from '@/lib/utils'
 import {
+  accountIdTitle,
   ConnectivityTestDialog,
+  credentialInitial,
   CredentialMenuContent,
   DeferredMount,
   DeleteCredentialDialog,
@@ -27,8 +29,10 @@ import {
   resetCreditsMeta,
   credentialExpiryMeta,
   evaluateCredential,
+  isRangeSelect,
   planBadgeVariant,
   planLabel,
+  proxyTitle,
   QuotaMeter,
   switchTitle,
   useCredentialActions,
@@ -55,7 +59,7 @@ import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { Separator } from '@/components/ui/separator'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { HINT_FOCUS_RING, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /**
  * memo 的收益在于「列表本身没变，但父组件重渲染了」这类情况：搜索框每敲一个字、
@@ -72,8 +76,13 @@ export const CredentialCard = memo(function CredentialCard({
   now: number
   selectable?: boolean
   selected?: boolean
-  /** 收 id 而不是每张卡现做一个闭包，回调引用才能稳定，memo 才拦得住重渲染。 */
-  onSelectedChange?: (id: number, next: boolean) => void
+  /**
+   * 收 id 而不是每张卡现做一个闭包，回调引用才能稳定，memo 才拦得住重渲染。
+   *
+   * `extend`：按着 shift 点的，勾选从锚点到这一张之间整段（见 credential-workspace 的
+   * `toggleSelected`）。
+   */
+  onSelectedChange?: (id: number, next: boolean, extend?: boolean) => void
 }) {
   const { t, language, locale } = useI18n()
   const [editing, setEditing] = useState(false)
@@ -89,7 +98,7 @@ export const CredentialCard = memo(function CredentialCard({
   const { rename, toggle, remove, consumeReset } = actions
   const { quota, status } = evaluateCredential(cred, now, language)
   const credentialLabel = displayCredentialLabel(cred.label, language)
-  const initial = credentialLabel.trim().charAt(0).toUpperCase() || '?'
+  const initial = credentialInitial(credentialLabel)
   const titleId = `credential-card-title-${cred.id}`
   const added = relativeTime(cred.created_at, now, language)
   // 只渲染上游真报过的窗口。卡片是弹性布局，没有的那个直接不占位；表格那边列宽固定，
@@ -212,7 +221,11 @@ export const CredentialCard = memo(function CredentialCard({
                 {selectable && (
                   <Checkbox
                     checked={selected}
-                    onCheckedChange={(checked) => onSelectedChange?.(cred.id, checked)}
+                    onCheckedChange={(checked, details) => onSelectedChange?.(
+                      cred.id,
+                      checked,
+                      isRangeSelect(details.event),
+                    )}
                     aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
                   />
                 )}
@@ -220,52 +233,90 @@ export const CredentialCard = memo(function CredentialCard({
                   <AvatarFallback>{initial}</AvatarFallback>
                 </Avatar>
                 <div className="min-w-0 flex-1">
-                  <h3
-                    id={titleId}
-                    className="block min-w-0 truncate whitespace-nowrap leading-snug"
-                    title={credentialLabel}
-                  >
-                    {credentialLabel}
-                  </h3>
-                  <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs font-normal">
-                    <span className="tabular-nums">#{cred.id}</span>
-                    <span aria-hidden="true">·</span>
-                    {/* 账号 id 的掩码尾段：同名或都叫「未命名」的两个号，只有这一段能区分。 */}
-                    <span
-                      className="min-w-0 truncate tabular-nums"
-                      title={cred.email
-                        ? t(
-                          `${cred.email}（账号 ${cred.account_id_masked}）`,
-                          `${cred.email} (account ${cred.account_id_masked})`,
-                        )
-                        : t(`账号 ${cred.account_id_masked}`, `Account ${cred.account_id_masked}`)}
-                    >
-                      {cred.account_id_masked}
-                    </span>
-                    <span aria-hidden="true">·</span>
-                    <span
-                      className="inline-flex min-w-0 items-center gap-1"
-                      title={t(
-                        `添加于 ${formatFullTime(cred.created_at, language)}`,
-                        `Added ${formatFullTime(cred.created_at, language)}`,
+                  {/* 标题即主操作：点开这个号的用量明细。业界的卡片规范是「一张卡一个明确的
+                      主操作」，而这张卡原来的详情入口是页脚一颗卷轴图标，标题反倒不可点——
+                      最显眼的东西不承担最常做的事。页脚那颗按钮随之退成纯数字（见页脚那段注），
+                      所以通往用量弹窗的**按钮**仍然只有一个，只是换到了该在的位置。 */}
+                  <h3 id={titleId} className="min-w-0">
+                    <button
+                      type="button"
+                      onClick={() => setUsageOpen(true)}
+                      aria-haspopup="dialog"
+                      title={credentialLabel}
+                      className={cn(
+                        'block min-w-0 max-w-full cursor-pointer truncate whitespace-nowrap text-left leading-snug',
+                        'hover:underline',
+                        HINT_FOCUS_RING,
                       )}
                     >
-                      <CalendarDaysIcon className="size-3 shrink-0" />
-                      <span>{t(`添加于 ${added}`, `Added ${added}`)}</span>
-                    </span>
-                    {expiryUrgent && (
-                      <span
-                        className="inline-flex min-w-0 items-center gap-1 text-warning-foreground"
-                        title={t(
-                          'access token 即将过期；下一个请求会自动刷新，无需处理',
-                          'The access token is about to expire; the next request refreshes it automatically',
-                        )}
-                      >
-                        <ClockIcon className="size-3 shrink-0" />
-                        <span>{expiry.label}</span>
+                      {credentialLabel}
+                    </button>
+                  </h3>
+                  {/* 元信息**整行是一个提示触发区**，不是每一项各挂一个。
+                      原来这里是三四个原生 `title` 各说一句：键盘用户一个都拿不到（原生提示只认
+                      鼠标悬停），样式也和卡上其余提示不是一套。逐项换成 Tooltip 的话每张卡要多
+                      两三个焦点位——而这一行讲的本来就是同一件事「这个号是谁、什么时候加的、
+                      怎么出网」，一次给全反而比拆开更好读，焦点位也比原来还少一个。 */}
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={<CardDescription tabIndex={0} />}
+                      // 窄卡片（手机，卡片宽度不到 @sm/card）上退回 text-xs：text-2xs 是 11px，
+                      // 还叠着 muted 前景色，正好压在「次要文字最小尺寸」的下限上（iOS HIG 11pt、
+                      // Material labelSmall 11sp 都是底线）。手机上这一行是唯一写着账号 id 与
+                      // 添加时间的地方，不该是全页最小的字。卡片宽起来（桌面多列）再收回 11px，
+                      // 那时它旁边有足够留白，密度比字号重要。
+                      className={cn(
+                        'mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 font-normal',
+                        'text-xs @sm/card:text-2xs',
+                        HINT_FOCUS_RING,
+                      )}
+                    >
+                      <span className="tabular-nums">#{cred.id}</span>
+                      <span aria-hidden="true">·</span>
+                      {/* 账号 id 的掩码尾段：同名或都叫「未命名」的两个号，只有这一段能区分。 */}
+                      <span className="min-w-0 truncate tabular-nums">{cred.account_id_masked}</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="inline-flex min-w-0 items-center gap-1">
+                        <CalendarDaysIcon className="size-3 shrink-0" />
+                        <span>{t(`添加于 ${added}`, `Added ${added}`)}</span>
                       </span>
-                    )}
-                  </CardDescription>
+                      {/* 出站代理只标「有」，地址在提示里：地址常带账号密码，不该常驻卡面。
+                          与列表视图同一个位置、同一份说法（见 credential-row 的身份格）。 */}
+                      {cred.proxy && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="shrink-0">{t('代理', 'proxy')}</span>
+                        </>
+                      )}
+                      {expiryUrgent && (
+                        <span className="inline-flex min-w-0 items-center gap-1 text-warning-foreground">
+                          <ClockIcon className="size-3 shrink-0" />
+                          <span>{expiry.label}</span>
+                        </span>
+                      )}
+                    </TooltipTrigger>
+                    {/* 顺序与上面那行逐项对应，读起来才对得上。 */}
+                    <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                      <span className="block">{accountIdTitle(cred, language)}</span>
+                      <span className="block">
+                        {t(
+                          `添加于 ${formatFullTime(cred.created_at, language)}`,
+                          `Added ${formatFullTime(cred.created_at, language)}`,
+                        )}
+                      </span>
+                      {cred.proxy && (
+                        <span className="block">{proxyTitle(cred.proxy, language)}</span>
+                      )}
+                      {expiryUrgent && (
+                        <span className="block">
+                          {t(
+                            'access token 即将过期；下一个请求会自动刷新，无需处理',
+                            'The access token is about to expire; the next request refreshes it automatically',
+                          )}
+                        </span>
+                      )}
+                    </TooltipPopup>
+                  </Tooltip>
                 </div>
               </div>
             )}
@@ -310,7 +361,9 @@ export const CredentialCard = memo(function CredentialCard({
                     `${credentialLabel}：${status.label}。${status.detail}`,
                     `${credentialLabel}: ${status.label}. ${status.detail}`,
                   )}
-                  aria-live="polite"
+                  // 不挂 aria-live：一屏二十张卡，每张都成了活区域，任一个号的状态一变
+                  // （30 秒一轮刷新，冷却秒数、额度百分比都在动）读屏就打断用户念一遍。
+                  // 状态本身有 aria-label，用户主动读到这张卡时拿得到，不需要它自己喊。
                 >
                   {status.label}
                 </TooltipTrigger>
@@ -330,45 +383,62 @@ export const CredentialCard = memo(function CredentialCard({
                 {status.label}
               </Badge>
             )}
+            {/* 这一行**按「会不会自己变」排**，不是随手堆：状态（默认字号、抢眼）→ 重置券 /
+                credits（有时效，会消失）→ 套餐 / 优先级（sm 字号，属性）。代理原来也在这里，
+                已经挪进标题下面那行元信息——它跟 `#3 · …9f31d0` 是一类东西，而且列表视图
+                本来就把它放在那一行，两个视图这才对得上。
+
+                说明文字原来挂在原生 `title` 上，键盘用户拿不到（原生提示只认鼠标悬停），而同一
+                张卡的页脚早就换成 Tooltip 组件了——两套规则并存说不通。统一走 Tooltip：不传
+                `render` 时它渲染成 `<button>`，既进焦点序列，又自带 badgeVariants 里那圈焦点环
+                和粗指针下的 44px 热区。代价是每枚徽章占一个焦点位，所以这一行只留真的要解释的
+                东西（套餐那枚给的是上游原始串，优先级那枚讲的是调度规则）。 */}
             {resetBadge && (
-              <Badge variant="success" size="sm" title={resetBadge.title}>
-                {resetBadge.label}
-              </Badge>
+              <Tooltip>
+                <TooltipTrigger className={cn(badgeVariants({ variant: 'success', size: 'sm' }), 'cursor-help')}>
+                  {resetBadge.label}
+                </TooltipTrigger>
+                <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                  {resetBadge.title}
+                </TooltipPopup>
+              </Tooltip>
             )}
             {creditsBadge && (
-              <Badge variant={creditsBadge.variant} size="sm" title={creditsBadge.title}>
-                {creditsBadge.label}
-              </Badge>
+              <Tooltip>
+                <TooltipTrigger
+                  className={cn(badgeVariants({ variant: creditsBadge.variant, size: 'sm' }), 'cursor-help')}
+                >
+                  {creditsBadge.label}
+                </TooltipTrigger>
+                <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                  {creditsBadge.title}
+                </TooltipPopup>
+              </Tooltip>
             )}
-            <Badge
-              variant={planBadgeVariant(cred.plan_type)}
-              size="sm"
-              title={cred.plan_type
-                ? t(`上游报告的套餐：${cred.plan_type}`, `Plan reported by upstream: ${cred.plan_type}`)
-                : t('上游还没报告套餐档位', 'The upstream has not reported a plan yet')}
-            >
-              {planLabel(cred.plan_type, language)}
-            </Badge>
-            <Badge
-              variant="outline"
-              size="sm"
-              title={t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
-            >
-              P{cred.priority}
-            </Badge>
-            {/* 出站代理只标「有」，具体地址在悬浮提示里：地址常带账号密码，不该常驻卡面。 */}
-            {cred.proxy && (
-              <Badge
-                variant="outline"
-                size="sm"
-                title={t(
-                  `该账号的全部出站流量走 ${cred.proxy}`,
-                  `All outbound traffic for this account goes through ${cred.proxy}`,
+            <Tooltip>
+              <TooltipTrigger
+                className={cn(
+                  badgeVariants({ variant: planBadgeVariant(cred.plan_type), size: 'sm' }),
+                  'cursor-help',
                 )}
               >
-                {t('代理', 'Proxy')}
-              </Badge>
-            )}
+                {planLabel(cred.plan_type, language)}
+              </TooltipTrigger>
+              <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                {cred.plan_type
+                  ? t(`上游报告的套餐：${cred.plan_type}`, `Plan reported by upstream: ${cred.plan_type}`)
+                  : t('上游还没报告套餐档位', 'The upstream has not reported a plan yet')}
+              </TooltipPopup>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger className={cn(badgeVariants({ variant: 'outline', size: 'sm' }), 'cursor-help')}>
+                P{cred.priority}
+              </TooltipTrigger>
+              <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
+              </TooltipPopup>
+            </Tooltip>
+            {/* 代理搬到了标题下面那行元信息里（见上面那段注）：它是**属性**，不是状态。 */}
           </div>
 
           <section
@@ -382,8 +452,12 @@ export const CredentialCard = memo(function CredentialCard({
               {quota.snapshotTs != null ? (
                 <Tooltip>
                   <TooltipTrigger
-                    render={<span />}
-                    className="inline-flex items-center gap-1 text-2xs text-muted-foreground"
+                    render={<span tabIndex={0} />}
+                    // 字号跟着上面那行元信息走（同一档次要文字），见标题下面那段注。
+                    className={cn(
+                      'inline-flex items-center gap-1 text-xs @sm/card:text-2xs text-muted-foreground',
+                      HINT_FOCUS_RING,
+                    )}
                   >
                     <ClockIcon className="size-3" />
                     {t(
@@ -394,7 +468,7 @@ export const CredentialCard = memo(function CredentialCard({
                   <TooltipPopup>{snapshotTime}</TooltipPopup>
                 </Tooltip>
               ) : (
-                <span className="text-2xs text-muted-foreground">{t('暂无数据', 'No data')}</span>
+                <span className="text-xs @sm/card:text-2xs text-muted-foreground">{t('暂无数据', 'No data')}</span>
               )}
             </div>
             {reportedWindows.length > 0 ? (
@@ -438,30 +512,28 @@ export const CredentialCard = memo(function CredentialCard({
               : 'flex gap-3',
           )}
         >
-          {/* 页脚这几项统一用 Tooltip 组件而不是原生 title：原生提示有约 1 秒延迟、
-              触屏上完全出不来，样式也不受控，和卡片上方的状态提示不是一套东西。 */}
+          {/* 页脚这几项统一用 Tooltip 组件而不是原生 title：原生提示有约 1 秒延迟、样式不受控，
+              和卡片上方的状态提示不是一套东西（触屏两者都出不来，见 [HINT_FOCUS_RING]）。
+
+              请求数原来是一颗 ghost 按钮，点了开用量明细——那个入口已经搬到标题上了。这里退成
+              和隔壁费用 / RPM 一样的「图标 + 数字 + 提示」，三项长得一样才好互相比对，也不再
+              有两个按钮通向同一个弹窗。 */}
           <Tooltip>
             <TooltipTrigger
+              render={<span tabIndex={0} />}
               className={cn(
-                buttonVariants({ variant: 'ghost' }),
-                // 窄卡片上按钮的横向 padding 收一半：这颗按钮是页脚最宽的一块，
-                // 挤掉的每一像素都直接给右边的 RPM。
-                'min-w-0 max-w-full justify-self-start justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
+                'inline-flex min-w-0 max-w-full shrink items-center gap-1.5 justify-self-start whitespace-nowrap text-xs',
+                HINT_FOCUS_RING,
               )}
-              onClick={() => setUsageOpen(true)}
-              aria-label={t(`查看 ${credentialLabel} 的用量明细`, `View usage details for ${credentialLabel}`)}
-              aria-haspopup="dialog"
             >
-              <ScrollTextIcon className="text-muted-foreground" />
-              <Badge variant="secondary" size="sm" className="tabular-nums">
-                {requestsText}
-              </Badge>
-              <span className="sr-only">{t('条已转发请求', 'forwarded requests')}</span>
+              <ScrollTextIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+              <span className="sr-only">{t('已转发请求', 'Forwarded requests')}</span>
+              <span className="truncate font-medium tabular-nums">{requestsText}</span>
             </TooltipTrigger>
             <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
               {t(
-                `经这个账号转发过 ${requests.toLocaleString(locale)} 条请求（含失败的）。点击查看逐条明细`,
-                `${requests.toLocaleString(locale)} requests forwarded through this account (failures included). Click for the per-request breakdown`,
+                `经这个账号转发过 ${requests.toLocaleString(locale)} 条请求（含失败的）。点标题看逐条明细`,
+                `${requests.toLocaleString(locale)} requests forwarded through this account (failures included). Click the title for the per-request breakdown`,
               )}
             </TooltipPopup>
           </Tooltip>
@@ -484,19 +556,19 @@ export const CredentialCard = memo(function CredentialCard({
             />
           </div>
 
-          {/* 两行布局下的左内边距对齐上一行按钮的 padding（同一个 --spacing(3)-1px），
-              否则钱包图标比上面的卷轴图标突出 11px，两行读起来是错开的。 */}
+          {/* 两行布局下不再补左内边距：上一行那颗按钮退成纯文字之后，两行的图标本来就落在
+              同一条线上（原来要补 --spacing(3)-1px 是为了对齐按钮自己的横向 padding）。 */}
           <div
             className={cn(
               'flex min-w-0 items-center gap-3 @sm/card:gap-4',
-              footerStacked && 'col-span-2 pl-[calc(--spacing(3)-1px)] @sm/card:col-span-1 @sm/card:pl-0',
+              footerStacked && 'col-span-2 @sm/card:col-span-1',
             )}
           >
             <Separator orientation="vertical" className="hidden h-5 @sm/card:block" />
             <Tooltip>
               <TooltipTrigger
-                render={<span />}
-                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs"
+                render={<span tabIndex={0} />}
+                className={cn('inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs', HINT_FOCUS_RING)}
               >
                 {/* 窄卡片省掉钱包图标：`$` 已经把这串数字标成钱了，省下的宽度留给 RPM。 */}
                 <WalletCardsIcon className="hidden size-3.5 text-muted-foreground @sm/card:inline" aria-hidden />
@@ -515,8 +587,8 @@ export const CredentialCard = memo(function CredentialCard({
             <Separator orientation="vertical" className="h-5" />
             <Tooltip>
               <TooltipTrigger
-                render={<span />}
-                className="inline-flex min-w-0 shrink items-center gap-2 whitespace-nowrap text-xs"
+                render={<span tabIndex={0} />}
+                className={cn('inline-flex min-w-0 shrink items-center gap-2 whitespace-nowrap text-xs', HINT_FOCUS_RING)}
               >
                 {/* 页脚里唯一的实时值（隔壁两个都是累计量），用呼吸点替掉图标把「活的」画出来。
                     绿色只落在这个 6px 点上：数值本身无好坏之分，颜色留给状态（运行正常 / 冷却）。 */}

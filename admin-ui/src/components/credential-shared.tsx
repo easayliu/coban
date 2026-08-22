@@ -740,7 +740,9 @@ function QuotaFact({
   return (
     <Tooltip>
       <TooltipTrigger
-        render={<div />}
+        // tabIndex：换成 div 之后它就不在焦点序列里了，键盘用户读不到这段说明。
+        // 焦点环由 badgeVariants 自带，故不必再叠 HINT_FOCUS_RING。
+        render={<div tabIndex={0} />}
         delay={0}
         className={cn(
           badgeVariants({ variant, size: 'sm' }),
@@ -1541,6 +1543,64 @@ function formatWait(secs: number, language: Language): string {
   }
   const days = (secs / 86400).toFixed(1)
   return localize(language, `${days} 天`, `${days} days`)
+}
+
+/**
+ * 头像里那个字。卡片与列表共用——同一个账号在两个视图里必须是同一个字母，不然看着像两个号。
+ *
+ * 取备注首字：备注默认就是邮箱，所以多数情况下是邮箱首字母。备注为空（后端不会给，但类型上
+ * 可能）时退成 `?`，比一个空圆圈说得清楚。
+ */
+export function credentialInitial(credentialLabel: string): string {
+  return credentialLabel.trim().charAt(0).toUpperCase() || '?'
+}
+
+/**
+ * 账号 id 掩码尾段的 title。卡片与列表共用一份——两处各写一遍，改一处就成了同一串东西
+ * 在两个视图里有两种说法。
+ *
+ * 界面上那格只有末 6 位（后端只回掩码，见 `web.rs` 的 `mask`），单看就是一串没头没尾的
+ * 字符，必须由提示说清「这是账号标识」。邮箱一并给出：登录时备注默认取的就是邮箱，但备注
+ * 可以被改名改掉，那之后这里是唯一还能看到邮箱的地方。
+ */
+export function accountIdTitle(
+  cred: Credential,
+  language: Language,
+  /**
+   * 同一段提示里**已经单独显示了的名字**。备注默认取的就是邮箱，那种情况下这里再念一遍
+   * 邮箱就是重复——传进来即可让它自动省掉；改过名（备注 ≠ 邮箱）时邮箱仍然给出，那时它是
+   * 界面上唯一还能看到邮箱的地方。
+   */
+  shownLabel?: string,
+): string {
+  const email = cred.email && cred.email !== shownLabel ? cred.email : null
+  return email
+    ? localize(
+      language,
+      `${email}（账号 ${cred.account_id_masked}）`,
+      `${email} (account ${cred.account_id_masked})`,
+    )
+    : localize(language, `账号 ${cred.account_id_masked}`, `Account ${cred.account_id_masked}`)
+}
+
+/** 出站代理的 title。地址常带账号密码，所以只在提示里给，不常驻界面。 */
+export function proxyTitle(proxy: string, language: Language): string {
+  return localize(
+    language,
+    `该账号的全部出站流量走 ${proxy}`,
+    `All outbound traffic for this account goes through ${proxy}`,
+  )
+}
+
+/**
+ * 这次勾选是不是「按着 shift 的范围选」。
+ *
+ * base-ui 把原生事件放在 `onCheckedChange` 第二个参数的 `event` 上，类型是个联合（鼠标、
+ * 键盘、甚至裸 Event），未必都有 `shiftKey`，所以先探再取。键盘触发的勾选也认 shift——
+ * 用键盘 Tab 到复选框、按住 shift 敲空格，是同一个意图。
+ */
+export function isRangeSelect(event: Event): boolean {
+  return 'shiftKey' in event && (event as MouseEvent).shiftKey === true
 }
 
 /** 开关的 title：停用中的账号说「启用」，反之亦然。 */

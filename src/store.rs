@@ -442,7 +442,7 @@ pub struct UsageRecord {
     pub cred_id: Option<i64>,
     pub cred_label: String,
     /// 这条请求**实际用的会话键**：客户端自报的会话头优先，没有就是前缀指纹
-    /// （见 [`crate::proxy`] 的 `prefix_fingerprint`）。
+    /// （见 [`crate::proxy`] 的 `prefix_parts`）。
     ///
     /// 原来只记客户端自报的那个头，而实测三个真实 codex 客户端一个都不发——于是这一列
     /// 基本全空，一次缓存未命中归不到任何一条会话上。记实际用的那个键才有归因可言。
@@ -1330,7 +1330,7 @@ impl CredentialStore {
     /// 全被限流时返回 [`AllRateLimited`]（带最短等待秒数），调用点据此回一个带
     /// `retry-after` 的 429，而不是一句没有下文的「没有可用账号」。
     ///
-    /// `sticky` 是这条请求的会话键（见 [`crate::proxy`] 的 `prefix_fingerprint`）。给了就按它
+    /// `sticky` 是这条请求的会话键（见 [`crate::proxy`] 的 `prefix_parts`）。给了就按它
     /// 定落点，没给则按档内 LRU 轮换。定落点分两层，**租约优先于哈希**：
     ///
     /// 1. **租约**（[`SessionLeases`]）：这个键上一次真的被哪个号服务过，就还给它。这一层是

@@ -79,6 +79,7 @@ import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { useI18n, type Language } from '@/lib/i18n'
+import { useMediaQuery } from '@/lib/media'
 import { useDebounced } from '@/lib/use-debounced'
 import { cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
 
@@ -103,10 +104,18 @@ export type CredentialTierFilterKey = 'all' | PlanKey
 
 export type CredentialViewMode = 'card' | 'list'
 
-export const CREDENTIAL_PAGE_SIZES = [10, 20, 50] as const
+/**
+ * 每页条数**取 12 的倍数**，不是 10 / 20 / 50。
+ *
+ * 窄屏的卡片是网格，列数在 1 / 2 之间走（见下面那张网格的注）。每页 10 个撞上非整除的列数就
+ * 会在最后一行留空格——三列时是「3+3+3+1」，右边空两格，看着像加载失败或数据缺了一块。
+ *
+ * 通行做法是让每页条数被常见列数整除（12 能被 1/2/3/4/6 整除，列数将来怎么变都是整行），而
+ * **不是**把最后一行的卡片拉宽填满：那会让同一页里的卡片不一样大，卡片之间就没法照着同一个
+ * 位置比读数了。表格不在乎整除，12/24/48 对它只是行数。
+ */
+export const CREDENTIAL_PAGE_SIZES = [12, 24, 48] as const
 export type CredentialPageSize = (typeof CREDENTIAL_PAGE_SIZES)[number]
-
-export const CREDENTIAL_VIEW_MODES = ['card', 'list'] as const
 
 const PAGE_SIZE_ITEMS = CREDENTIAL_PAGE_SIZES.map((size) => ({
   size,
@@ -188,8 +197,19 @@ const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
 export const CREDENTIAL_FILTER_KEYS = FILTERS.map((filter) => filter.key)
 export const CREDENTIAL_TIER_FILTER_KEYS = TIER_FILTERS.map((item) => item.key)
 
+/**
+ * 表格视图的下限宽度（= Tailwind 的 xl）。
+ *
+ * 两件事共用它：首屏默认视图，以及窄屏的强制降级——十几列的表压到手机上每列只剩二十几个
+ * 像素，那时不管偏好是什么都得回卡片。一个说「这么宽该给表格」而另一个说「这么窄得回卡片」，
+ * 两个数不一样的话，中间那段窗口会来回跳。
+ */
+export const LIST_VIEW_MEDIA = '(min-width: 80rem)'
+
+export const CREDENTIAL_VIEW_MODES = ['card', 'list'] as const
+
 export function preferredInitialCredentialView(): CredentialViewMode {
-  return typeof window !== 'undefined' && window.matchMedia('(min-width: 80rem)').matches
+  return typeof window !== 'undefined' && window.matchMedia(LIST_VIEW_MEDIA).matches
     ? 'list'
     : 'card'
 }
@@ -344,6 +364,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     page,
     pageSize,
   } = state
+  /**
+   * **实际渲染哪种视图**：窄屏一律卡片，哪怕存下来的偏好是表格（见 [LIST_VIEW_MEDIA]）。
+   *
+   * 只改渲染、**不改存下来的偏好**：在桌面选了卡片的人，用手机看一眼再回桌面，还是卡片。
+   * 视图切换那组按钮也因此只在 xl 以上出现——窄屏下它只有一个有效值，摆出来是个假选择。
+   */
+  const effectiveView: CredentialViewMode = useMediaQuery(LIST_VIEW_MEDIA) ? view : 'card'
   const pool = credentials ?? []
   const debouncedQuery = useDebounced(query)
   const searchRef = useRef<HTMLInputElement>(null)
@@ -614,10 +641,46 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   selectedRef.current = selected
   const onSelectedChangeRef = useRef(actions.onSelectedChange)
   onSelectedChangeRef.current = actions.onSelectedChange
-  const toggleSelected = useCallback((id: number, checked: boolean) => {
+  const pageItemsRef = useRef(pageItems)
+  pageItemsRef.current = pageItems
+  /**
+   * shift 范围选的锚点：**最后一次不按 shift 勾的那一行**。
+   *
+   * 桌面惯例（Finder / 资源管理器 / Gmail 一路）是连续 shift 点击都从同一个锚点重新展开，
+   * 而不是以上一次 shift 点击处为界——所以只有普通点击才更新它。
+   */
+  const anchorRef = useRef<number | null>(null)
+  /**
+   * `extend`：按着 shift 点的。把锚点到这一行之间**整段**设成这一行的新状态，一次勾一屏。
+   *
+   * 范围按**当前这一页看到的顺序**算（`pageItems`），不是按 id 或者全池顺序——用户眼里的
+   * 「这两行之间」就是排序筛选之后屏幕上的那一段。锚点已经不在本页（翻过页、改过筛选）时
+   * 退回单选，免得勾中一堆看不见的行。
+   *
+   * 语义是**加法**：范围之外已经勾上的不会被清掉（复选框列表的通行做法，Gmail / GitHub /
+   * Jira 都是这样；Finder 那种「整份选择就是这一段」适合单选高亮，不适合一格一个复选框）。
+   * 所以先勾到远处、再 shift 点近处，远端那一截仍留着——那是用户自己勾的，不该被悄悄丢掉。
+   *
+   * 引用要稳定（卡片/行都是 memo 的），所以一律走 ref，不进依赖数组。
+   */
+  const toggleSelected = useCallback((id: number, checked: boolean, extend = false) => {
     const next = new Set(selectedRef.current)
-    if (checked) next.add(id)
-    else next.delete(id)
+    const items = pageItemsRef.current
+    const to = items.findIndex((item) => item.id === id)
+    const from = anchorRef.current == null
+      ? -1
+      : items.findIndex((item) => item.id === anchorRef.current)
+    if (extend && from >= 0 && to >= 0) {
+      const [start, end] = from <= to ? [from, to] : [to, from]
+      for (let i = start; i <= end; i += 1) {
+        if (checked) next.add(items[i].id)
+        else next.delete(items[i].id)
+      }
+    } else {
+      if (checked) next.add(id)
+      else next.delete(id)
+      anchorRef.current = id
+    }
     onSelectedChangeRef.current(next)
   }, [])
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
@@ -868,10 +931,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 </Menu>
               </ToolbarGroup>
 
-              <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block xl:ml-0" />
-              <ToolbarGroup className="self-center justify-end">
+              {/* 分隔线跟着它后面那组一起消失：只留一条竖线挂在工具栏末尾，看着像画坏了。 */}
+              <ToolbarSeparator orientation="vertical" className="hidden xl:ml-0 xl:block" />
+              <ToolbarGroup className="hidden self-center justify-end xl:flex">
                 <ToggleGroup
-                  value={[view]}
+                  value={[effectiveView]}
                   onValueChange={(values) => {
                     const next = values[values.length - 1]
                     if (next === 'card' || next === 'list') actions.onViewChange(next)
@@ -889,8 +953,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   <ToggleGroupSeparator />
                   <ToggleGroupItem
                     value="list"
-                    aria-label={t('列表视图', 'List view')}
-                    title={t('列表视图', 'List view')}
+                    aria-label={t('表格视图', 'Table view')}
+                    title={t('表格视图', 'Table view')}
                   >
                     <ListIcon />
                   </ToggleGroupItem>
@@ -1051,7 +1115,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
           {isLoading ? (
             <div className="relative">
-              <CredentialLoadingState view={view} selectable count={pageSize} />
+              <CredentialLoadingState view={effectiveView} selectable count={pageSize} />
             </div>
           ) : isError && !credentials ? (
             <Card><ErrorState error={error} onRetry={actions.onRetry} /></Card>
@@ -1084,20 +1148,31 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 </EmptyContent>
               </Empty>
             </Card>
-          ) : view === 'list' ? (
+          ) : effectiveView === 'list' ? (
             <Table
               variant="card"
-              // 最小宽度跟着列数收：少一列就少 10rem。写死一个数的话 table-auto 会把省下来
-              // 的宽度摊回给其余列——那一列是收掉了，横向滚动条却还在。
-              // 额度列现在是 w-40（条子上面多了一行窗口用量，见 [QuotaMeter]），故两列全在时
-              // 是 76rem——正好是这一页的最大内容宽度（.page-frame 80rem 减去左右各 2rem）。
+              // 最小宽度跟着**这一档真的会显示的那几列**收：少一列就少它自己那点宽度。写死一个数
+              // 的话 table-auto 会把省下来的宽度摊回给其余列——那一列是收掉了，横向滚动条却还在。
+              //
+              // 下限跟着**真的会渲染的那几列**收：少一列就少它自己那点宽度。写死一个数的话
+              // table-auto 会把省下来的宽度摊回给其余列——那一列是收掉了，横向滚动条却还在。
+              //
+              // 各列宽度之和 64.5rem（含行尾那列开关 w-14；请求 / Token 不在表上，见 [COL] 的
+              // `cost`），下限给到 68.5rem，多出的 4rem 归账号名那列（唯一自适应的一列）。
+              // 额度列每少一个再减 10rem（w-40，见 [QuotaMeter]）。
+              //
+              // 刻意低于画布净宽（76rem = 1216px，卡片视图也是这个数）：拿画布宽度当下限等于把
+              // 横向滚动条焊死——窗口只要被竖向滚动条吃掉十几个像素就得左右拖。
+              //
+              // 不需要 `table-fixed` 与 `xl:` 前缀：这张表只在 ≥80rem 渲染（窄屏强制走卡片，
+              // 见 [LIST_VIEW_MEDIA]），条件写了也永远为真。
               className={cn(
-                'table-fixed xl:table-auto',
+                'table-auto',
                 quotaColumns.primary && quotaColumns.secondary
-                  ? 'xl:min-w-[76rem]'
+                  ? 'min-w-[68.5rem]'
                   : quotaColumns.primary || quotaColumns.secondary
-                    ? 'xl:min-w-[66rem]'
-                    : 'xl:min-w-[56rem]',
+                    ? 'min-w-[58.5rem]'
+                    : 'min-w-[48.5rem]',
               )}
             >
               <TableCaption className="sr-only">{t('账号列表', 'Account list')}</TableCaption>
@@ -1129,7 +1204,16 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </TableBody>
             </Table>
           ) : (
-            <ul className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4">
+            /* **最多两列**，写死列数而不是让 auto-fill 自己排。
+               卡片只在窄屏出现（≥80rem 是表格，见 [LIST_VIEW_MEDIA]），那一档最宽也就 1279px，
+               两列各约 600px 顶格。三列起每行要扫的东西太多，而卡片本身又高——一屏装不下一整行
+               的结果是既没扫完也没比着。两列是这类内容卡片的常规上限。
+               1 → 2 列的门槛取 52rem：那时净画布 784px，两列各 384px，**正好是卡片自己的
+               `@sm/card` 断点**（Tailwind 的 `--container-sm` = 24rem）——卡片到这个宽度才
+               展开成「头像 + 页脚单行 + 额度两列」，再窄就退成更高的堆叠版。所以门槛不是随手
+               挑的：跨过去的那一刻，两张卡刚好都还是展开态。
+               列数固定成 2 之后，每页条数（12 / 24 / 48，见 [CREDENTIAL_PAGE_SIZES]）照样整行。 */
+            <ul className="relative grid list-none grid-cols-1 items-stretch gap-3 p-0 min-[52rem]:grid-cols-2 sm:gap-4">
               {pageItems.map((item) => (
                 <CredentialCard
                   key={item.id}

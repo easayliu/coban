@@ -1,3 +1,5 @@
+import { useSyncExternalStore } from 'react'
+
 /**
  * 深浅色主题：系统 / 浅色 / 深色三态。
  *
@@ -41,6 +43,29 @@ export function writeThemeMode(mode: ThemeMode): void {
     // 存不下就算了，不影响当次使用
   }
   applyThemeMode(mode)
+  // 同一页里可能有不止一处在显示当前模式（宽屏那枚按钮、窄屏菜单里那组单选），
+  // 它们各自 useState 会各存一份，改了一处另一处的对勾就留在旧值上。故走一份订阅。
+  for (const notify of watchers) notify()
+}
+
+const watchers = new Set<() => void>()
+
+/**
+ * 读当前主题模式并跟着变。返回的 setter 就是 [`writeThemeMode`]（写盘 + 上色 + 通知）。
+ *
+ * 用 useSyncExternalStore：模式的真身在 localStorage 与 `<html>` 的 class 上，不在 React
+ * 里——把它复制进组件 state 就有了两份真相。
+ */
+export function useThemeMode(): [ThemeMode, (mode: ThemeMode) => void] {
+  const mode = useSyncExternalStore(
+    (onChange) => {
+      watchers.add(onChange)
+      return () => { watchers.delete(onChange) }
+    },
+    readThemeMode,
+    () => 'system' as ThemeMode,
+  )
+  return [mode, writeThemeMode]
 }
 
 /**
