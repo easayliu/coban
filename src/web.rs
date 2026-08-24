@@ -436,15 +436,14 @@ fn import_one(state: &AppState, acc: &serde_json::Value) -> Result<CredentialVie
         .or_else(|| get("chatgpt_account_id"))
         .or_else(|| claims.account_id.clone());
 
+    let expires_at = import_expires_at(&access_token, tokens);
+
     let mut view = save_token_set(
         state,
         oauth::TokenSet {
             access_token,
             refresh_token,
-            // 导入的 token 大概率已经过期或将过期——**记成 0 让它立刻走一次刷新**，
-            // 而不是照抄 `last_refresh + 3600` 猜一个可能已经过的时刻。第一条请求会
-            // 顺带把它换成新的，且刷新失败能立刻暴露出「这份文件已经不能用了」。
-            expires_at: 0,
+            expires_at,
             id_token,
             claims: oauth::Claims { account_id, ..claims },
         },
@@ -463,6 +462,38 @@ fn import_one(state: &AppState, acc: &serde_json::Value) -> Result<CredentialVie
         }
     }
     Ok(view)
+}
+
+/// 定下一条导入进来的凭证的过期时刻。
+///
+/// **要从 access_token 自己身上读，不能一律记 0**。记 0 等于「导进来立刻强刷一次」，而
+/// 「refresh_token 还能不能用」与「access_token 还剩多久」是两件独立的事：前者作废、后者
+/// 还剩好几天，是导入场景里最常见的一种状态——导出那一刻两边持有的是同一个 refresh_token，
+/// 谁先刷一次，另一边连同整条授权链当场作废（上游回 `refresh_token_invalidated`），而
+/// access_token 完全不受影响，照样能转发到它自己的 `exp` 为止。一律记 0 的话，这种号在
+/// 导入的第一秒就被我们自己用一次必然失败的刷新废掉，明明还能用好几天。
+///
+/// 取值顺序：
+/// 1. access_token 的 `exp` —— token 自证，且 [`oauth::access_token_expires_at`] 会校验
+///    签发方，伪造不进来；
+/// 2. 文件里的 `expires_at` —— sub2api 这类批量导出带，实测与 1 逐个吻合（14 个号里 13 个
+///    完全相同、1 个差 1 秒的取整），留着是为了将来 access_token 不再是 JWT 时还有依据；
+/// 3. 都没有 → 0，保持原来的行为：立刻刷一次，让「这份文件已经不能用了」当场暴露，而不是
+///    等到第一条转发才发现。
+fn import_expires_at(access_token: &str, tokens: &serde_json::Value) -> u64 {
+    oauth::access_token_expires_at(access_token)
+        .or_else(|| json_epoch_secs(tokens.get("expires_at")))
+        .unwrap_or(0)
+}
+
+/// 读一个可能是数字、也可能是数字字符串的 Unix 秒字段。
+///
+/// 两种形态都收是因为导出方不止一家：JSON 里写 `1788092074` 与 `"1788092074"` 的都见过，
+/// 而只认其中一种的代价是「时间戳明明在文件里，却当成缺失退回 0」——那正是这个字段要
+/// 避免的结果，且从表现上看不出原因。
+fn json_epoch_secs(v: Option<&serde_json::Value>) -> Option<u64> {
+    let v = v?;
+    v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())
 }
 
 /// 给一个账号对象取个能认出来的名字，用于跳过原因的定位。
@@ -737,6 +768,11 @@ async fn set_proxy(
 ///
 /// 只验证 refresh_token 与出站链路，**不碰模型也不花额度**——「这个号能不能用某个模型」
 /// 由 [`test_credential`] 回答，它得真发一条请求。
+///
+/// 失败时与自动刷新那两条路**走同一套处置**（[`store::CredentialStore::note_refresh_failure`]）：
+/// 判成永久失效就把号停用并写明理由。少了这一步的话，手动刷一个 refresh_token 已作废的号，
+/// 看到的只是一句「刷新失败」，而库里它还是启用状态、`ban_reason` 是空的——选号照样挑它，
+/// 每条转发各撞一次才知道不行。
 async fn refresh_credential(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -746,8 +782,23 @@ async fn refresh_credential(
     // **失败要在服务端留痕**：`bad_request` 只把详情回给浏览器，而这条是排查授权问题时
     // 唯一有信息量的一行（上游的 error code 就在里面）。日志里只剩一句「400」等于没记。
     let set = oauth::refresh_token(&client, &cred.refresh_token, &cred.user_agent()).await.map_err(|e| {
-        tracing::warn!(cred_id = id, label = %cred.label, error = %format!("{e:#}"), "manual token refresh failed");
-        bad_request(format!("{e:#}"))
+        let banned = state.store.note_refresh_failure(&cred, &e);
+        tracing::warn!(
+            cred_id = id,
+            label = %cred.label,
+            banned = banned.unwrap_or("no"),
+            error = %format!("{e:#}"),
+            "manual token refresh failed"
+        );
+        // 停用了就在回给浏览器的那条里说清楚。用户按这个按钮是想知道「这个号还能不能用」，
+        // 「失败了」与「失败了，而且它已经被关掉、要重新登录」是两个不同的答案。
+        match banned {
+            Some(code) => bad_request(format!(
+                "{e:#}\n\nthis account has been disabled: the upstream rejected its refresh token \
+                 ({code}) and that will not recover on its own — sign in again to restore it."
+            )),
+            None => bad_request(format!("{e:#}")),
+        }
     })?;
     state
         .store
@@ -1269,6 +1320,50 @@ mod tests {
         let masked = mask(long);
         assert!(masked.starts_with('…') && long.ends_with(masked.trim_start_matches('…')));
         assert!(masked.len() < long.len());
+    }
+
+    /// 把一组 claim 拼成形态正确的 access_token（不签名，解析侧本就不验签）。
+    fn fake_access_token(exp: Option<u64>) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let mut body = serde_json::json!({ "iss": crate::config::ISSUER });
+        if let Some(exp) = exp {
+            body["exp"] = serde_json::json!(exp);
+        }
+        let head = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
+        format!("{head}.{}.sig", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&body).unwrap()))
+    }
+
+    /// access_token 自己声明的 `exp` 说了算。这条是导入的关键：refresh_token 已经作废、
+    /// access_token 还剩几天的号，靠这个值才留得住——退回 0 的话它会在导入的第一秒被一次
+    /// 必然失败的刷新废掉。
+    #[test]
+    fn import_takes_the_expiry_from_the_access_token() {
+        let at = fake_access_token(Some(1_788_092_074));
+        // 文件里那个字段存在也不抢：token 自证的那份能校验签发方，更可信。
+        let tokens = serde_json::json!({ "expires_at": 1 });
+        assert_eq!(import_expires_at(&at, &tokens), 1_788_092_074);
+    }
+
+    /// access_token 里没有 `exp`（或它压根不是 JWT）时退到文件里那个字段，数字与数字字符串
+    /// 两种写法都收——只认一种的代价是「时间戳明明在文件里却当成缺失」，表现上看不出原因。
+    #[test]
+    fn import_falls_back_to_the_file_field_in_either_json_shape() {
+        let no_exp = fake_access_token(None);
+        for v in [serde_json::json!(1_788_092_074_u64), serde_json::json!("1788092074")] {
+            let tokens = serde_json::json!({ "expires_at": v });
+            assert_eq!(import_expires_at(&no_exp, &tokens), 1_788_092_074, "{tokens}");
+            assert_eq!(import_expires_at("not-a-jwt", &tokens), 1_788_092_074, "{tokens}");
+        }
+    }
+
+    /// 两处都取不到才退回 0 —— 保持原来的行为：立刻刷一次，让「这份文件不能用了」当场
+    /// 暴露。别处签的 token 也走这条：它的 `exp` 一概不认。
+    #[test]
+    fn import_falls_back_to_an_immediate_refresh_when_nothing_is_known() {
+        let empty = serde_json::json!({});
+        assert_eq!(import_expires_at(&fake_access_token(None), &empty), 0);
+        assert_eq!(import_expires_at("not-a-jwt", &empty), 0);
+        assert_eq!(import_expires_at("", &serde_json::json!({ "expires_at": "soon" })), 0);
     }
 
     /// PKCE 表按 state 索引：并发登录不能互相踩，取走之后不可复用。

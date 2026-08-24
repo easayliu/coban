@@ -640,7 +640,9 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void) {
   const refresh = useMutation({
     mutationFn: () => refreshCredential(cred.id),
     onSuccess: () => { toastManager.add({ title: t('已刷新', 'Refreshed'), type: 'success' }); invalidate() },
-    onError: (e) => failure(t('刷新失败', 'Refresh failed'), e),
+    // 失败也要重取：refresh token 被上游判死时后端会顺手停用这个号并写下理由，不重取的话
+    // toast 说着「已停用」而卡片还亮着，要等下一轮 30 秒轮询才对得上，看着像界面出错了。
+    onError: (e) => { failure(t('刷新失败', 'Refresh failed'), e); invalidate() },
   })
   const remove = useMutation({
     mutationFn: () => deleteCredential(cred.id),

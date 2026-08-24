@@ -57,21 +57,9 @@ impl Claims {
     /// 故这里以嵌套为准，另留一条扁平兜底（万一哪天上游真改成扁平的，不至于当场全挂），
     /// 两种形态都有回归测试钉住。
     pub fn parse(id_token: &str) -> Self {
-        let Some(payload) = id_token.split('.').nth(1) else {
+        let Some(v) = jwt_payload(id_token) else {
             return Self::default();
         };
-        let Ok(raw) = URL_SAFE_NO_PAD.decode(payload) else {
-            return Self::default();
-        };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-            return Self::default();
-        };
-        // **签发方对不上就整条不认**：一个别处签的 JWT 里当然也能有个
-        // `chatgpt_account_id`，照单全收就等于让任何人塞一条假凭证进来。这一步拦不住
-        // 伪造（没验签），但拦得住「粘错了文件」这类真实得多的情况，且报错精确。
-        if v.get("iss").and_then(|x| x.as_str()) != Some(config::ISSUER) {
-            return Self::default();
-        }
         let ns = v.get(config::ID_TOKEN_CLAIM_NS);
         let claim = |name: &str| {
             ns.and_then(|o| o.get(name))
@@ -86,6 +74,37 @@ impl Claims {
             plan_type: claim("chatgpt_plan_type"),
         }
     }
+}
+
+/// 解出一个 JWT 的 payload 段并校验签发方；不是本方签发的一律当没有。
+///
+/// **刻意不验签**，理由见 [`Claims::parse`]。签发方那一道则必须留着：一个别处签的 JWT
+/// 里当然也能有个 `chatgpt_account_id` 或一个很远的 `exp`，照单全收就等于让任何人塞一条
+/// 假凭证进来。这一步拦不住伪造（没验签），但拦得住「粘错了文件」这类真实得多的情况。
+///
+/// access_token 与 id_token 都是 `auth.openai.com` 签发的三段式 JWT，故两边共用这一步。
+fn jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    let raw = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    if v.get("iss").and_then(|x| x.as_str()) != Some(config::ISSUER) {
+        return None;
+    }
+    Some(v)
+}
+
+/// 从 access_token 自己的 `exp` 读它的过期时刻（Unix 秒）。
+///
+/// **解的是 access_token，不是 id_token**：两者的有效期完全不是一个量级——实测同一次
+/// 刷新签出来的 id_token 只有 1 小时，access_token 有 10 天。拿 id_token 的 `exp` 去当
+/// 凭证的过期时刻，等于让每个刚导入的号一小时后就去刷一次，正是这个函数要避免的事。
+///
+/// 用途是[导入][`crate::web`]：那条路拿到的是一份**别处签发、我们没参与过**的 token，
+/// 没有「刚才那次响应说 3600 秒」这种旁证，只能问 token 自己。交换与刷新那两条路不走
+/// 这里——它们的 `expires_in` 是上游当场给的，比 JWT 里的 `exp` 更权威（后者不含时钟偏移
+/// 的修正）。
+pub fn access_token_expires_at(access_token: &str) -> Option<u64> {
+    jwt_payload(access_token)?.get("exp").and_then(serde_json::Value::as_u64)
 }
 
 /// 一次登录尝试的 PKCE 上下文，需在交换 token 时回传。
@@ -194,24 +213,52 @@ impl TokenResponse {
 ///    重试判成永久失效。sub2api 那边是带指数退避直接重试的；这里刻意不这么做，只在
 ///    「确定没发出去」的连接层错误上重试，见 [`crate::store::CredentialStore::valid_access_token`]。
 ///
-/// 判据清单取自 sub2api 的 `isNonRetryableRefreshError`，另补上实测遇到的
-/// `refresh_token_invalidated`（它那份清单里没有，可能是较新的错误码）。
+/// 判据清单取自 sub2api 的 `isNonRetryableRefreshError`，另补上实测遇到的两族。
+///
+/// **匹配是对整条错误文本做子串**，所以这里放的既是 OAuth 标准错误码，也是上游自己那套
+/// 更细的码。两套的形态不一样，别混：
+///
+/// - 标准那套走 `{"error":"invalid_grant"}`，扁平一层；
+/// - 上游那套走 `{"error":{"code":"refresh_token_invalidated","message":"…"}}`，**嵌套**，
+///   而且 401/400 都出现过。实测拿到的有 `refresh_token_invalidated`（「Your session has
+///   ended」，整条授权链被撤销）与 `invalid_refresh_token_*` 一族（token 本身不成立，见下）。
+///
+/// `invalid_refresh_token` 用**前缀**收整族：实测的两个是
+/// `invalid_refresh_token_ciphertext_too_short` 与 `invalid_refresh_token_ciphertext_integrity`
+/// （token 被截断或改过时回的），逐个列举下去必漏——这一族的语义就是「这个 token 本身不
+/// 成立」，没有哪个成员会自己好。漏掉它的代价是这种号被判成暂时性故障，每条请求都去撞一次
+/// 同一堵墙，而 `ban_reason` 始终是空的，界面上看不出为什么一直失败。
+///
+/// 注意不能反过来只留前缀：`refresh_token_invalidated` 与 `refresh_token_reused` 没有
+/// `invalid_` 这个前缀，是另一族。
 pub const PERMANENT_REFRESH_ERRORS: &[&str] = &[
     "invalid_grant",
     "refresh_token_reused",
     "refresh_token_invalidated",
+    "invalid_refresh_token",
     "invalid_client",
     "unauthorized_client",
     "access_denied",
 ];
 
-/// 这次刷新失败是不是**不会自己好**的那种（需要重新授权）。
+/// 这次刷新失败是不是**不会自己好**的那种（需要重新授权）；是则回**命中的那个判据**。
 ///
 /// **大小写不敏感**：错误文本来自上游的 JSON 体与我们自己拼的上下文，大小写不受控，
 /// sub2api 在这一点上专门有条测试（`case_insensitive`）。
-pub fn is_permanent_refresh_error(msg: &str) -> bool {
+///
+/// 回的是命中的码而不是一个 bool，因为停用一个号时要把它写进 `ban_reason`，那一栏是用户
+/// 唯一能看到的解释。写「刷新被拒」等于没说，写上命中的码，`refresh_token_invalidated`
+/// （会话被撤销，只能重登）与 `invalid_refresh_token_ciphertext_integrity`（token 存坏了，
+/// 重导一份可能就好）这两种完全不同的处置才分得开。
+///
+/// 从清单里取而不是去解上游的 JSON：错误文本是我们自己一层层 `context` 拼出来的，形态不
+/// 受控（嵌套 `error.code`、扁平 `error`、纯文本都可能），而清单里的串是 `'static` 的，
+/// 拿来当理由不会把响应体里的东西捎进日志。
+pub fn permanent_refresh_error(msg: &str) -> Option<&'static str> {
     let lower = msg.to_ascii_lowercase();
-    PERMANENT_REFRESH_ERRORS.iter().any(|k| lower.contains(k))
+    // 顺序即优先级：`invalid_refresh_token_*` 比前面几个更具体，但它与它们互斥，
+    // 命中哪个都只有一个答案，故直接取第一个。
+    PERMANENT_REFRESH_ERRORS.iter().copied().find(|k| lower.contains(k))
 }
 
 /// 刷新时申报的 scope。见 [`refresh_token`] 的说明——与登录时那串**不同**，不含
@@ -449,6 +496,34 @@ mod tests {
         assert!(Claims::parse(&token).account_id.is_none());
     }
 
+    /// 导入那条路靠这个值决定「进来之后要不要立刻刷一次」，取不到就退回 0（=立刻刷），
+    /// 而这批号的 refresh_token 往往已经作废——取不出 `exp` 等于把一个还能用好几天的号
+    /// 在导入的第一秒废掉。
+    #[test]
+    fn access_token_expiry_comes_from_its_own_exp_claim() {
+        let token = fake_id_token(serde_json::json!({ "exp": 1_788_092_074_u64 }));
+        assert_eq!(access_token_expires_at(&token), Some(1_788_092_074));
+    }
+
+    /// 别处签的 token 里一样可以有个很远的 `exp`。签发方对不上就不认——认了的话，一条
+    /// 伪造的凭证能让我们永远不去刷新、也就永远发现不了它是假的。
+    #[test]
+    fn access_token_expiry_rejects_a_foreign_issuer_and_garbage() {
+        let foreign = fake_id_token(serde_json::json!({
+            "iss": "https://evil.example",
+            "exp": 1_788_092_074_u64,
+        }));
+        assert_eq!(access_token_expires_at(&foreign), None);
+
+        // 没有 exp 的合法 token 同样返回 None，而不是 Some(0)——两者在调用点的含义不同：
+        // None 走兜底，Some(0) 会被当成「1970 年就过期了」。
+        assert_eq!(access_token_expires_at(&fake_id_token(serde_json::json!({}))), None);
+
+        for junk in ["", "not-a-jwt", "a.b", "a.!!!.c"] {
+            assert_eq!(access_token_expires_at(junk), None, "input: {junk}");
+        }
+    }
+
     #[test]
     fn callback_accepts_full_url_bare_query_and_bare_code() {
         let (code, state) =
@@ -475,17 +550,20 @@ mod tests {
     /// 分类清单取自 sub2api 的 `isNonRetryableRefreshError`，含它那条大小写不敏感的用例。
     #[test]
     fn permanent_refresh_errors_are_classified_case_insensitively() {
-        for msg in [
-            "invalid_grant",
-            "Error: invalid_grant - token revoked",
-            "INVALID_GRANT",
-            r#"status 401, body: {"error":{"code":"refresh_token_reused"}}"#,
-            r#"{"error":{"code":"refresh_token_invalidated"}}"#,
-            "invalid_client",
-            "unauthorized_client",
-            "access_denied",
+        for (msg, want) in [
+            ("invalid_grant", "invalid_grant"),
+            ("Error: invalid_grant - token revoked", "invalid_grant"),
+            ("INVALID_GRANT", "invalid_grant"),
+            (
+                r#"status 401, body: {"error":{"code":"refresh_token_reused"}}"#,
+                "refresh_token_reused",
+            ),
+            (r#"{"error":{"code":"refresh_token_invalidated"}}"#, "refresh_token_invalidated"),
+            ("invalid_client", "invalid_client"),
+            ("unauthorized_client", "unauthorized_client"),
+            ("access_denied", "access_denied"),
         ] {
-            assert!(is_permanent_refresh_error(msg), "should be permanent: {msg}");
+            assert_eq!(permanent_refresh_error(msg), Some(want), "should be permanent: {msg}");
         }
         // 这些**必须**判成可重试：把它们当永久失效，一次机房抖动就能关光整池账号。
         for msg in [
@@ -494,8 +572,33 @@ mod tests {
             "the token endpoint returned 502 Bad Gateway",
             "dns error",
         ] {
-            assert!(!is_permanent_refresh_error(msg), "should be transient: {msg}");
+            assert_eq!(permanent_refresh_error(msg), None, "should be transient: {msg}");
         }
+    }
+
+    /// `invalid_refresh_token_*` 一族——token 本身不成立，重试到天荒地老也不会好。
+    /// 逐条实测自 `https://auth.openai.com/oauth/token`，形态是嵌套的 `error.code`，
+    /// 与扁平的 `{"error":"invalid_grant"}` 不是一回事。
+    #[test]
+    fn the_invalid_refresh_token_family_is_permanent() {
+        for code in [
+            "invalid_refresh_token",
+            "invalid_refresh_token_ciphertext_too_short",
+            "invalid_refresh_token_ciphertext_integrity",
+        ] {
+            let body = format!(
+                r#"the token endpoint returned 400 Bad Request: {{"error":{{"message":"Invalid refresh token.","code":"{code}"}}}}"#
+            );
+            assert_eq!(
+                permanent_refresh_error(&body),
+                Some("invalid_refresh_token"),
+                "should be permanent: {code}"
+            );
+        }
+
+        // 上游那句人话里也有「invalid refresh token」，但它是**空格**分隔的，不该命中
+        // 下划线的判据——判据靠的是 code 而不是 message，两者别混。
+        assert_eq!(permanent_refresh_error(r#"{"message":"Invalid refresh token."}"#), None);
     }
 
     /// verifier/state 取十六进制（对齐 sub2api），且长度落在 RFC 7636 的 43–128 之内。

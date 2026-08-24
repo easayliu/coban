@@ -1026,6 +1026,15 @@ impl CredentialStore {
     /// refresh_token，按 token 去重就会给同一个账号攒出第二行——两行各持一半的用量历史，
     /// 而且老那行的 token 已经作废、每次选中它都是一次失败的转发。账号 id 是稳定的，
     /// 认它才对得上「同一个账号」。
+    ///
+    /// 更新时**把自动停用一并解除**（`disabled` 跟着 `ban_reason`/`resume_at` 一起清）。
+    /// 少了 `disabled` 那一半的话，一个被 [`Self::mark_banned`] 关掉的号重新登录/导入之后
+    /// 会停在 `disabled = 1` 而 `ban_reason` 已经是 NULL 的状态——界面上是「停用了但不说
+    /// 为什么」，而且换了一份新 token 也救不回来，得再手动开一次。
+    ///
+    /// 但**人工停用要保住**：那种号的 `ban_reason` 与 `resume_at` 本来就都是 NULL，靠这个
+    /// 条件与前两者区分开（同 [`Self::resume_if_rate_limited`] 那道判断）。一律置 0 的话，
+    /// 「先关掉、稍后再说」的号会被一次重新导入悄悄放回轮转。
     pub fn upsert(
         &self,
         label: &str,
@@ -1055,6 +1064,9 @@ impl CredentialStore {
                 conn.execute(
                     "UPDATE credentials SET email = ?1, plan_type = ?2, id_token = ?3, \
                          access_token = ?4, refresh_token = ?5, expires_at = ?6, \
+                         disabled = CASE \
+                             WHEN ban_reason IS NOT NULL OR resume_at IS NOT NULL THEN 0 \
+                             ELSE disabled END, \
                          ban_reason = NULL, resume_at = NULL, updated_at = unixepoch() \
                      WHERE id = ?7",
                     params![
@@ -1308,11 +1320,24 @@ impl CredentialStore {
     }
 
     /// 该凭证还要冷却几秒（不在冷却中返回 0）。
+    ///
+    /// **向上取整**：还剩 2.9 秒就报 3，不报 2。这个数有两个去处，两处都吃不起少报：
+    ///
+    /// - [`Self::select`] 用它算「最快什么时候有号」，而调用点会照着这个数睡一觉再选一遍
+    ///   （见 `proxy` 那道 grace）。少报一秒就是睡醒之后那个号**还在冷却里**，于是本来
+    ///   一次就够的等待必须再来一轮——那一轮既是白等，也把「最多等两次」这道预算花在了
+    ///   取整的零头上，而不是花在真的第二次机会上。
+    /// - 回客户端的 `Retry-After` 少报一秒，就是一个保证白跑的往返。
     pub fn cooldown_secs(&self, id: i64) -> i64 {
         let now = Instant::now();
         let mut map = self.cooldown.lock();
         match map.get(&id) {
-            Some(&until) if until > now => (until - now).as_secs().max(1) as i64,
+            // `as_secs()` 向下取整，有零头就补一秒。这一支里 `until > now`，零头与整秒
+            // 至少有一个不为零，所以结果天然 >= 1（不需要再兜一个 `max(1)`）。
+            Some(&until) if until > now => {
+                let left = until - now;
+                (left.as_secs() + u64::from(left.subsec_nanos() > 0)) as i64
+            }
             Some(_) => {
                 map.remove(&id);
                 0
@@ -1616,7 +1641,11 @@ impl CredentialStore {
             return Ok(fresh.access_token);
         }
         let client = clients.for_credential(&fresh)?;
-        let set = refresh_with_retry(&client, &fresh.refresh_token, &fresh.user_agent()).await?;
+        let set = refresh_with_retry(&client, &fresh.refresh_token, &fresh.user_agent())
+            .await
+            .inspect_err(|e| {
+                self.note_refresh_failure(&fresh, e);
+            })?;
         self.update_tokens(
             fresh.id,
             &set.access_token,
@@ -1625,6 +1654,38 @@ impl CredentialStore {
             set.id_token.as_deref(),
         )?;
         Ok(set.access_token)
+    }
+
+    /// 刷新失败之后的统一处置：**只有「不会自己好」的那几种才停用**，并把命中的上游错误码
+    /// 写进 `ban_reason`。真的停用了就回那个码，否则回 `None`（错误是暂时性的，或停用这一步
+    /// 自己失败了）。
+    ///
+    /// 三条会刷新的路径（惰性刷新、撞 401 之后补刷、后台手动刷）**必须共用这一个**。分头写
+    /// 的代价已经踩过：只有惰性刷新那条停用了号，另外两条只 log 一行就把错误抛回去，于是用
+    /// 后台那个按钮刷一个 refresh_token 已作废的号，看到的是一句「刷新失败」，而库里这个号
+    /// 还是启用状态、`ban_reason` 是空的——选号照样挑它，每条转发各撞一次才知道不行，界面上
+    /// 也完全看不出原因。
+    ///
+    /// 网络抖动、上游 5xx 也会走到这里，那些一概不停用：下一条请求自然会再试一次，把它们也
+    /// 判成失效的话，一次机房抖动就能把整池账号关光。
+    pub fn note_refresh_failure(
+        &self,
+        cred: &Credential,
+        err: &anyhow::Error,
+    ) -> Option<&'static str> {
+        let code = crate::oauth::permanent_refresh_error(&format!("{err:#}"))?;
+        let reason = format!("refresh token rejected by upstream: {code} (re-login required)");
+        if let Err(e) = self.mark_banned(cred.id, &reason) {
+            // 停不掉也不能把它当成停掉了——调用点会照着返回值告诉用户「已停用」。
+            tracing::error!(
+                cred_id = cred.id,
+                label = %cred.label,
+                error = %format!("{e:#}"),
+                "could not disable a credential whose refresh token was rejected"
+            );
+            return None;
+        }
+        Some(code)
     }
 
     /// 取该凭证当前可用的 access_token，必要时先刷新。
@@ -1670,15 +1731,7 @@ impl CredentialStore {
                 Ok(set.access_token)
             }
             Err(e) => {
-                // 只有「不会自己好」的那几种才停用（见 [`crate::oauth::is_permanent_refresh_error`]）。
-                // 网络抖动、上游 5xx 也会走到这里，那些留着，下一条请求自然会再试一次——
-                // 把它们也判成失效的话，一次机房抖动就能把整池账号关光。
-                if crate::oauth::is_permanent_refresh_error(&format!("{e:#}")) {
-                    self.mark_banned(
-                        fresh.id,
-                        "refresh token rejected by upstream (re-login required)",
-                    )?;
-                }
+                self.note_refresh_failure(&fresh, &e);
                 Err(e)
             }
         }
@@ -2230,6 +2283,86 @@ mod tests {
         assert_eq!(b.plan_type.as_deref(), Some("pro"));
     }
 
+    /// 重新登录/导入要把**自动**停用解掉。少了这一步的号会停在「disabled = 1 而
+    /// ban_reason 已是 NULL」——界面上看不出为什么关着，换一份新 token 也救不回来。
+    #[test]
+    fn relogin_lifts_an_automatic_pause() {
+        let s = store();
+        for (label, arm) in [
+            (
+                "banned",
+                &(|s: &CredentialStore, id| s.mark_banned(id, "r").unwrap())
+                    as &dyn Fn(&CredentialStore, i64),
+            ),
+            ("rate-limited", &(|s: &CredentialStore, id| s.pause_for_rate_limit(id, 600).unwrap())),
+        ] {
+            // refresh_token 上有 UNIQUE 约束，两轮不能重名。
+            let (rt1, rt2) = (format!("rt1-{label}"), format!("rt2-{label}"));
+            let (c, _) =
+                s.upsert(label, None, None, label, None, "at1", &rt1, now_secs() + 3600).unwrap();
+            arm(&s, c.id);
+            assert!(s.get(c.id).unwrap().unwrap().disabled, "{label}: setup");
+
+            let (after, _) =
+                s.upsert(label, None, None, label, None, "at2", &rt2, now_secs() + 3600).unwrap();
+            assert!(!after.disabled, "{label}: should be back in rotation");
+            assert!(after.ban_reason.is_none(), "{label}");
+            assert!(after.resume_at.is_none(), "{label}");
+        }
+    }
+
+    /// 但**人工停用要保住**：`ban_reason` 与 `resume_at` 都是 NULL 是它与自动停用唯一的
+    /// 区分点。一律置 0 的话，「先关掉、稍后再说」的号会被一次重新导入悄悄放回轮转。
+    #[test]
+    fn relogin_keeps_a_manual_pause() {
+        let s = store();
+        let (c, _) = s.upsert("l", None, None, "acct-1", None, "at1", "rt1", 0).unwrap();
+        s.set_disabled(c.id, true).unwrap();
+
+        let (after, _) = s.upsert("l", None, None, "acct-1", None, "at2", "rt2", 0).unwrap();
+        assert!(after.disabled, "a manual pause must survive a re-import");
+        assert_eq!(after.access_token, "at2", "the token itself still updates");
+    }
+
+    /// 刷新被上游明确拒掉 → 停用，且 `ban_reason` 里带上命中的码。三条刷新路径共用这一个，
+    /// 所以这条测试同时钉住了手动刷新那个按钮的行为。
+    #[test]
+    fn a_permanent_refresh_failure_disables_the_credential_and_says_why() {
+        let s = store();
+        let c = add(&s, "a");
+        let body = r#"the token endpoint returned 401 Unauthorized: {"error":{"code":"refresh_token_invalidated"}}"#;
+
+        assert_eq!(
+            s.note_refresh_failure(&c, &anyhow::anyhow!("{body}")),
+            Some("refresh_token_invalidated")
+        );
+
+        let after = s.get(c.id).unwrap().unwrap();
+        assert!(after.disabled, "a rejected refresh token must take the account out of rotation");
+        assert!(
+            after.ban_reason.unwrap_or_default().contains("refresh_token_invalidated"),
+            "the reason must name the upstream code — it is the only explanation the user sees"
+        );
+        // 封禁不是限流暂停：`resume_at` 留着的话会被惰性恢复当成「到点了」捡回轮转。
+        assert!(after.resume_at.is_none());
+    }
+
+    /// 网络抖动、上游 5xx 一概不动这个号。判成永久失效的话，一次机房抖动就能关光整池账号。
+    #[test]
+    fn a_transient_refresh_failure_leaves_the_credential_alone() {
+        let s = store();
+        let c = add(&s, "a");
+        for msg in [
+            "request to the token endpoint failed: connection reset by peer",
+            "the token endpoint returned 502 Bad Gateway: <html>",
+        ] {
+            assert_eq!(s.note_refresh_failure(&c, &anyhow::anyhow!("{msg}")), None, "{msg}");
+            let after = s.get(c.id).unwrap().unwrap();
+            assert!(!after.disabled, "{msg}");
+            assert!(after.ban_reason.is_none(), "{msg}");
+        }
+    }
+
     /// 没有 account_id 的凭证一律拒收：存进去的话每条转发都 401，而报错指不到这里。
     #[test]
     fn credential_without_account_id_is_rejected() {
@@ -2701,6 +2834,25 @@ mod tests {
         let err = s.select(&[], None).unwrap_err();
         let rl = err.downcast_ref::<AllRateLimited>().expect("should be AllRateLimited");
         assert!(rl.retry_after_secs <= 10, "should report the soonest: {}", rl.retry_after_secs);
+    }
+
+    /// 报出来的剩余冷却是**向上取整**的：少报一秒，等的人睡醒时那个号还在冷却里，
+    /// 拿到 `Retry-After` 的客户端则白跑一个往返。
+    #[test]
+    fn the_reported_cooldown_never_undershoots() {
+        let s = store();
+        let a = add(&s, "a");
+        // 记完立刻读：真实剩余是 2.99… 秒，报 2 就是少报。
+        s.note_rate_limited(a.id, 3);
+        assert_eq!(s.cooldown_secs(a.id), 3);
+        // 池子只剩它时，select 报的等待秒数同样不能少报——proxy 那道 grace 照着它睡。
+        let err = s.select(&[], None).unwrap_err();
+        let rl = err.downcast_ref::<AllRateLimited>().expect("should be AllRateLimited");
+        assert_eq!(rl.retry_after_secs, 3);
+        // 到期即出冷却，不留一个永远报 1 的尾巴。
+        s.note_rate_limited(a.id, 1);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(s.cooldown_secs(a.id), 0);
     }
 
     /// 整池都在等额度重置时，客户端该拿到一个带 `retry-after` 的 429，而不是一句「没有可用

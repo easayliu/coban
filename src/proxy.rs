@@ -59,9 +59,28 @@ const ALL_RATE_LIMITED_GRACE_SECS: i64 = 3;
 
 /// 一条请求最多为「号池全在冷却」等几次。
 ///
-/// 每一次都是实打实加在客户端延迟上的，封顶两次（最坏约 6 秒）：等两轮还没有号回来，说明
-/// 这不是「差一秒」而是号池真的不够用——那时候一句带 `Retry-After` 的 429 才是实话。
+/// 每一次都是实打实加在客户端延迟上的，封顶两次：等两轮还没有号回来，说明这不是「差一秒」
+/// 而是号池真的不够用——那时候一句带 `Retry-After` 的 429 才是实话。
+///
+/// 报出来的秒数是**向上取整**的（见 [`store::CredentialStore::cooldown_secs`]），所以第一次
+/// 等待必然盖过那个号的整个剩余冷却；会走到第二次，只有一种情形：等的这几秒里那个号被别的
+/// 请求又撞了一次 429、冷却顺势延长了。这道预算因此是真的第二次机会，而不是补取整的零头。
 const ALL_RATE_LIMITED_WAITS_MAX: u32 = 2;
+
+/// 上面那道等待要加的抖动上限（毫秒）。
+///
+/// 不加抖动就是**齐刷刷醒**：所有等待者读的是同一张冷却表里同一个到期时刻，算出来的秒数
+/// 一样。而醒来那一刻池子里通常只有刚回血的那一个号（其余还在冷却），`select` 的档内 LRU
+/// 与 HRW 都无从分散，于是攒下来的请求同时砸到它头上——它立刻再撞一次上游 429 重新进冷却
+/// （拿的还是上游给的 `retry-after`，可能比上次更长），输掉竞争的那些白等一场，再拿到同一
+/// 个 429。附带一笔：那一瞬间它们还要一起抢 `select` 里的那把库锁，连带拖慢当时正常的请求。
+///
+/// 错开之后先进去的那条要么占掉 RPM 名额、要么把号打回冷却，后面的是在**错开的时刻**看到
+/// 真相，于是走「当场 429」那条更快也更诚实的路，而不是一起挤进去再一起失败。
+///
+/// 750 毫秒：够把一个瞬间的脉冲摊开，又不至于在 [`ALL_RATE_LIMITED_GRACE_SECS`] 那条线上
+/// 再添出小半秒来。抖动只往后加不往前减——往前就是醒在冷却到期之前，那一轮必然白跑。
+const ALL_RATE_LIMITED_JITTER_MS: u64 = 750;
 
 /// 上游错误体记进日志的截断长度。那句给人看的话从来不长，长的是它回显的请求内容。
 const UPSTREAM_MSG_MAX: usize = 300;
@@ -172,10 +191,13 @@ pub async fn handle(
                 // 一个号都挑不出来、但最早那个马上就回血：等它一下再选一遍，别把这条请求
                 // 判死（见 [`ALL_RATE_LIMITED_GRACE_SECS`]）。**只在一个号都还没试过时等**
                 // ——试过的话下面那句会把更贴近真相的上游响应交回去，等待改变不了那个判决。
-                if let Some(wait) = all_rate_limited_grace(&e, last.is_some(), grace_waits) {
+                if let Some(base) = all_rate_limited_grace(&e, last.is_some(), grace_waits) {
                     grace_waits += 1;
+                    // 抖动：这一批等待者算出来的秒数是同一个，不错开就一起醒、一起砸向
+                    // 刚回血那个号（见 [`ALL_RATE_LIMITED_JITTER_MS`]）。
+                    let wait = base + grace_jitter();
                     tracing::info!(
-                        wait_secs = wait.as_secs(),
+                        wait_ms = wait.as_millis() as u64,
                         waits = grace_waits,
                         "every credential is cooling down but one is about to come back; \
                          waiting for it instead of handing the client a 429"
@@ -2385,6 +2407,15 @@ fn all_rate_limited_grace(e: &anyhow::Error, tried_any: bool, waits: u32) -> Opt
     }
     let secs = e.downcast_ref::<store::AllRateLimited>()?.retry_after_secs;
     (secs <= ALL_RATE_LIMITED_GRACE_SECS).then(|| Duration::from_secs(secs.max(0) as u64))
+}
+
+/// 这次 grace 等待要往后错开多少（见 [`ALL_RATE_LIMITED_JITTER_MS`]）。
+///
+/// 单独一个函数是为了让 [`all_rate_limited_grace`] 保持可断言的纯函数：那道门判的是「该不该
+/// 等、等多久」，抖动是怎么把这一批等待者摊开，两件事分开测。
+fn grace_jitter() -> Duration {
+    use rand::RngExt;
+    Duration::from_millis(rand::rng().random_range(0..=ALL_RATE_LIMITED_JITTER_MS))
 }
 
 /// 把选号失败翻成对客户端有意义的响应。
@@ -5245,6 +5276,21 @@ mod tests {
         assert!(
             all_rate_limited_grace(&anyhow::anyhow!("no enabled credentials"), false, 0).is_none()
         );
+    }
+
+    /// 抖动只往**后**错开，且不越过那道上限：往前错就是醒在冷却到期之前，那一轮必然白跑；
+    /// 越过上限则是在 [`ALL_RATE_LIMITED_GRACE_SECS`] 这条线外面又添出一截等待。
+    #[test]
+    fn the_grace_wait_is_jittered_forward_only() {
+        let cap = Duration::from_millis(ALL_RATE_LIMITED_JITTER_MS);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let j = grace_jitter();
+            assert!(j <= cap, "抖动不该越过上限: {j:?}");
+            seen.insert(j.as_millis());
+        }
+        // 真的在摊开：一批等待者算出来的秒数是同一个，全取同一个抖动等于没加。
+        assert!(seen.len() > 50, "抖动该是散开的，实际只有 {} 种取值", seen.len());
     }
 
     /// 上游那三句抱怨都要认出来，「是哪一项」与「它想要什么」都要读准：认不出来，这段会话
