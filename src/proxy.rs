@@ -41,6 +41,28 @@ const UA_MAX_LEN: usize = 120;
 /// 号放回去再撞一次墙。两处共用（按阈值预停与撞上额度墙），各写一份必然会写出两个数。
 const QUOTA_PAUSE_FALLBACK_SECS: i64 = 15 * 60;
 
+/// 号池整个都在冷却时，**愿意就地等回血**的最长时间（秒）。超过这个数就把 429 交回客户端。
+///
+/// 与 [`store::RATE_LIMIT_WAIT_SECS`] 同一条规矩（短的就地等、长的交回去），管的是另一段：
+/// 那个值管「选中的号撞了上游 429」，这个管「一个号都挑不出来」。缺了这一段，两处对同一件
+/// 事给出两种处置——最早那个号还有 1 秒就回血，客户端却当场吃一个 429。
+///
+/// 为什么不做成设置项：它不是用法的选择，而是「一次往返 vs 一次等待」那条线，3 秒两边都
+/// 划得过去。而 [`store::AllRateLimited`] 报的是**池子里最早那个**的恢复时刻——报 1 秒就
+/// 是真有个号马上回来，为它回一个 429 的代价是：认 `Retry-After` 的客户端白跑一个往返，
+/// 不认的（Go SDK 与各种自己写的 HTTP 调用）直接把一条本来能成的请求判死。
+///
+/// 额度用尽那一类不会走到这里：那种号按恢复时刻**落库**暂停，`select` 压根不把它算进池子。
+/// RPM 打满的号进的是同一个 [`store::AllRateLimited`]，但它报的是整个窗口
+/// （`RPM_WINDOW_SECS`，60 秒），远超这条线，照旧当场交回。
+const ALL_RATE_LIMITED_GRACE_SECS: i64 = 3;
+
+/// 一条请求最多为「号池全在冷却」等几次。
+///
+/// 每一次都是实打实加在客户端延迟上的，封顶两次（最坏约 6 秒）：等两轮还没有号回来，说明
+/// 这不是「差一秒」而是号池真的不够用——那时候一句带 `Retry-After` 的 429 才是实话。
+const ALL_RATE_LIMITED_WAITS_MAX: u32 = 2;
+
 /// 上游错误体记进日志的截断长度。那句给人看的话从来不长，长的是它回显的请求内容。
 const UPSTREAM_MSG_MAX: usize = 300;
 
@@ -140,13 +162,29 @@ pub async fn handle(
 
     let mut tried: Vec<i64> = Vec::new();
     let mut last: Option<Response> = None;
+    // 已经为「号池全在冷却」等过几次（见 [`ALL_RATE_LIMITED_GRACE_SECS`]）。
+    let mut grace_waits = 0u32;
 
     for attempt in 0..MAX_ATTEMPTS {
         let cred = match state.store.select(&tried, session.key()) {
             Ok(c) => c,
             Err(e) => {
-                // 一个都挑不出来时：已经试过号的话把上一次的上游响应交回去（那是更贴近
-                // 真相的错误），一次都没试过才回自己造的错。
+                // 一个号都挑不出来、但最早那个马上就回血：等它一下再选一遍，别把这条请求
+                // 判死（见 [`ALL_RATE_LIMITED_GRACE_SECS`]）。**只在一个号都还没试过时等**
+                // ——试过的话下面那句会把更贴近真相的上游响应交回去，等待改变不了那个判决。
+                if let Some(wait) = all_rate_limited_grace(&e, last.is_some(), grace_waits) {
+                    grace_waits += 1;
+                    tracing::info!(
+                        wait_secs = wait.as_secs(),
+                        waits = grace_waits,
+                        "every credential is cooling down but one is about to come back; \
+                         waiting for it instead of handing the client a 429"
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                // 已经试过号的话把上一次的上游响应交回去（那是更贴近真相的错误），一次都
+                // 没试过才回自己造的错。
                 return last.unwrap_or_else(|| select_error_response(&e));
             }
         };
@@ -1835,6 +1873,25 @@ fn internal_error(e: &anyhow::Error) -> Response {
 fn internal_error_plain(msg: &str) -> Response {
     tracing::error!(error = msg, "failed to build response");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+/// 这次选号失败要不要**就地等一下再选一遍**；`Some(d)` 是该睡多久。
+///
+/// 三道门，缺一不可：
+/// - 失败的原因是 [`store::AllRateLimited`]（号池全在冷却）。别的原因（一个号都没配、全被
+///   停用）等下去也不会变。
+/// - 最早那个号的恢复时刻在 [`ALL_RATE_LIMITED_GRACE_SECS`] 之内。再长就是号池真的不够用，
+///   那时一句带 `Retry-After` 的 429 才是实话。
+/// - 这条请求还**一个号都没试过**（`tried_any`）。试过的话调用点会把那次更贴近真相的上游
+///   响应交回客户端，等待改变不了那个判决。
+///
+/// 外加 [`ALL_RATE_LIMITED_WAITS_MAX`] 的次数上限：每次都是实打实加在客户端延迟上的。
+fn all_rate_limited_grace(e: &anyhow::Error, tried_any: bool, waits: u32) -> Option<Duration> {
+    if tried_any || waits >= ALL_RATE_LIMITED_WAITS_MAX {
+        return None;
+    }
+    let secs = e.downcast_ref::<store::AllRateLimited>()?.retry_after_secs;
+    (secs <= ALL_RATE_LIMITED_GRACE_SECS).then(|| Duration::from_secs(secs.max(0) as u64))
 }
 
 /// 把选号失败翻成对客户端有意义的响应。
@@ -4446,6 +4503,31 @@ mod tests {
         let last = format!("sess-{}", STALE_REASONING_MEMO_MAX * 2 - 1);
         assert!(stale_reasoning_known(&memo, Some(&last), 1));
         assert!(!stale_reasoning_known(&memo, Some("sess-a"), 1));
+    }
+
+    /// 号池全在冷却时，短的就地等、长的交回客户端——两处对同一件事必须给出同一种处置
+    /// （见 [`store::RATE_LIMIT_WAIT_SECS`] 那条规矩）。
+    #[test]
+    fn a_pool_that_is_about_to_come_back_is_waited_out_not_rejected() {
+        let all = |secs| anyhow::Error::new(store::AllRateLimited { retry_after_secs: secs });
+
+        // 最早那个 1 秒后回血：等它，别让客户端吃 429。
+        assert_eq!(all_rate_limited_grace(&all(1), false, 0), Some(Duration::from_secs(1)));
+        assert_eq!(
+            all_rate_limited_grace(&all(ALL_RATE_LIMITED_GRACE_SECS), false, 0),
+            Some(Duration::from_secs(ALL_RATE_LIMITED_GRACE_SECS as u64))
+        );
+        // 再长就是号池真的不够用（RPM 打满报的是整个窗口，也走这一支）：当场交回。
+        assert!(all_rate_limited_grace(&all(ALL_RATE_LIMITED_GRACE_SECS + 1), false, 0).is_none());
+        assert!(all_rate_limited_grace(&all(60), false, 0).is_none());
+        // 等的次数有上限：客户端的延迟是实打实加上去的。
+        assert!(all_rate_limited_grace(&all(1), false, ALL_RATE_LIMITED_WAITS_MAX).is_none());
+        // 已经试过号：那次上游响应更贴近真相，等待改变不了它。
+        assert!(all_rate_limited_grace(&all(1), true, 0).is_none());
+        // 别的选号失败（没配号、全停用）等下去也不会变。
+        assert!(
+            all_rate_limited_grace(&anyhow::anyhow!("no enabled credentials"), false, 0).is_none()
+        );
     }
 
     /// 上游那两句抱怨都要认出来，项号与「它想要什么」都要读准：认不出来，这段会话从此每

@@ -118,6 +118,12 @@ pub fn translate_request(raw: &[u8], sort_tools: bool) -> Result<Translated, Str
         out.insert("reasoning".into(), json!({ "effort": effort }));
     }
     if let Some(text) = translate_response_format(obj.get("response_format"))? {
+        // json_object 那档上游还有一道口子要过（见 [`mention_json`]）。
+        if text.pointer("/format/type").and_then(|t| t.as_str()) == Some("json_object")
+            && let Some(input) = out.get_mut("input").and_then(|v| v.as_array_mut())
+        {
+            mention_json(input);
+        }
         out.insert("text".into(), text);
     }
     // 这两个是上游的硬约束，不是客户端的选择：`store` 只收 `false`（这条路径不存会话），
@@ -372,6 +378,66 @@ fn translate_response_format(rf: Option<&Value>) -> Result<Option<Value>, String
             )))
         }
         Some(other) => Err(format!("unsupported `response_format.type`: `{other}`")),
+    }
+}
+
+/// json_object 那档要补的一句话：让 `input` 里出现 "json" 这个词。
+///
+/// 短、且说的正是客户端已经用 `response_format` 表达过的那件事——补一句长的等于替客户端改
+/// 提示词。
+const JSON_HINT: &str = "Respond in JSON.";
+
+/// `text.format` 是 `json_object` 时，保证 `input` 里的消息提到过 "json"。
+///
+/// 上游的原话：`Response input messages must contain the word 'json' in some form to use
+/// 'text.format' of type 'json_object'.` 那道口子**只看 `input` 里的消息，不看
+/// `instructions`**——而 [`translate_messages`] 正是把 `system`/`developer` 全并进
+/// `instructions` 的：客户端那句「请输出 JSON」十有八九写在系统提示里，一并过去之后
+/// `input` 里就再没有这个词了。同一份请求直接发给 OpenAI 的 `/v1/chat/completions` 是能过的
+/// （那头系统消息也算一条 message），**这条 400 是我们这一跳造出来的**，必须在这一跳补回去。
+///
+/// 补的办法是往**最后一条用户消息**后面加一个内容块，而不是新起一条消息：新起一条会凭空多
+/// 一个对话轮次，客户端那头对不上自己发的 `messages`。一条用户消息都没有（只有工具结果那种
+/// 请求）时才补一条。
+///
+/// 已经提到过就一个字都不动——`json`、`JSON`、`Json` 都算（上游那句话说的是 "in some form"，
+/// 它自己也是不分大小写地找）。
+///
+/// 客户端的提示词里压根没提过 JSON 时也补：那种请求直接发上游一样会被这道口子拦（跟我们这
+/// 一跳无关），而它要的东西已经写在 `response_format` 里了，补一句正是它的本意。
+fn mention_json(input: &mut Vec<Value>) {
+    if input.iter().any(message_mentions_json) {
+        return;
+    }
+    let hint = json!({ "type": "input_text", "text": JSON_HINT });
+    if let Some(content) = input
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.as_array_mut())
+    {
+        content.push(hint);
+        return;
+    }
+    input.push(json!({ "role": "user", "content": [hint] }));
+}
+
+/// 这条消息的正文里提到过 "json" 没有。
+///
+/// 只看**消息**的正文：上游那道口子的措辞是 "input messages"，工具调用的参数、工具结果里出
+/// 现这个词算不算它没说。宁可多补一句（无害），不能少补（那是一条 400）。
+fn message_mentions_json(item: &Value) -> bool {
+    if item.get("role").is_none() {
+        return false;
+    }
+    let has = |v: Option<&Value>| {
+        v.and_then(|t| t.as_str()).is_some_and(|t| t.to_ascii_lowercase().contains("json"))
+    };
+    match item.get("content") {
+        Some(Value::String(_)) => has(item.get("content")),
+        Some(Value::Array(parts)) => parts.iter().any(|p| has(p.get("text"))),
+        _ => false,
     }
 }
 
@@ -940,6 +1006,54 @@ mod tests {
         // 客户端没提推理档位时**不能**凭空加一个：不支持推理的模型会直接 400。
         let v = upstream(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
         assert!(v.get("reasoning").is_none());
+    }
+
+    /// json_object 那档：`input` 里必须出现 "json" 这个词，否则上游一句 400
+    /// （`Response input messages must contain the word 'json' in some form…`）。那道口子不看
+    /// `instructions`，而系统消息正是被我们并进 `instructions` 的——不补这一句，等于我们这一跳
+    /// 把一份本来能过的请求弄成了 400。
+    #[test]
+    fn json_object_mode_makes_sure_the_input_says_json() {
+        // 「请输出 JSON」写在系统提示里的那种（最常见）：input 里补上一句。
+        let v = upstream(
+            r#"{"model":"m","response_format":{"type":"json_object"},"messages":[
+                {"role":"system","content":"Return a JSON object with the field `answer`."},
+                {"role":"user","content":"how tall is Everest"}]}"#,
+        );
+        let content = v["input"][0]["content"].as_array().unwrap();
+        assert_eq!(v["input"].as_array().unwrap().len(), 1, "不该凭空多一个对话轮次");
+        assert_eq!(content[0]["text"], "how tall is Everest", "客户端那段话原样留着");
+        assert_eq!(content[1]["text"], JSON_HINT, "补的一句挂在最后一条用户消息后面");
+        assert_eq!(v["text"]["format"]["type"], "json_object");
+
+        // 用户消息自己提过就一个字都不动，大小写不论。
+        let v = upstream(
+            r#"{"model":"m","response_format":{"type":"json_object"},
+                "messages":[{"role":"user","content":"reply as Json"}]}"#,
+        );
+        assert_eq!(v["input"][0]["content"].as_array().unwrap().len(), 1);
+
+        // 一条用户消息都没有（只有工具结果）时才新起一条。
+        let v = upstream(
+            r#"{"model":"m","response_format":{"type":"json_object"},"messages":[
+                {"role":"assistant","tool_calls":[{"id":"c1","type":"function",
+                 "function":{"name":"shell","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"ok"}]}"#,
+        );
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"][0]["text"], JSON_HINT);
+
+        // 别的档不补：json_schema 与不要求格式的请求都不该被动一个字。
+        let v = upstream(
+            r#"{"model":"m","response_format":{"type":"json_schema","json_schema":
+                {"name":"r","schema":{"type":"object"}}},
+                "messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert_eq!(v["input"][0]["content"].as_array().unwrap().len(), 1);
+        let v = upstream(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(v["input"][0]["content"].as_array().unwrap().len(), 1);
     }
 
     /// 多模态：图片按 input_image 送，`image_url` 收对象与裸字符串两种写法。

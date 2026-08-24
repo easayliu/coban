@@ -1362,7 +1362,9 @@ function AccountPagination({
         </CossPagination>
       )}
       <div className="row-start-1 flex items-center gap-2 justify-self-end md:col-start-3">
-        <span className="max-sm:sr-only">{t('每页', 'Per page')}</span>
+        {/* 汉字之间处处能断行：不钉住 nowrap，「每页」会在这个窄格子里竖排成两行。
+            挤起来该让选择器让位（它有 min-w-20 兜着），而不是把两个字劈开。 */}
+        <span className="shrink-0 whitespace-nowrap max-sm:sr-only">{t('每页', 'Per page')}</span>
         <Select
           items={pageSizeItems}
           value={String(pageSize)}
