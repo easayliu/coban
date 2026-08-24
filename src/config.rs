@@ -81,8 +81,16 @@ pub const RESPONSES_PATH: &str = "responses";
 
 /// 官方客户端的 `originator` 头取值。上游按它区分「哪个 codex 前端发来的」。
 ///
-/// 写死成 CLI 那个值而不是透传来访客户端的：coban 的接入方就是 codex CLI，透传等于把
-/// 一个可被客户端任意改写的值直接送给上游，形态反而不稳定。
+/// **补位值，不是写死值**：来访客户端自报了这个头、而 UA 又走透传档时，跟着过去的是它那份
+/// （见 `proxy::build_forward_headers`）。只有「来访没带」与「UA 被改写了」两种情况才用这里
+/// 这个值。
+///
+/// 早先这里是无条件写死，理由是「coban 的接入方就是 codex CLI，透传等于把一个客户端能任意
+/// 改写的值送给上游」。那个前提过期了：Codex Desktop 这类**自带一份完整身份**的官方前端在这
+/// 条路上已经是常客，而写死会拼出「UA 说 Codex Desktop、originator 说 codex_cli_rs」这种谁都
+/// 产生不出来的组合——它的体里还带着 `client_metadata`（CLI 不发的字段），单收敛头也对不齐。
+/// 客户端能改这个值不假，但那与透传档对 UA 已经做的赌是同一个：身份要么整份透传、要么整份
+/// 收敛，不半透半收。
 pub const ORIGINATOR: &str = "codex_cli_rs";
 
 /// 官方客户端版本号，随 `User-Agent` 与 `x-codex-*` 一起报给上游。

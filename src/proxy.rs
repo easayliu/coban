@@ -2322,6 +2322,10 @@ fn upstream_url(path: &str, query: Option<&str>) -> String {
 /// **入站不按 UA 拦人**：门是接入 key 在把（见 [`client_authorized`]），而 UA 是客户端
 /// 一行配置就能改的东西，拦不住任何有意绕的人。这个开关管的是**出站形态**——上游看到的
 /// 是不是一个自相一致的客户端。
+///
+/// 它**同时管 `originator`**（见 [`build_forward_headers`]）：那两个头说的是同一件事
+/// （「谁在发」），分开处理就会拼出「UA 说 Codex Desktop、`originator` 说 codex_cli_rs」这种
+/// 谁都产生不出来的组合。要么整份透传，要么整份收敛。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UaMode {
     /// 来访客户端报什么就发什么（默认，见 [`store::DEFAULT_UPSTREAM_UA_MODE`]）。
@@ -2403,7 +2407,23 @@ fn build_forward_headers(
     set(&mut out, "authorization", &format!("Bearer {token}"));
     // 这个头与 access_token 是一对：上游认的是两件一起，缺任何一半都是 401。
     set(&mut out, "chatgpt-account-id", &cred.account_id);
-    set(&mut out, "originator", config::ORIGINATOR);
+    // `originator` 与 UA 归**同一个判断**管：改写 UA 那一档把身份整份收敛成 CLI 那份，透传
+    // 那一档就让来访自报的这个头跟着过去。半透半收（UA 说 Codex Desktop、`originator` 说
+    // codex_cli_rs）才是官方客户端产生不出来的那种组合，而这条路上 Codex Desktop 这类**自带
+    // 一份完整身份**的官方前端已经是常客——它的体里还带着 `client_metadata` 这种 CLI 不发的
+    // 字段，头收敛了体也对不上。
+    //
+    // 来访没带（或带了个空值）时一律补上写死的那份：上游按这个头区分是哪个前端，缺了是另一
+    // 种异常形态。第三方客户端（OpenAI SDK、各种翻译类接入）压根不发它，所以它们拿到的与
+    // 以前一样。
+    let keeps_originator = !rewrite_ua
+        && incoming
+            .get("originator")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.trim().is_empty());
+    if !keeps_originator {
+        set(&mut out, "originator", config::ORIGINATOR);
+    }
     // 会话 id 按账号 + 会话键派生，见 Credential::session_id 的注。
     set(&mut out, "session_id", &cred.session_id(fingerprint));
     // 解压 feature 开着，声明什么就可能收到什么压缩形态；这一项要与官方客户端一致。
@@ -5315,6 +5335,53 @@ mod tests {
         );
         assert_eq!(UaMode::from_setting(1), UaMode::Auto);
         assert_eq!(UaMode::from_setting(2), UaMode::Pin);
+    }
+
+    /// `originator` 跟着 UA 走：透传档让来访自报的那份过去（Codex Desktop 这类官方前端自带
+    /// 一份完整身份），改写档整份收敛成写死的那个值。半透半收就是那种谁都产生不出来的组合。
+    #[test]
+    fn the_originator_follows_whatever_happens_to_the_ua() {
+        let cred = ua_cred("acct-9");
+        let desktop = hm(&[
+            ("user-agent", "Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26200; x86_64) unknown"),
+            ("originator", "codex_desktop"),
+        ]);
+
+        // 透传档：两个头一起原样过去。
+        let passed = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Passthrough);
+        assert_eq!(passed.get("originator").unwrap(), "codex_desktop");
+        assert!(passed.get("user-agent").unwrap().to_str().unwrap().starts_with("Codex Desktop/"));
+
+        // 改写档：UA 换成这个号派生的那份，`originator` 跟着收敛，不留下半份旧身份。
+        for mode in [UaMode::Auto, UaMode::Pin] {
+            let out = build_forward_headers(&desktop, &cred, "t", "fp", mode);
+            assert_eq!(out.get("user-agent").unwrap(), cred.user_agent().as_str());
+            assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR, "{mode:?}");
+        }
+
+        // Auto 档遇上真的官方 CLI：UA 放过，`originator` 也跟着放过——判断只有一个。
+        let cli = hm(&[
+            (
+                "user-agent",
+                format!("{}0.150.0 (Mac OS 15.6.1; arm64) unknown", config::UA_PREFIX).as_str(),
+            ),
+            ("originator", "codex_cli_rs"),
+        ]);
+        let out = build_forward_headers(&cli, &cred, "t", "fp", UaMode::Auto);
+        assert!(out.get("user-agent").unwrap().to_str().unwrap().contains("0.150.0"));
+        assert_eq!(out.get("originator").unwrap(), "codex_cli_rs");
+
+        // 来访没带 / 带了个空值：三档都补上写死的那份——上游按这个头区分前端，缺了是另一种
+        // 异常形态。（第三方 SDK 走的正是这条路，它们压根不发这个头。）
+        for headers in [
+            hm(&[("user-agent", "OpenAI/Python 1.108.1")]),
+            hm(&[("user-agent", "OpenAI/Python 1.108.1"), ("originator", "   ")]),
+        ] {
+            for mode in [UaMode::Passthrough, UaMode::Auto, UaMode::Pin] {
+                let out = build_forward_headers(&headers, &cred, "t", "fp", mode);
+                assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR, "{mode:?}");
+            }
+        }
     }
 
     /// 改写 UA 的那条路必须把 SDK 留痕头一起清掉，透传那条路必须一个都不动——留一半就是

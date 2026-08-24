@@ -406,10 +406,15 @@ pub const UPSTREAM_UA_MODE: &str = "upstream_ua_mode";
 /// 默认不动来访客户端报的东西，与 [`DEFAULT_NORMALIZE_TOOL_ORDER`] 同一个态度——要不要
 /// 收敛，取决于接入方是什么，那件事只有用户知道。
 ///
-/// 什么时候该开到 `1`：接入方里有 OpenAI SDK、各种翻译类客户端那一类。转发那头写死了
-/// `originator`（见 [`crate::config::ORIGINATOR`]），透传 UA 会与它对不上——上游看到的是
-/// 「`originator` 说 codex CLI、UA 说 OpenAI/Python」这种官方客户端产生不出来的组合，走
-/// `/v1/chat/completions` 那条路（体被翻成 Responses 形状）更是必然如此。
+/// **`originator` 跟着这个开关走**（见 `crate::proxy::build_forward_headers`）：透传档连它
+/// 一起透传（来访没带才补），改写档连它一起收敛。两个头说的是同一件事，分开处理就会拼出
+/// 「UA 说 Codex Desktop、`originator` 说 codex_cli_rs」这种谁都产生不出来的组合。
+///
+/// 什么时候该开到 `1`：接入方里有 OpenAI SDK、各种翻译类客户端那一类——它们不发
+/// `originator`，只能拿到补位的 CLI 那份，于是「`originator` 说 codex CLI、UA 说
+/// OpenAI/Python」；走 `/v1/chat/completions` 那条路（体被翻成 Responses 形状）更是必然如此。
+/// 反过来，接入方是 codex CLI 与 Codex Desktop 这类自带完整身份的官方前端时，`0` 才是对的：
+/// 它们的头与体本来就自相一致，收敛反而把体（`client_metadata` 那些）落单。
 ///
 /// `2` 留给「确定只有翻译类客户端接入」的场景：来访 UA 确实是 `codex_cli_rs/*` 时透传是
 /// 对的——那客户端报的版本号可能比 [`crate::config::CODEX_VERSION`] 这个写死的常量更新，
