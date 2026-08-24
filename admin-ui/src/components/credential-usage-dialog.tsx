@@ -198,7 +198,7 @@ export function CredentialUsageDialog({
           <section className="grid gap-2 rounded-xl border bg-muted/32 px-3 py-2.5 sm:grid-cols-[auto_auto_minmax(0,1fr)] sm:items-center sm:gap-5 sm:px-4">
             <div className="flex items-baseline justify-between gap-4 sm:block">
               <p className="text-2xs font-medium text-muted-foreground">
-                {t('近 30 天明细花费', 'Request cost, last 30 days')}
+                {t('近 30 天请求花费', 'Request cost, last 30 days')}
               </p>
               <p className="font-semibold text-sm tabular-nums sm:mt-0.5">
                 {usage.data ? formatUsd(usage.data.total_cost) : '—'}
@@ -224,8 +224,8 @@ export function CredentialUsageDialog({
             </div>
             <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">
               {t(
-                '流水仅保留最近 30 天；卡片上的累计花费来自历史账本，因此两者无需相等。',
-                'Logs are retained for 30 days; the card uses the lifetime ledger, so the totals are not expected to match.',
+                '请求明细仅保留最近 30 天；卡片上的累计花费来自历史账本，因此两者无需相等。',
+                'The request log is retained for 30 days; the card uses the lifetime ledger, so the totals are not expected to match.',
               )}
             </p>
           </section>
@@ -451,12 +451,19 @@ function UsageCards({
                 </LogFact>
               )}
             </dl>
-            {log.ua && (
+            {(log.ua || log.upstream_ua) && (
+              // 改写过也**只占一行**（同 UaCell）：这份卡片是给窄屏看的，每多一行就少看一条。
+              // 发出去那份留在 title 里。
               <p
-                className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground"
-                title={log.ua}
+                className="mt-2 flex items-baseline gap-1 border-t pt-1.5 text-2xs text-muted-foreground"
+                title={log.upstream_ua
+                  ? `${t('来访', 'Reported')}: ${log.ua ?? '—'}\n${t('发往上游', 'Sent upstream')}: ${log.upstream_ua}`
+                  : log.ua ?? undefined}
               >
-                {log.ua}
+                <span className="min-w-0 truncate">{log.ua ?? '—'}</span>
+                {log.upstream_ua && (
+                  <span className="shrink-0">{t('→ 已改写', '\u2192 rewritten')}</span>
+                )}
               </p>
             )}
           </li>
@@ -546,7 +553,10 @@ function UsageTable({
           <TableHead className="whitespace-nowrap">{t('会话', 'Session')}</TableHead>
           <TableHead
             className="min-w-52 whitespace-nowrap"
-            title={t('来访客户端自报的 User-Agent', 'User-Agent reported by the incoming client')}
+            title={t(
+              '上行是来访客户端自报的 User-Agent。它被改写过的话，下行（→）是实际发往上游那份——按账号派生，见设置里「发往上游的 User-Agent」。',
+              'The top line is the User-Agent the incoming client reported. When it was rewritten, the second line (\u2192) is what actually went upstream \u2014 derived per account, see "User-Agent sent upstream" in settings.',
+            )}
           >
             {t('客户端 UA', 'Client UA')}
           </TableHead>
@@ -609,7 +619,7 @@ function UsageTable({
               <TableCell className="whitespace-nowrap font-mono text-xs" title={sessionId}>
                 {sessionShort}
               </TableCell>
-              <UaCell ua={log.ua} />
+              <UaCell ua={log.ua} upstreamUa={log.upstream_ua} />
             </TableRow>
           )
         })}
@@ -623,11 +633,28 @@ function UsageTable({
  *
  * 真实 UA 动辄六七十字符，表格里截断显示，完整内容留在 title 里——不截的话一条长 UA
  * 会把整行撑高，一屏就看不了几条。
+ *
+ * `upstreamUa` 非空即「这条请求的 UA 被改写过」（相同的时候后端存的就是 null，见
+ * `UsageLog.upstream_ua`），那时**不另起一行**、只在行尾挂一个标记，发出去那份留在 title 里
+ * ——这张表一行一条，多一行就把这一行撑成两倍高，扫起来对不齐。
  */
-function UaCell({ ua }: { ua: string | null }) {
+function UaCell({ ua, upstreamUa }: { ua: string | null, upstreamUa: string | null }) {
+  const { t } = useI18n()
+  const title = upstreamUa
+    ? `${t('来访', 'Reported')}: ${ua ?? '—'}\n${t('发往上游', 'Sent upstream')}: ${upstreamUa}`
+    : ua ?? undefined
   return (
-    <TableCell className="align-top leading-4" title={ua ?? undefined}>
-      <span className={cn('block truncate', !ua && 'text-muted-foreground')}>{ua ?? '—'}</span>
+    <TableCell className="align-top leading-4" title={title}>
+      <span className="flex items-baseline gap-1">
+        {/* flex 子项默认 min-width:auto，不给 min-w-0 的话 truncate 不生效，长 UA 会把整张
+            表撑宽。 */}
+        <span className={cn('min-w-0 truncate', !ua && 'text-muted-foreground')}>{ua ?? '—'}</span>
+        {upstreamUa && (
+          <span className="shrink-0 text-2xs text-muted-foreground">
+            {t('→ 已改写', '\u2192 rewritten')}
+          </span>
+        )}
+      </span>
     </TableCell>
   )
 }

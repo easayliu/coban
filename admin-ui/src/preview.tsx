@@ -441,7 +441,10 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
     index === 9 ? 'no_usage' : index === 5 ? 'rotated' : index % 4 === 1 ? 'instructions_changed' : 'hit',
   model: index % 3 === 0 ? 'gpt-5-codex' : 'gpt-5',
   path: '/backend-api/codex/responses',
-  ua: 'codex_cli_rs/0.47.0 (Mac OS 15.3; arm64)',
+  ua: index % 6 === 2 ? 'OpenAI/Python 1.108.1' : 'codex_cli_rs/0.47.0 (Mac OS 15.3; arm64)',
+  // 被改写过的那几条（来访是 SDK）才有第二行，其余留 null——与后端一样，相同就不记。
+  upstream_ua:
+    index % 6 === 2 ? 'codex_cli_rs/0.148.0 (Mac OS 15.6.1; arm64) iTerm.app' : null,
   status: index === 5 ? 429 : index === 9 ? 500 : 200,
   input_tokens: index === 9 ? null : 12_480 + index * 913,
   // cached 是 input 的子集（约 93%，长会话的常态），不能比它大——否则命中率一律顶到 100%。

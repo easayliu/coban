@@ -995,7 +995,7 @@ export function CredentialMenuContent({
       </MenuItem>
       <MenuItem onClick={onUsage}>
         <ScrollTextIcon />
-        {t('用量明细', 'Usage details')}
+        {t('请求明细', 'Request log')}
       </MenuItem>
       <MenuSeparator />
       <MenuItem variant="destructive" onClick={onRequestDelete}>

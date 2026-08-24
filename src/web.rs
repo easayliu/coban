@@ -66,6 +66,8 @@ pub struct AppState {
     pub stale_reasoning: proxy::StaleReasoningMemo,
     /// 「这个会话捎来的 `input` 项不合上游要求」的记忆，见 [`crate::proxy::InputRuleMemo`]。
     pub input_rules: proxy::InputRuleMemo,
+    /// 「上游不收这个 schema 关键字」的记忆，见 [`crate::proxy::SchemaKeywordMemo`]。
+    pub schema_keywords: proxy::SchemaKeywordMemo,
 }
 
 type ApiError = (StatusCode, String);
@@ -90,6 +92,7 @@ pub async fn run(
         models_cache: Arc::default(),
         stale_reasoning: Arc::default(),
         input_rules: Arc::default(),
+        schema_keywords: Arc::default(),
     };
 
     spawn_usage_pruner(state.store.clone());
@@ -1281,6 +1284,7 @@ mod tests {
             models_cache: Arc::default(),
             stale_reasoning: Arc::default(),
             input_rules: Arc::default(),
+            schema_keywords: Arc::default(),
         };
         let a = PkceChallenge::generate();
         let b = PkceChallenge::generate();
@@ -1311,6 +1315,7 @@ mod tests {
             models_cache: Arc::default(),
             stale_reasoning: Arc::default(),
             input_rules: Arc::default(),
+            schema_keywords: Arc::default(),
         };
         for _ in 0..PKCE_MAX_PENDING * 2 {
             remember_pkce(&state, PkceChallenge::generate());

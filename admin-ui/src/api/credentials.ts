@@ -153,6 +153,13 @@ export interface UsageLog {
   path: string
   /** 来访客户端自报的 UA（已截断）。 */
   ua: string | null
+  /**
+   * **实际发往上游**的 UA（已截断）；`null` = 与 `ua` 逐字节相同（没被改写）。
+   *
+   * 「改没改」事后推不出来（判定要用当时的档位，那是个全局设置、不随请求入库），所以
+   * 后端按请求存了这一列。见设置里「发往上游的 User-Agent」。
+   */
+  upstream_ua: string | null
   status: number
   input_tokens: number | null
   cached_tokens: number | null

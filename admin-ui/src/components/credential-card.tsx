@@ -233,10 +233,10 @@ export const CredentialCard = memo(function CredentialCard({
                   <AvatarFallback>{initial}</AvatarFallback>
                 </Avatar>
                 <div className="min-w-0 flex-1">
-                  {/* 标题即主操作：点开这个号的用量明细。业界的卡片规范是「一张卡一个明确的
+                  {/* 标题即主操作：点开这个号的请求明细。业界的卡片规范是「一张卡一个明确的
                       主操作」，而这张卡原来的详情入口是页脚一颗卷轴图标，标题反倒不可点——
                       最显眼的东西不承担最常做的事。页脚那颗按钮随之退成纯数字（见页脚那段注），
-                      所以通往用量弹窗的**按钮**仍然只有一个，只是换到了该在的位置。 */}
+                      所以通往请求明细的**按钮**仍然只有一个，只是换到了该在的位置。 */}
                   <h3 id={titleId} className="min-w-0">
                     <button
                       type="button"
@@ -515,7 +515,7 @@ export const CredentialCard = memo(function CredentialCard({
           {/* 页脚这几项统一用 Tooltip 组件而不是原生 title：原生提示有约 1 秒延迟、样式不受控，
               和卡片上方的状态提示不是一套东西（触屏两者都出不来，见 [HINT_FOCUS_RING]）。
 
-              请求数原来是一颗 ghost 按钮，点了开用量明细——那个入口已经搬到标题上了。这里退成
+              请求数原来是一颗 ghost 按钮，点了开请求明细——那个入口已经搬到标题上了。这里退成
               和隔壁费用 / RPM 一样的「图标 + 数字 + 提示」，三项长得一样才好互相比对，也不再
               有两个按钮通向同一个弹窗。 */}
           <Tooltip>
@@ -532,8 +532,8 @@ export const CredentialCard = memo(function CredentialCard({
             </TooltipTrigger>
             <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
               {t(
-                `经这个账号转发过 ${requests.toLocaleString(locale)} 条请求（含失败的）。点标题看逐条明细`,
-                `${requests.toLocaleString(locale)} requests forwarded through this account (failures included). Click the title for the per-request breakdown`,
+                `经这个账号转发过 ${requests.toLocaleString(locale)} 条请求（含失败的）。点标题看请求明细`,
+                `${requests.toLocaleString(locale)} requests forwarded through this account (failures included). Click the title for the request log`,
               )}
             </TooltipPopup>
           </Tooltip>

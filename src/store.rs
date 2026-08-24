@@ -477,6 +477,13 @@ pub struct UsageRecord {
     pub path: String,
     /// 来访客户端自报的 UA（已截断）。
     pub ua: Option<String>,
+    /// **实际发往上游**的 UA（已截断）。`None` = 与 [`Self::ua`] 逐字节相同。
+    ///
+    /// 只在不同时才记，理由有两条：这一列存在的意义就是回答「这条请求被改写了吗、改成了
+    /// 什么」，相同的话它恒等于 `ua`，白占 30 天的地方；而「改没改」这件事**事后推不出来**
+    /// ——判定要用当时的档位（见 [`UPSTREAM_UA_MODE`]），那是个全局设置、不随请求入库，
+    /// 改过档之后拿现在的档位回看历史会算错。
+    pub upstream_ua: Option<String>,
     pub status: i64,
     /// 是否从响应里解析到用量。未解析到时下面各 token 列为空——**记空值而不是 0**，
     /// 0 会被平均值统计当成一次真实的「零消耗请求」。
@@ -598,6 +605,9 @@ pub struct UsageLog {
     pub path: String,
     /// 来访客户端自报的 UA（已截断）。认「谁在发」用它。
     pub ua: Option<String>,
+    /// 实际发往上游的 UA（已截断）；`None` = 与 [`Self::ua`] 相同，见
+    /// [`UsageRecord::upstream_ua`]。
+    pub upstream_ua: Option<String>,
     pub status: i64,
     pub input_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
@@ -802,6 +812,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             model          TEXT,
             path           TEXT    NOT NULL DEFAULT '',
             ua             TEXT,
+            -- 实际发往上游的 UA（已截断）。NULL = 与 ua 那份逐字节相同，见
+            -- UsageRecord::upstream_ua。
+            upstream_ua    TEXT,
             status         INTEGER NOT NULL DEFAULT 0,
             has_usage      INTEGER NOT NULL DEFAULT 0 CHECK (has_usage IN (0,1)),
             input_tokens     INTEGER,
@@ -846,6 +859,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     migrate_token_totals(conn)?;
     migrate_cache_reason(conn)?;
     migrate_reset_credits(conn)?;
+    migrate_upstream_ua(conn)?;
     Ok(())
 }
 
@@ -889,6 +903,24 @@ fn migrate_cache_reason(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_usage_logs_ts_reason ON usage_logs(ts, cache_reason);",
     )
     .context("failed to create the cache_reason index")?;
+    Ok(())
+}
+
+/// 给 `usage_logs` 补上 `upstream_ua` 列。理由同 [`migrate_token_totals`]。
+///
+/// **不回填**：旧行不知道当时发出去的是什么——那取决于当时的档位与当时来访报的 UA，两者
+/// 都没入库。留 NULL 正好落在「与来访那份相同」这个语义上，而那是旧行绝大多数的真实情形
+/// （这一列出现之前，只有「来访没报 UA」那一格会被改写）。
+fn migrate_upstream_ua(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('usage_logs') WHERE name = ?1")?
+        .exists(params!["upstream_ua"])?;
+    if has_column {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE usage_logs ADD COLUMN upstream_ua TEXT;")
+        .context("failed to add upstream_ua to usage_logs")?;
+    tracing::info!("schema migrated: usage_logs.upstream_ua added");
     Ok(())
 }
 
@@ -1725,8 +1757,8 @@ impl CredentialStore {
             "INSERT INTO usage_logs
                  (cred_id, cred_label, session_id, model, path, ua, status, has_usage,
                   input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens,
-                  ttft_ms, total_ms, cost_usd, quota_raw, cache_reason)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                  ttft_ms, total_ms, cost_usd, quota_raw, cache_reason, upstream_ua)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 rec.cred_id,
                 rec.cred_label,
@@ -1746,6 +1778,7 @@ impl CredentialStore {
                 rec.cost_usd,
                 quota_raw,
                 rec.cache_reason,
+                rec.upstream_ua,
             ],
         )?;
         if let Some(cred_id) = rec.cred_id {
@@ -2037,7 +2070,7 @@ impl CredentialStore {
         let sql = format!(
             "SELECT id, ts, cred_id, cred_label, session_id, cache_reason, model, path, ua, status,
                     input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens,
-                    ttft_ms, total_ms, cost_usd
+                    ttft_ms, total_ms, cost_usd, upstream_ua
              FROM usage_logs {where_sql} ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
             args.len() + 1,
             args.len() + 2
@@ -2065,6 +2098,7 @@ impl CredentialStore {
                 ttft_ms: r.get(15)?,
                 total_ms: r.get(16)?,
                 cost_usd: r.get(17)?,
+                upstream_ua: r.get(18)?,
             })
         };
         let logs: Vec<UsageLog> = stmt
@@ -2497,6 +2531,56 @@ mod tests {
         // 只有 4 个桶：20 条 first_turn 合成一行。
         assert_eq!(stats.len(), 4);
         assert_eq!(stats.iter().map(|r| r.requests).sum::<i64>(), 23);
+    }
+
+    /// 老库补 `upstream_ua`：旧行留空（当时发出去的是什么，事后编不出来），新行照常记。
+    ///
+    /// 「相同就留空」这条约定也在这里钉住：那是前端判「这条被改写过」的唯一依据。
+    #[test]
+    fn migration_adds_upstream_ua_without_backfilling() {
+        let s = store();
+        let a = add(&s, "a");
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(a.id),
+            ua: Some("OpenAI/Python 1.108.1".into()),
+            upstream_ua: Some("codex_cli_rs/0.148.0 (Mac OS 15.6.1; arm64) unknown".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        {
+            let conn = s.conn.lock();
+            conn.execute_batch("ALTER TABLE usage_logs DROP COLUMN upstream_ua;").unwrap();
+            init_schema(&conn).unwrap();
+        }
+
+        let page = s.list_usage_page(Some(a.id), 10, 0, None).unwrap();
+        assert_eq!(page.logs.len(), 1);
+        assert!(page.logs[0].upstream_ua.is_none(), "旧行留空，不编一份发出去的 UA");
+
+        // 迁移之后：改写过的记下来，透传的留空。
+        for (ua, upstream) in [
+            (
+                Some("OpenAI/Python 1.108.1"),
+                Some("codex_cli_rs/0.148.0 (Debian 12; x86_64) unknown"),
+            ),
+            (Some("codex_cli_rs/0.150.0 (Mac OS 26.0.1; arm64) vscode"), None),
+        ] {
+            s.insert_usage_log(&UsageRecord {
+                cred_id: Some(a.id),
+                ua: ua.map(str::to_owned),
+                upstream_ua: upstream.map(str::to_owned),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let page = s.list_usage_page(Some(a.id), 10, 0, None).unwrap();
+        assert_eq!(page.logs[0].upstream_ua, None, "透传那条不该留下第二份 UA");
+        assert_eq!(
+            page.logs[1].upstream_ua.as_deref(),
+            Some("codex_cli_rs/0.148.0 (Debian 12; x86_64) unknown")
+        );
+        assert_eq!(page.logs[1].ua.as_deref(), Some("OpenAI/Python 1.108.1"), "来访那份仍是原值");
     }
 
     /// 旧库补 `cache_reason` 列：**不回填**（旧行没有归因可言），补完老流水仍读得出来。

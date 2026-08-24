@@ -120,9 +120,9 @@ export const CACHE_REASONS: Record<
     tone: 'neutral',
   },
   legacy: {
-    label: ['升级前的旧流水', 'Logged before the upgrade'],
+    label: ['升级前的旧请求', 'Logged before the upgrade'],
     hint: [
-      '归因功能上线之前写下的请求，那时还没有这一列。旧行刻意不回填——填什么都是编的。它们会随流水的 30 天保留期自己老化掉，不参与上面的占比。',
+      '归因功能上线之前写下的请求，那时还没有这一列。旧行刻意不回填——填什么都是编的。它们会随请求明细的 30 天保留期自己老化掉，不参与上面的占比。',
       'Requests logged before attribution existed, when this column did not. Old rows are deliberately not backfilled — any value would be invented. They age out with the 30-day log retention and are excluded from the shares above.',
     ],
     tone: 'neutral',
@@ -247,12 +247,12 @@ export function CacheReasonBreakdown({ reasons }: { reasons: CacheReasonStat[] }
           'Ranked by input tokens paid uncached rather than by request count — one long conversation missing costs far more than ten small requests. The darker bars are the ones worth fixing (hover a name for what to do); the pale ones were always going to miss.',
         )}
       </p>
-      {/* 旧流水只说一句，不占一行条子：它不是一个能「修」的原因，而算进分母会把新数据
+      {/* 旧请求只说一句，不占一行条子：它不是一个能「修」的原因，而算进分母会把新数据
           那几行压成 0.x%。说出来是为了让人对得上总条数，不至于以为自己数错了。 */}
       {legacyRequests > 0 && (
         <p className="text-2xs leading-4 text-muted-foreground">
           {t(
-            `另有 ${legacyRequests.toLocaleString(locale)} 条是归因上线之前记下的，没有原因可分，未计入上面的占比；它们会随流水的 30 天保留期自己老化掉。想看干净的读数就把跨度调到 24h。`,
+            `另有 ${legacyRequests.toLocaleString(locale)} 条是归因上线之前记下的，没有原因可分，未计入上面的占比；它们会随请求明细的 30 天保留期自己老化掉。想看干净的读数就把跨度调到 24h。`,
             `A further ${legacyRequests.toLocaleString(locale)} requests were logged before attribution existed and carry no reason, so they are excluded from the shares above; they age out with the 30-day log retention. Switch to the 24h range for a clean read.`,
           )}
         </p>

@@ -475,6 +475,9 @@ async fn forward_once(
     );
     let mut fwd_headers =
         build_forward_headers(headers, cred, &token, session_key.unwrap_or_default(), ua_mode);
+    // 落库要两份：客户端报的，与真的发出去的（见 UaPair）。UA 在这条请求的重试之间不会变
+    // ——凭证与档位都定了——所以这里算一次就够。
+    let ua = UaPair::of(headers, &fwd_headers);
     if collapse || chat.is_some() {
         // 体里的 `stream` 已被我们钉成 true，`accept` 得跟着说 SSE：官方客户端不存在
         // 「体里要流、头里要 JSON」这种自相矛盾的形态，别让上游去猜。
@@ -492,6 +495,8 @@ async fn forward_once(
     let mut stripped = false;
     // 这条请求已经为「`input` 里有不合上游要求的项」修过几遍（见 [`repair_input_items`]）。
     let mut input_repairs = 0u32;
+    // 这条请求已经为「schema 里有上游不收的关键字」修过几遍（见 [`strip_schema_keywords`]）。
+    let mut schema_repairs = 0u32;
     // 撞 401 之后强刷过一次 token 没有：只给一次，刷完还是 401 就是这个号真的坏了。
     let mut token_refreshed = false;
     // 这个会话在这个号上已经吃过一次「解不开」：直接摘掉，省下那次注定 400 的往返
@@ -507,6 +512,14 @@ async fn forward_once(
     let known_rules = known_input_rules(&state.input_rules, session_key);
     if !known_rules.is_empty()
         && let Some(fixed) = repair_input_items(&fwd_body, &known_rules)
+    {
+        fwd_body = fixed;
+    }
+    // 上游不收的 schema 关键字已经学到过：同样先剥掉再发，省下那次注定 400 的往返
+    // （见 [`SchemaKeywordMemo`]）。这份记忆是全局的，跟有没有会话键无关。
+    let forbidden = known_schema_keywords(&state.schema_keywords);
+    if !forbidden.is_empty()
+        && let Some(fixed) = strip_schema_keywords(&fwd_body, &forbidden)
     {
         fwd_body = fixed;
     }
@@ -552,7 +565,7 @@ async fn forward_once(
             state,
             cred,
             path,
-            headers,
+            &ua,
             session,
             status.as_u16() as i64,
             None,
@@ -700,8 +713,9 @@ async fn forward_once(
             stripped = true;
             continue;
         }
-        // 上游嫌 `input` 里某一项不合要求（`id` 前缀不对、或缺了必填的 `encrypted_content`，
-        // 见 [`detect_input_item_complaint`]）：把这一类项修掉再发一遍。**不换号**——坏项在
+        // 上游嫌 `input` 里某一项不合要求（`id` 前缀不对、缺了必填的 `encrypted_content`、或
+        // 那个 id 上游根本查不到，见 [`detect_input_item_complaint`]）：把这一类项修掉再发
+        // 一遍。**不换号**——坏项在
         // 客户端手里的那段历史里，换到第三个号还是同一句 400；也不能就这么把 400 交回去，
         // 客户端下一轮还会把同一段历史发回来，这段会话就此卡死（同摘密文那支的理由）。
         //
@@ -727,6 +741,31 @@ async fn forward_once(
                 );
                 fwd_body = fixed;
                 input_repairs += 1;
+                continue;
+            }
+        }
+        // 上游不认这张 schema 里的某个关键字（`uniqueItems` 这类，见
+        // [`detect_forbidden_schema_keyword`]）：剥掉它再发一遍。**不换号**——这是上游的
+        // schema 子集，换到第三个号还是同一句 400；也不能就这么交回去，那份 schema 躺在
+        // 客户端的配置里，它下一轮还发同一份（同前两支的理由）。
+        //
+        // 重发不再占 RPM 名额（名额由调用点在选号后占过一次）。修上几遍有硬顶
+        // [`SCHEMA_REPAIRS_MAX`]：上游一次只报一个关键字，剩下的往返得有个尽头。
+        if schema_repairs < SCHEMA_REPAIRS_MAX
+            && let Some(key) = detect_forbidden_schema_keyword(status, &bytes)
+        {
+            note_schema_keyword(&state.schema_keywords, &key);
+            if let Some(fixed) =
+                strip_schema_keywords(&fwd_body, &known_schema_keywords(&state.schema_keywords))
+            {
+                tracing::info!(
+                    cred_id = cred.id,
+                    keyword = %key,
+                    "upstream does not accept this keyword in a request schema; \
+                     stripped it and retried on the same credential"
+                );
+                fwd_body = fixed;
+                schema_repairs += 1;
                 continue;
             }
         }
@@ -758,12 +797,12 @@ async fn forward_once(
 
     if collapse {
         return Ok(Outcome::Done(
-            collapse_upstream(state, cred, path, headers, session, chat, up, quota, started).await,
+            collapse_upstream(state, cred, path, &ua, session, chat, up, quota, started).await,
         ));
     }
 
     Ok(Outcome::Done(stream_upstream(
-        state, cred, path, headers, session, chat, up, quota, started, in_flight,
+        state, cred, path, &ua, session, chat, up, quota, started, in_flight,
     )))
 }
 
@@ -782,7 +821,7 @@ async fn collapse_upstream(
     state: &AppState,
     cred: &Credential,
     path: &str,
-    req_headers: &HeaderMap,
+    ua: &UaPair,
     session: &SessionCtx,
     chat: Option<&ChatMode>,
     up: wreq::Response,
@@ -798,7 +837,7 @@ async fn collapse_upstream(
                 state,
                 cred,
                 path,
-                req_headers,
+                ua,
                 session,
                 status.as_u16() as i64,
                 None,
@@ -822,7 +861,7 @@ async fn collapse_upstream(
         state,
         cred,
         path,
-        req_headers,
+        ua,
         session,
         status.as_u16() as i64,
         model,
@@ -896,7 +935,7 @@ fn stream_upstream(
     state: &AppState,
     cred: &Credential,
     path: &str,
-    req_headers: &HeaderMap,
+    ua: &UaPair,
     session: &SessionCtx,
     chat: Option<&ChatMode>,
     up: wreq::Response,
@@ -919,7 +958,8 @@ fn stream_upstream(
         drift: session.drift,
         input_len: session.input_len,
         path: path.to_owned(),
-        ua: ua_of(req_headers),
+        ua: ua.incoming.clone(),
+        upstream_ua: ua.upstream.clone(),
         status: up.status().as_u16() as i64,
         quota,
         started,
@@ -1010,7 +1050,9 @@ fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized,
 /// 上游对这几项都是硬约束，且各自的 400 长得一模一样地不讲道理：
 /// - `store` 漏传或传 `true` → `Store must be set to false`（会话不落在 ChatGPT 侧）；
 /// - `stream` 漏传或传 `false` → `Stream must be set to true`（这条路径只出 SSE）；
-/// - `input` 给一段裸文本 → `Input must be a list`（见 [`normalize_input_shape`]）。
+/// - `input` 给一段裸文本 → `Input must be a list`（见 [`normalize_input_shape`]）；
+/// - `input` 里有 `role: "system"` 的消息 → `System messages are not allowed`
+///   （见 [`merge_system_messages`]）。
 ///
 /// codex CLI 两项都带对了，但照 OpenAI 官方 Responses API 写的客户端不会——那边 `store`
 /// 默认 `true`、`stream` 默认 `false`，两条默认值正好都踩在雷上。改写只此一处：这是上游的
@@ -1037,8 +1079,10 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
     // 趁体已经解开算指纹：为此再解析一遍是白花的 CPU——真实流量里这个体有几百 KB。
     // **排在算指纹之前**：指纹里就含 tools 及其顺序，反过来的话前缀稳住了而落点还在跟着
     // 客户端那个乱序变——两件事必须用同一份顺序。裸文本的 `input` 同理，得先包成列表，
-    // 否则指纹与 `input_len` 认的是一个上游根本不会接受的形状。
+    // 否则指纹与 `input_len` 认的是一个上游根本不会接受的形状。搬系统消息也一样：它同时
+    // 动 `instructions` 与 `input` 的头，而这两段正是前缀的前两截（见 [`prefix_parts`]）。
     let rewrote_input = normalize_input_shape(&mut obj);
+    let merged_system = merge_system_messages(&mut obj);
     let reordered = sort_tools && normalize_tool_order(&mut obj);
     let prefix = prefix_parts(&obj);
     let input_len = obj.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
@@ -1047,7 +1091,13 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
     let collapse = obj.get("stream") != yes;
     // 先扫参数、再判快路径：要不要重新序列化取决于**真的丢掉了东西**，而不是某个字段在不在。
     let dropped = drop_unsupported_params(&mut obj);
-    if !collapse && obj.get("store") == no && !dropped && !reordered && !rewrote_input {
+    if !collapse
+        && obj.get("store") == no
+        && !dropped
+        && !reordered
+        && !rewrote_input
+        && !merged_system
+    {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
         return Normalized { body, collapse, chat: None, prefix, input_len };
     }
@@ -1084,6 +1134,70 @@ fn normalize_input_shape(obj: &mut serde_json::Map<String, serde_json::Value>) -
         }]),
     );
     true
+}
+
+/// 把 `input` 里 `role: "system"` 的消息搬进顶层的 `instructions`。回「是否真的改过」。
+///
+/// 上游不收这个角色，回的是 `System messages are not allowed`——而这条路上的客户端分两拨：
+/// codex CLI 从来不发系统消息（这段对它是空动作），照 Chat Completions 的心智写的接入方则
+/// 把系统提示当 `messages[0]` 塞进 `input`，于是**从第一个请求起就没通过**。
+///
+/// 这不是「替客户端做决定」，与钉 `store`/`stream` 同一档：带着 system 消息必 400，搬走之后
+/// 那段文字一个字不少地到了 `instructions`——它在 Responses 那头本来就是安放这类内容的地方
+/// （[`crate::chat::translate_messages`] 翻 Chat 请求时干的正是同一件事，只是那条路在进门时
+/// 就翻好了，而敲 `responses` 的客户端绕过了整个 [`crate::chat`]）。
+///
+/// **只搬 `system`，不碰 `developer`**：上游那句话只否了前者，而 `developer` 在 Responses
+/// 里是合法角色，没有证据就动它是在猜上游的 schema——猜错一次就是把一条本来能成的请求改坏。
+///
+/// **`instructions` 空缺时也不替它编一句**：那是另一件事（客户端一句系统意图都没表达），
+/// 该由上游那句 400 说话。[`crate::chat`] 那头补一句默认提示，是因为「Chat 客户端
+/// 不发系统消息」再正常不过，这条路上不是。
+///
+/// 三种情况一个字都不动，宁可把请求原样交给上游判：`input` 不是列表、某条系统消息读不出
+/// 文本（只有图片块之类）、`instructions` 已经在那儿但不是字符串。都是「搬过去会丢东西或
+/// 搬不动」，那时一句明确的 400 好过一段语义可疑的请求。
+fn merge_system_messages(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(input) = obj.get("input").and_then(|v| v.as_array()) else { return false };
+    if !input.iter().any(is_system_message) {
+        return false;
+    }
+    if obj.get("instructions").is_some_and(|v| !v.is_string()) {
+        return false;
+    }
+    let mut merged = String::new();
+    for item in input.iter().filter(|i| is_system_message(i)) {
+        // 读不出文本就整条请求不动：把一条系统消息悄悄丢掉比 400 糟。
+        let Some(text) = chat::flatten_text(item.get("content")).filter(|t| !t.trim().is_empty())
+        else {
+            return false;
+        };
+        if !merged.is_empty() {
+            merged.push_str("\n\n");
+        }
+        merged.push_str(&text);
+    }
+    // 已有的 `instructions` 排在前面：它是这条请求的基座提示，客户端另外塞的那几句是补充。
+    let mut instructions =
+        obj.get("instructions").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+    if !instructions.is_empty() {
+        instructions.push_str("\n\n");
+    }
+    instructions.push_str(&merged);
+    obj.insert("instructions".to_owned(), serde_json::Value::String(instructions));
+    if let Some(arr) = obj.get_mut("input").and_then(|v| v.as_array_mut()) {
+        arr.retain(|i| !is_system_message(i));
+    }
+    true
+}
+
+/// `input` 里的这一项是不是一条 `role: "system"` 的消息。
+///
+/// 认 `type` 缺省（Responses 的消息项可以只写 `role`/`content`）与 `type: "message"` 两种；
+/// 别的 `type` 上就算挂着个 `role: "system"` 也不认——那不是一条消息。
+fn is_system_message(item: &serde_json::Value) -> bool {
+    item.get("role").and_then(|r| r.as_str()) == Some("system")
+        && item.get("type").and_then(|t| t.as_str()).is_none_or(|t| t == "message")
 }
 
 /// 上游拒收、且**丢了客户端察觉不到**的参数。逐个实测过，回的都是
@@ -1255,17 +1369,20 @@ pub enum InputItemRule {
     IdPrefix { item_type: String, prefix: String },
     /// 这类项必须带着 `field` 这个字段。
     RequiredField { item_type: String, field: String },
+    /// 上游查不到 `id` 指的那一项：`store=false` 时它压根没被存下来（见
+    /// [`detect_input_item_complaint`] 认的第三句）。
+    UnknownItem { item_type: String, id: String },
 }
 
 impl InputItemRule {
     /// 这一项是不是撞上了这条规则：类型对得上，而它确实不合要求。
     fn violated_by(&self, item: &serde_json::Value) -> bool {
-        let t = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        let t = item_type_of(item).unwrap_or_default();
         match self {
             // 没有 `id` 的项一律放过——规则管的是「`id` 的形状」，一个不带 `id` 的项没有
             // 形状可言（客户端自己造的消息本来就不带）。
             Self::IdPrefix { item_type, prefix } => {
-                item_type == t
+                item_type == &t
                     && item
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -1273,7 +1390,18 @@ impl InputItemRule {
             }
             // `null` 与「字段不在」一样算缺：上游要的是内容，不是这个键存在。
             Self::RequiredField { item_type, field } => {
-                item_type == t && item.get(field).is_none_or(|v| v.is_null())
+                item_type == &t && item.get(field).is_none_or(|v| v.is_null())
+            }
+            // 丢得起的类型按**类**扫：那一批项来自同一段外来历史，上游查不到其中一个，剩下
+            // 的也一样查不到，而它一次只报一个——一项一项修就是一项一次上游往返（同
+            // [`repair_input_items`] 那段的理由）。丢不起的类型只认被点名的那一项：那时的改法
+            // 是摘掉 `id`，一个精确的动作没有理由推广到同类项上去。
+            Self::UnknownItem { item_type, id } => {
+                if DROP_WHOLE_ITEM.contains(&item_type.as_str()) {
+                    item_type == &t
+                } else {
+                    item.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                }
             }
         }
     }
@@ -1286,7 +1414,17 @@ impl InputItemRule {
             Self::RequiredField { .. } => true,
             // `id` 对多数类型是可选的，摘掉就好；[`DROP_WHOLE_ITEM`] 那几个不行。
             Self::IdPrefix { .. } => {
-                DROP_WHOLE_ITEM.contains(&item.get("type").and_then(|t| t.as_str()).unwrap_or(""))
+                DROP_WHOLE_ITEM.contains(&item_type_of(item).unwrap_or_default().as_str())
+            }
+            // 自带内容的项（消息、工具调用、工具结果）**只摘掉 `id`**：摘掉之后上游不再拿这个
+            // id 去查什么，而那条消息、那次调用、那段结果一个字不丢——这是无损的。反过来，
+            // 丢得起的类型（[`DROP_WHOLE_ITEM`]）与光有个 `id`、没带任何内容的引用项
+            // （`item_reference`）只能整项丢：前者本来就该丢，后者摘掉 `id` 就什么都不剩了。
+            Self::UnknownItem { .. } => {
+                DROP_WHOLE_ITEM.contains(&item_type_of(item).unwrap_or_default().as_str())
+                    || !["content", "arguments", "output"]
+                        .iter()
+                        .any(|k| item.get(*k).is_some_and(|v| !v.is_null()))
             }
         }
     }
@@ -1305,10 +1443,18 @@ pub type InputRuleMemo =
 /// 记忆体的上限，同 [`STALE_REASONING_MEMO_MAX`]：会话有生有灭，只能靠先进先出顶住。
 const INPUT_RULE_MEMO_MAX: usize = 512;
 
-/// 上游那句抱怨里能读出来的两件事：坏在第几项、它想要什么。
+/// 上游那句抱怨里能读出来的两件事：坏的是哪一项、它想要什么。
 struct InputItemComplaint {
-    index: usize,
+    at: ItemAt,
     want: Want,
+}
+
+/// 上游是怎么指认那一项的。两种都有，取决于它踩的是哪条口子。
+enum ItemAt {
+    /// 按 `input` 里的项号（`input[137]`）。
+    Index(usize),
+    /// 按项的 `id`。
+    Id(String),
 }
 
 /// 上游想要的那件事。
@@ -1317,11 +1463,24 @@ enum Want {
     IdPrefix(String),
     /// 缺了这个必填字段。
     Field(String),
+    /// 这一项它查不到，得从 `input` 里拿掉。
+    Unresolvable,
 }
 
-/// 判断这次 400 是不是「`input` 里某一项不合上游的要求」，顺手把项号与它想要的那件事读出来。
+/// 取一项的类型。
 ///
-/// 认两句话，都是 2026-08 在 Codex Desktop 的 alpha 版会话上实测到的原文：
+/// `type` 缺省的项当消息算：Responses 允许一条消息只写 `role`/`content`（同
+/// [`is_system_message`] 的判断）。缺了 `type` 又没有 `role` 的项没有类型可言，返回 `None`。
+fn item_type_of(item: &serde_json::Value) -> Option<String> {
+    if let Some(t) = item.get("type").and_then(|t| t.as_str()) {
+        return Some(t.to_owned());
+    }
+    item.get("role").is_some().then(|| "message".to_owned())
+}
+
+/// 判断这次拒绝是不是「`input` 里某一项上游不收」，顺手把是哪一项、它想要什么读出来。
+///
+/// 认三句话，都是 2026-08 实测到的原文（前两句在 Codex Desktop 的 alpha 版会话上）：
 /// - `Invalid 'input[137].id': 'item_7bf507811fb6e5f92c0ce7f2'. Expected an ID that begins
 ///   with 'rs'.`——客户端把一段别处来的历史照原样发了回来，那批项的 `id` 是 `item_…` 而不是
 ///   Responses 的 `rs_…`。
@@ -1329,18 +1488,21 @@ enum Want {
 ///   只剩 `id` 与 `summary`：密文在 `response.output_item.done` 里，上一轮的流没走到那个事件
 ///   （人按了停、网断了、或客户端自己压缩历史时丢了那一截），而 `store=false` 时上游没处查，
 ///   只能靠客户端捎回来。
+/// - `Item with id 'rs_resp_chatcmpl-…' not found. Items are not persisted when `store` is set
+///   to false.`——**404**，不是 400。那个 id 不是上游会发的形状（官方的 reasoning id 里没有
+///   `resp_chatcmpl-` 这一截），它是别的兼容网关造的：客户端在那边跑过几轮，rollout 里存下了
+///   那批假 id，现在同一段会话接着往真上游发。`store=false` 时上游没处查，只能把那批项拿掉。
 ///
-/// 两句都是客户端那头的事，但**代价全在这条链路上**：这段会话从这一轮起每一次都 400。所以照
-/// 摘密文那套处置——修掉再发一遍。
+/// 三句都是客户端那头的事，但**代价全在这条链路上**：这段会话从这一轮起每一次都 400/404。
+/// 所以照摘密文那套处置——修掉再发一遍。
 ///
-/// 读项号与它想要什么、而不是只判「是这个病」：改哪一项、按什么改，全靠上游这句话。
+/// 读是哪一项、它想要什么，而不是只判「是这个病」：改哪一项、按什么改，全靠上游这句话。
 fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputItemComplaint> {
-    if status != StatusCode::BAD_REQUEST {
+    // 400 与 404 两种码：前两句是 400，第三句（查不到那一项）是 404。
+    if status != StatusCode::BAD_REQUEST && status != StatusCode::NOT_FOUND {
         return None;
     }
-    let msg = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_owned))?;
+    let msg = upstream_error_text(body)?;
     if let Some((_, rest)) = msg.split_once("Invalid 'input[")
         && let Some((idx, rest)) = rest.split_once("].id'")
         && let Ok(index) = idx.parse::<usize>()
@@ -1348,7 +1510,21 @@ fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputI
             rest.split_once("begins with '").and_then(|(_, r)| r.split('\'').next())
         && !prefix.trim().is_empty()
     {
-        return Some(InputItemComplaint { index, want: Want::IdPrefix(prefix.trim().to_owned()) });
+        return Some(InputItemComplaint {
+            at: ItemAt::Index(index),
+            want: Want::IdPrefix(prefix.trim().to_owned()),
+        });
+    }
+    // 这一句按 id 指认，不给项号——它本来就不是在说「第几项写错了」，而是「这个 id 我查不到」。
+    if let Some((_, rest)) = msg.split_once("Item with id '")
+        && let Some((id, rest)) = rest.split_once('\'')
+        && rest.trim_start().starts_with("not found")
+        && !id.is_empty()
+    {
+        return Some(InputItemComplaint {
+            at: ItemAt::Id(id.to_owned()),
+            want: Want::Unresolvable,
+        });
     }
     let (_, rest) = msg.split_once("Missing required parameter: 'input[")?;
     let (idx, rest) = rest.split_once("].")?;
@@ -1356,8 +1532,9 @@ fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputI
     let field = rest.split('\'').next()?;
     // 只认项上那一层的裸字段名。`input[2].content[0].text` 这种更深的路径不认：按它学出来的
     // 规则谁也撞不上，白发一次重试。
-    (!field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .then(|| InputItemComplaint { index, want: Want::Field(field.to_owned()) })
+    (!field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then(|| {
+        InputItemComplaint { at: ItemAt::Index(index), want: Want::Field(field.to_owned()) }
+    })
 }
 
 /// 把一句抱怨落成一条规则：抱怨只说了「第几项」，规则要的是「哪一类项」——项号在下一轮就
@@ -1369,8 +1546,16 @@ fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputI
 ///   这条规则学了也修不动，只会白发一次重试。
 fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<InputItemRule> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let item = v.get("input")?.as_array()?.get(complaint.index)?;
-    let item_type = item.get("type")?.as_str()?.to_owned();
+    let input = v.get("input")?.as_array()?;
+    let item = match &complaint.at {
+        ItemAt::Index(i) => input.get(*i)?,
+        // 按 id 指认时那一项**不一定在 `input` 里**（`previous_response_id` 之类也会被上游
+        // 拿去查）：找不到就不学，那条 400 原样交回去。
+        ItemAt::Id(id) => {
+            input.iter().find(|it| it.get("id").and_then(|x| x.as_str()) == Some(id.as_str()))?
+        }
+    };
+    let item_type = item_type_of(item)?;
     match &complaint.want {
         Want::IdPrefix(prefix) => {
             Some(InputItemRule::IdPrefix { item_type, prefix: prefix.clone() })
@@ -1378,13 +1563,19 @@ fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<Input
         Want::Field(field) => DROP_WHOLE_ITEM
             .contains(&item_type.as_str())
             .then(|| InputItemRule::RequiredField { item_type, field: field.clone() }),
+        Want::Unresolvable => match &complaint.at {
+            ItemAt::Id(id) => Some(InputItemRule::UnknownItem { item_type, id: id.clone() }),
+            // 上游没给 id 就没法认那一项，这条规则学不成。
+            ItemAt::Index(_) => None,
+        },
     }
 }
 
 /// 按规则把 `input` 里不合要求的那些项修掉，返回改写后的体；一项都没动则返回 `None`——那说明
 /// 这条 400 不是这个病，重发一遍白发一次。
 ///
-/// 两种改法，界线见 [`InputItemRule::drops_whole_item`]：整项丢掉，或只摘掉那个 `id`。
+/// 两种改法，界线见 [`InputItemRule::drops_whole_item`]：整项丢掉，或只摘掉那个 `id`——后者
+/// 是无损的，那一项的内容一个字不动，上游只是不再拿这个 `id` 去查什么。
 /// **同一条规则把整个 `input` 扫一遍**：上游一次只报第一个坏项，而坏项通常是成片的（同一段
 /// 被压缩过的历史里，那一类项的毛病一模一样），一项一项修就是一项一次上游往返。
 fn repair_input_items(body: &Bytes, rules: &[InputItemRule]) -> Option<Bytes> {
@@ -1395,11 +1586,10 @@ fn repair_input_items(body: &Bytes, rules: &[InputItemRule]) -> Option<Bytes> {
         let before = input.len();
         input.retain(|item| !rules.iter().any(|r| r.violated_by(item) && r.drops_whole_item(item)));
         touched |= input.len() != before;
-        // 留下来的违规项都是「摘掉那个字段就好」的那种，目前只有坏 `id` 一种。
+        // 留下来的违规项都是「摘掉 `id` 就好」的那种：前缀不对的 `id`、或上游查不到的 `id`
+        // ——两种病的药是同一味。缺字段那类规则不会走到这里（它的 `drops_whole_item` 恒为真）。
         for item in input.iter_mut() {
-            let bad_id = rules
-                .iter()
-                .any(|r| matches!(r, InputItemRule::IdPrefix { .. }) && r.violated_by(item));
+            let bad_id = rules.iter().any(|r| r.violated_by(item) && !r.drops_whole_item(item));
             if bad_id && let Some(o) = item.as_object_mut() {
                 touched |= o.remove("id").is_some();
             }
@@ -1428,6 +1618,214 @@ fn note_input_rule(memo: &InputRuleMemo, session_key: Option<&str>, rule: &Input
         memo.pop_front();
     }
     memo.push_back((key.to_owned(), rule.clone()));
+}
+
+/// 上游那句给人看的错误话（`error.message`），原样不截断。
+///
+/// 与 [`upstream_message`] 是两件事：那个是打日志用的，截到 [`UPSTREAM_MSG_MAX`]；这个要
+/// 拿去解析，截一刀就可能正好把要读的那个词切掉。
+fn upstream_error_text(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_owned))
+}
+
+/// 一条请求最多为「schema 里有上游不收的关键字」修几遍。
+///
+/// 同 [`INPUT_REPAIRS_MAX`] 的理由：上游一次只报**第一个**不认的关键字，而一次修复会把同一个
+/// 关键字在整张 schema 里扫干净（见 [`strip_schema_keywords`]），所以一个关键字只要一遍；留
+/// 几遍是给「一张 schema 里几种不认的关键字各写了一点」的客户端。
+const SCHEMA_REPAIRS_MAX: u32 = 3;
+
+/// **一个都不许剥**的 schema 关键字：它们定义的是数据的**结构**。
+///
+/// 剥掉约束（`uniqueItems`/`minItems`/`format`…）只是把校验放宽，模型该产出的形状一个字不变；
+/// 剥掉这几个则是把 schema 掏空——客户端拿到的东西不再受任何约束，而且**它不会报错**，比一句
+/// 400 难查得多（同 [`DROP_WHOLE_ITEM`] 那段「丢得起才丢」的界线）。
+///
+/// 上游真要是嫌这里头某一个「不许用」（`anyOf` 在根上就确实不许用），那就把那句 400 原样
+/// 交回去：这条链路修不动它，得写 schema 的人自己改。
+const SCHEMA_STRUCTURE_KEYS: &[&str] = &[
+    "type",
+    "properties",
+    "items",
+    "prefixItems",
+    "required",
+    "additionalProperties",
+    "enum",
+    "const",
+    "anyOf",
+    "allOf",
+    "oneOf",
+    "not",
+    "$ref",
+    "$defs",
+    "definitions",
+    "description",
+];
+
+/// 值本身就是一张 schema（或一列 schema）的键。递归要顺着它们往下走。
+const SCHEMA_VALUED_KEYS: &[&str] = &[
+    "items",
+    "prefixItems",
+    "additionalItems",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+    "additionalProperties",
+    "propertyNames",
+    "anyOf",
+    "allOf",
+    "oneOf",
+];
+
+/// 值是「名字 → schema」映射的键。**这一层的键是用户起的字段名，不是关键字**。
+const SCHEMA_MAP_KEYS: &[&str] =
+    &["properties", "$defs", "definitions", "patternProperties", "dependentSchemas"];
+
+/// 「上游不收这个 schema 关键字」的记忆：关键字的有界集合。
+///
+/// **不按会话分**（这是与 [`InputRuleMemo`] 的差别）：那份规则说的是「这段会话的历史长歪了」，
+/// 而这份说的是「上游的 schema 方言里没有这个词」——对谁都成立，学一次就该让所有接入方都免掉
+/// 那次注定 400 的往返。何况 schema 是躺在客户端配置里的东西，不像坏项那样只跟着某段历史走。
+///
+/// 敢做成全局的，是因为能学进来的东西被卡得很死：只收上游明说「不许用」的词
+/// （[`detect_forbidden_schema_keyword`]），且结构性的关键字一个都不收
+/// （[`SCHEMA_STRUCTURE_KEYS`]）。剩下的都是约束与注解，剥掉只放宽校验。
+///
+/// 同样只活在进程内存里：上游哪天改口收了这个词，重启就忘掉了。
+pub type SchemaKeywordMemo = Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>;
+
+/// 记忆体的上限。上游不收的关键字统共就那么些，32 个足够；有个顶是因为它是**全局**的，
+/// 不能让一串畸形的 400 把它撑大。满了顶掉最老的那个，同 [`STALE_REASONING_MEMO_MAX`]。
+const SCHEMA_KEYWORD_MEMO_MAX: usize = 32;
+
+/// 判断这次 400 是不是「schema 里有上游不收的关键字」，把那个关键字读出来。
+///
+/// 认的是这一句，2026-08 实测原文（Codex Desktop 带 `--output-schema` 发来的）：
+/// `Invalid schema for response_format 'codex_output_schema': In context=('properties',
+/// 'used_fact_ids'), 'uniqueItems' is not permitted.`——上游的 Structured Outputs 只认 JSON
+/// Schema 的一个子集，`uniqueItems` 这类纯校验关键字不在里面。函数工具的参数 schema 犯同样的
+/// 毛病时措辞是 `Invalid schema for function 'xxx'`，同一句式。
+///
+/// 这跟摘密文、修坏项是同一族病：**请求本身错了、换号也不会好，但客户端每一轮都会把同一份
+/// schema 再发一遍**（它躺在客户端的配置里），不修的话这个接入方从此每条请求都 400。
+///
+/// **只读上游明说的那个词，不自己维护一张「哪些关键字不许用」的表**：那是在猜上游的 schema
+/// 子集，而它还在变。读不出词、词里有奇怪的字符、或那个词是结构性的
+/// （[`SCHEMA_STRUCTURE_KEYS`]），一律返回 `None`——把 400 原样交回去。
+fn detect_forbidden_schema_keyword(status: StatusCode, body: &[u8]) -> Option<String> {
+    if status != StatusCode::BAD_REQUEST {
+        return None;
+    }
+    let msg = upstream_error_text(body)?;
+    if !msg.contains("Invalid schema for") {
+        return None;
+    }
+    let (head, _) = msg.split_once("' is not permitted")?;
+    let key = head.rsplit('\'').next()?.trim().to_owned();
+    if key.is_empty() || SCHEMA_STRUCTURE_KEYS.contains(&key.as_str()) {
+        return None;
+    }
+    key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$').then_some(key)
+}
+
+/// 把这几个关键字从请求里的各张 schema 上剥掉，返回改写后的体；一个都没剥到则返回 `None`
+/// ——那说明这条 400 不是这个病，重发一遍白发一次。
+///
+/// 扫两处：结构化输出的 `text.format.schema`，与函数工具的 `tools[].parameters`。上游那句话
+/// 说得出是哪一处，但**两处都扫**：同一个客户端在两处写出同一个关键字是常态，而一处一次
+/// 往返不值得。
+///
+/// **同一个关键字在整张 schema 里扫干净**，理由同 [`repair_input_items`]：上游一次只报第一个
+/// context，而这种关键字通常是成片的（几个数组上都写着 `uniqueItems`），一处一处修就是一处
+/// 一次上游往返。
+///
+/// 关键字安不安全剥由 [`detect_forbidden_schema_keyword`] 把关，这里只管剥。
+///
+/// **先在原始字节上找一眼**再解 JSON：学到一个关键字之后这个函数就会被**每一条**请求的预检
+/// 调用到（那份记忆是全局的），而真实流量里这个体有几百 KB——为一个多半压根不在里面的词解
+/// 一遍 JSON 是白花的 CPU。代价是关键字若被转义着写进 JSON（`"uniqu\u0065Items"`）就找不着，
+/// 那时退化成不修、把 400 原样交回去，而没有客户端会那么写。
+fn strip_schema_keywords(body: &Bytes, keys: &[String]) -> Option<Bytes> {
+    let text = std::str::from_utf8(body).ok()?;
+    if !keys.iter().any(|k| text.contains(k.as_str())) {
+        return None;
+    }
+    let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body).ok()?;
+    let mut touched = false;
+    if let Some(schema) = obj.get_mut("text").and_then(|t| t.pointer_mut("/format/schema")) {
+        touched |= strip_in_schema(schema, keys);
+    }
+    if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        for t in tools.iter_mut() {
+            if let Some(schema) = t.get_mut("parameters") {
+                touched |= strip_in_schema(schema, keys);
+            }
+        }
+    }
+    if !touched {
+        return None;
+    }
+    serde_json::to_vec(&serde_json::Value::Object(obj)).ok().map(Bytes::from)
+}
+
+/// 顺着一张 schema 往下剥，返回**有没有真剥掉过东西**。
+///
+/// 递归必须**认得 schema 的形状**，不能见到同名的键就删：`properties` 底下那一层的键是用户
+/// 起的字段名——真有人把字段叫 `uniqueItems` 时，删掉的就是他那个字段的定义。所以只在 schema
+/// 节点自己那一层删，往下走则分三种：值是一张 schema（[`SCHEMA_VALUED_KEYS`]，也可能是一列，
+/// `anyOf` 与元组写法的 `items` 都是）、值是「名字 → schema」的映射（[`SCHEMA_MAP_KEYS`]）、
+/// 以及数组里的每一项。
+///
+/// 不必自己拦递归深度：这棵树是 `serde_json` 解出来的，它自己有解析深度上限。
+fn strip_in_schema(node: &mut serde_json::Value, keys: &[String]) -> bool {
+    let mut touched = false;
+    match node {
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                touched |= strip_in_schema(item, keys);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for k in keys {
+                touched |= o.remove(k.as_str()).is_some();
+            }
+            for k in SCHEMA_VALUED_KEYS {
+                if let Some(v) = o.get_mut(*k) {
+                    touched |= strip_in_schema(v, keys);
+                }
+            }
+            for k in SCHEMA_MAP_KEYS {
+                if let Some(serde_json::Value::Object(m)) = o.get_mut(*k) {
+                    for (_, v) in m.iter_mut() {
+                        touched |= strip_in_schema(v, keys);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    touched
+}
+
+/// 取已经学到的那几个关键字。
+fn known_schema_keywords(memo: &SchemaKeywordMemo) -> Vec<String> {
+    memo.lock().iter().cloned().collect()
+}
+
+/// 记下「上游不收这个关键字」。
+fn note_schema_keyword(memo: &SchemaKeywordMemo, key: &str) {
+    let mut memo = memo.lock();
+    if memo.iter().any(|k| k == key) {
+        return;
+    }
+    while memo.len() >= SCHEMA_KEYWORD_MEMO_MAX {
+        memo.pop_front();
+    }
+    memo.push_back(key.to_owned());
 }
 
 /// 把 `tools[]` 按名字排定序，返回**顺序是否真的动过**。
@@ -1768,10 +2166,41 @@ fn incoming_session_id(headers: &HeaderMap) -> Option<String> {
 
 /// 来访 UA（截断后入库）。
 fn ua_of(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.chars().take(UA_MAX_LEN).collect())
+    headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(truncate_ua)
+}
+
+/// 入库前的截断。真实 UA 六七十字符是常态，而这一列的用途是认客户端，不是存证。
+fn truncate_ua(ua: &str) -> String {
+    ua.chars().take(UA_MAX_LEN).collect()
+}
+
+/// 一条请求的两份 UA：来访客户端自报的，与**实际发往上游**的。
+///
+/// 两份都落库（见 [`store::UsageRecord::upstream_ua`]）：请求明细要能回答「客户端报了
+/// 什么、我们发出去的是什么」。这件事**事后推不出来**——判定要用当时的档位（见
+/// [`UaMode`]），而档位是全局设置、不随请求入库。
+#[derive(Debug, Clone, Default)]
+struct UaPair {
+    /// 来访客户端自报的（已截断）。
+    incoming: Option<String>,
+    /// 实际发往上游的（已截断）；`None` = 与 [`Self::incoming`] 逐字节相同（没改写）。
+    upstream: Option<String>,
+}
+
+impl UaPair {
+    /// 从来访头与已构造好的转发头里取这两份。
+    ///
+    /// 取转发头而不是「按档位再算一遍」：那等于把 [`build_forward_headers`] 里的判定复制
+    /// 一份，两处哪天走岔，页面上显示的就不是真的发出去那份。
+    fn of(incoming: &HeaderMap, forwarded: &wreq::header::HeaderMap) -> Self {
+        let reported = incoming.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+        let sent = forwarded.get("user-agent").and_then(|v| v.to_str().ok());
+        Self {
+            incoming: reported.map(truncate_ua),
+            // 截断前比：截断后比会把两条只在末尾不同的长 UA 判成相同。
+            upstream: sent.filter(|s| Some(*s) != reported).map(truncate_ua),
+        }
+    }
 }
 
 /// 上游错误体里那句**给人看的话**。见过的几种嵌法都认，都取不到就退回截断的原文。
@@ -2383,7 +2812,9 @@ struct UsageLogGuard {
     drift: store::PrefixDrift,
     input_len: usize,
     path: String,
+    /// 来访客户端自报的 UA 与实际发出去那份（见 [`UaPair`]）。
     ua: Option<String>,
+    upstream_ua: Option<String>,
     status: i64,
     quota: QuotaSnapshot,
     started: Instant,
@@ -2420,6 +2851,7 @@ impl Drop for UsageLogGuard {
             model,
             path: std::mem::take(&mut self.path),
             ua: self.ua.take(),
+            upstream_ua: self.upstream_ua.take(),
             status: self.status,
             has_usage: usage.is_some(),
             input_tokens: usage.map(|u| u.input_tokens),
@@ -2442,7 +2874,7 @@ fn log_usage(
     state: &AppState,
     cred: &Credential,
     path: &str,
-    req_headers: &HeaderMap,
+    ua: &UaPair,
     session: &SessionCtx,
     status: i64,
     model: Option<String>,
@@ -2472,7 +2904,8 @@ fn log_usage(
         session_id: session.key.clone(),
         model,
         path: path.to_owned(),
-        ua: ua_of(req_headers),
+        ua: ua.incoming.clone(),
+        upstream_ua: ua.upstream.clone(),
         status,
         has_usage: usage.is_some(),
         input_tokens: usage.map(|u| u.input_tokens),
@@ -3238,6 +3671,9 @@ fn log_probe_usage(
         model,
         path: PROBE_PATH.to_owned(),
         ua: Some(PROBE_UA.to_owned()),
+        // `ua` 那一列是个标记（探测没有来访客户端），发出去的仍是这个号派生的那份，
+        // 记上才能在明细里看出探测与真实转发报的是同一台机器。
+        upstream_ua: Some(truncate_ua(&cred.user_agent())),
         status: status.as_u16() as i64,
         has_usage: usage.is_some(),
         input_tokens: usage.map(|u| u.input_tokens),
@@ -4294,6 +4730,77 @@ mod tests {
         assert_eq!(body_shape(b"not json at all"), "<not a JSON object, 15 bytes>");
     }
 
+    /// `input` 里的 `role: "system"` 消息要搬进 `instructions`：上游不收这个角色，回的是
+    /// `System messages are not allowed`——而照 Chat Completions 的心智写的接入方就是把系统
+    /// 提示当 `messages[0]` 塞进 `input` 的，不搬的话它从第一个请求起就没通过。
+    #[test]
+    fn system_messages_are_merged_into_the_instructions() {
+        let v: serde_json::Value = serde_json::from_slice(
+            &norm(
+                "responses",
+                r#"{"model":"gpt-5.5","input":[
+                    {"role":"system","content":"be brief"},
+                    {"role":"user","content":"hi"}]}"#,
+            )
+            .body,
+        )
+        .unwrap();
+        assert_eq!(v["instructions"], "be brief", "那段文字一个字不少地到了该去的地方");
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+
+        // 已有的 `instructions` 是基座提示，排在前面；客户端塞的几句按序接在后面。
+        // Responses 的内容块（`input_text`）也认——它与 chat 那头共用同一份文本提取。
+        let v: serde_json::Value = serde_json::from_slice(
+            &norm(
+                "responses",
+                r#"{"model":"m","instructions":"base","input":[
+                    {"type":"message","role":"system","content":[{"type":"input_text","text":"one"}]},
+                    {"type":"message","role":"user","content":"hi"},
+                    {"type":"message","role":"system","content":"two"}]}"#,
+            )
+            .body,
+        )
+        .unwrap();
+        assert_eq!(v["instructions"], "base\n\none\n\ntwo");
+        assert_eq!(v["input"].as_array().unwrap().len(), 1);
+
+        // 一条系统消息都没有：一个字节都不该改（codex CLI 走的正是这条路，这段对它是空动作）。
+        let raw =
+            r#"{"model":"m","store":false,"stream":true,"input":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(norm("responses", raw).body, Bytes::from(raw.to_owned()));
+
+        // 读不出文本的系统消息（只有图片块）：一项都不搬，整条请求交给上游判——把一条系统
+        // 消息悄悄丢掉比 400 糟。
+        let v: serde_json::Value = serde_json::from_slice(
+            &norm(
+                "responses",
+                r#"{"model":"m","input":[
+                    {"role":"system","content":[{"type":"input_image","image_url":"data:x"}]},
+                    {"role":"user","content":"hi"}]}"#,
+            )
+            .body,
+        )
+        .unwrap();
+        assert_eq!(v["input"].as_array().unwrap().len(), 2, "搬不动就一项都不搬");
+        assert!(v.get("instructions").is_none());
+
+        // `developer` 不碰：上游那句话只否了 system，动一个合法角色是在猜上游的 schema。
+        let v: serde_json::Value = serde_json::from_slice(
+            &norm(
+                "responses",
+                r#"{"model":"m","input":[
+                    {"role":"developer","content":"be brief"},
+                    {"role":"user","content":"hi"}]}"#,
+            )
+            .body,
+        )
+        .unwrap();
+        assert_eq!(v["input"].as_array().unwrap().len(), 2);
+        assert!(v.get("instructions").is_none());
+    }
+
     /// `input` 给一段裸文本是官方 SDK 的头号写法（`client.responses.create(input="hi")`），
     /// 而订阅这条路径只认列表，原样转上去就是一句 `Input must be a list`。
     #[test]
@@ -4547,6 +5054,40 @@ mod tests {
         assert_eq!(passed.get("x-stainless-lang").unwrap(), "python");
     }
 
+    /// 落库那两份 UA：来访那份照原样记，发出去那份**只在不同时**记——请求明细就是靠
+    /// 「第二份在不在」判这条被改写过没有。
+    #[test]
+    fn the_logged_ua_pair_only_keeps_the_second_one_when_it_differs() {
+        let cred = ua_cred("acct-9");
+
+        let sdk = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
+        let rewritten =
+            UaPair::of(&sdk, &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Auto));
+        assert_eq!(rewritten.incoming.as_deref(), Some("OpenAI/Python 1.108.1"));
+        assert_eq!(rewritten.upstream.as_deref(), Some(cred.user_agent().as_str()));
+
+        // 同一条请求在透传档上：发出去的与来访逐字节相同，第二份留空。
+        let passed =
+            UaPair::of(&sdk, &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Passthrough));
+        assert_eq!(passed.incoming.as_deref(), Some("OpenAI/Python 1.108.1"));
+        assert_eq!(passed.upstream, None, "没改写就不该留下第二份");
+
+        // 来访压根没报 UA：第一份空着（那就是事实），第二份是补上去的那份。
+        let bare = HeaderMap::new();
+        let filled =
+            UaPair::of(&bare, &build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough));
+        assert_eq!(filled.incoming, None);
+        assert_eq!(filled.upstream.as_deref(), Some(cred.user_agent().as_str()));
+
+        // 超长 UA 入库前截断，两份用同一把尺子。
+        let long = "x".repeat(UA_MAX_LEN + 50);
+        let huge = hm(&[("user-agent", long.as_str())]);
+        let cut =
+            UaPair::of(&huge, &build_forward_headers(&huge, &cred, "t", "fp", UaMode::Passthrough));
+        assert_eq!(cut.incoming.as_deref().map(str::len), Some(UA_MAX_LEN));
+        assert_eq!(cut.upstream, None, "截断不该把一条透传的长 UA 判成改写过");
+    }
+
     /// 同一个号派生出来的 UA 处处一致：转发（改写档）与 coban 自己合成的探测请求必须报同
     /// 一台机器，否则一个号在上游看来是两个客户端在轮流用。
     #[test]
@@ -4706,19 +5247,30 @@ mod tests {
         );
     }
 
-    /// 上游那两句抱怨都要认出来，项号与「它想要什么」都要读准：认不出来，这段会话从此每
-    /// 一轮都 400（客户端下一轮还会把同一段历史发回来）。
+    /// 上游那三句抱怨都要认出来，「是哪一项」与「它想要什么」都要读准：认不出来，这段会话
+    /// 从此每一轮都 400/404（客户端下一轮还会把同一段历史发回来）。
     #[test]
     fn input_item_complaints_are_read_off_the_upstream_message() {
         let bad_id = br#"{"error":{"message":"Invalid 'input[137].id': 'item_7bf507811fb6e5f92c0ce7f2'. Expected an ID that begins with 'rs'.","type":"invalid_request_error"}}"#;
         let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, bad_id).expect("这句得认出来");
-        assert_eq!(c.index, 137);
+        assert!(matches!(c.at, ItemAt::Index(137)));
         assert!(matches!(&c.want, Want::IdPrefix(p) if p == "rs"));
 
         let missing = br#"{"error":{"message":"Missing required parameter: 'input[218].encrypted_content'.","type":"invalid_request_error"}}"#;
         let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, missing).expect("这句也得认");
-        assert_eq!(c.index, 218);
+        assert!(matches!(c.at, ItemAt::Index(218)));
         assert!(matches!(&c.want, Want::Field(f) if f == "encrypted_content"));
+
+        // 第三句按 id 指认，而且是 404——状态码这一关放不进去，这句就永远认不出来。
+        let unknown = br#"{"error":{"message":"Item with id 'rs_resp_chatcmpl-baa3374f-6ad7-9ebc-931b-a14adeae02fe' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input.","type":"invalid_request_error"}}"#;
+        let c = detect_input_item_complaint(StatusCode::NOT_FOUND, unknown).expect("这句也得认");
+        assert!(
+            matches!(&c.at, ItemAt::Id(id) if id == "rs_resp_chatcmpl-baa3374f-6ad7-9ebc-931b-a14adeae02fe")
+        );
+        assert!(matches!(c.want, Want::Unresolvable));
+        // 别的 404（真的是路径不对）不判：那不是 input 里的事。
+        let path_404 = br#"{"error":{"message":"Unrecognized request URL."}}"#;
+        assert!(detect_input_item_complaint(StatusCode::NOT_FOUND, path_404).is_none());
 
         // 状态码不对不判；别的 400 也不判——误判一次就是白把客户端的历史改一遍。
         assert!(detect_input_item_complaint(StatusCode::TOO_MANY_REQUESTS, bad_id).is_none());
@@ -4747,7 +5299,7 @@ mod tests {
             ]}"#
             .to_owned(),
         );
-        let c = InputItemComplaint { index: 1, want: Want::IdPrefix("rs".to_owned()) };
+        let c = InputItemComplaint { at: ItemAt::Index(1), want: Want::IdPrefix("rs".to_owned()) };
         let rule = input_item_rule(&body, &c).expect("那一项有 type，规则该出得来");
         assert_eq!(
             rule,
@@ -4755,7 +5307,10 @@ mod tests {
         );
 
         // 缺字段：只在丢得起的类型上学。reasoning 学得下来……
-        let c = InputItemComplaint { index: 1, want: Want::Field("encrypted_content".to_owned()) };
+        let c = InputItemComplaint {
+            at: ItemAt::Index(1),
+            want: Want::Field("encrypted_content".to_owned()),
+        };
         assert_eq!(
             input_item_rule(&body, &c).expect("reasoning 丢得起"),
             InputItemRule::RequiredField {
@@ -4764,15 +5319,25 @@ mod tests {
             }
         );
         // ……而一条消息缺了什么，字段补不出来、整项又不能丢，那就别学：把 400 原样交回去。
-        let c = InputItemComplaint { index: 0, want: Want::Field("content".to_owned()) };
+        let c =
+            InputItemComplaint { at: ItemAt::Index(0), want: Want::Field("content".to_owned()) };
         assert!(input_item_rule(&body, &c).is_none());
 
-        // 项号越界 / 那一项没有 type / 体不是 JSON：都不猜。
-        let c = InputItemComplaint { index: 9, want: Want::IdPrefix("rs".to_owned()) };
-        assert!(input_item_rule(&body, &c).is_none());
+        // `type` 缺省的项当消息算：Responses 允许一条消息只写 role/content，那不是「读不出
+        // 类型」，是那个类型有默认值。
         let untyped = Bytes::from(r#"{"input":[{"role":"user","content":"hi"}]}"#.to_owned());
-        let c = InputItemComplaint { index: 0, want: Want::IdPrefix("msg".to_owned()) };
-        assert!(input_item_rule(&untyped, &c).is_none());
+        let c = InputItemComplaint { at: ItemAt::Index(0), want: Want::IdPrefix("msg".to_owned()) };
+        assert_eq!(
+            input_item_rule(&untyped, &c).expect("没写 type 的消息项也认得出类型"),
+            InputItemRule::IdPrefix { item_type: "message".to_owned(), prefix: "msg".to_owned() }
+        );
+
+        // 项号越界 / 那一项既没 type 也没 role / 体不是 JSON：都不猜。
+        let c = InputItemComplaint { at: ItemAt::Index(9), want: Want::IdPrefix("rs".to_owned()) };
+        assert!(input_item_rule(&body, &c).is_none());
+        let shapeless = Bytes::from(r#"{"input":[{"id":"x"}]}"#.to_owned());
+        let c = InputItemComplaint { at: ItemAt::Index(0), want: Want::IdPrefix("msg".to_owned()) };
+        assert!(input_item_rule(&shapeless, &c).is_none());
         assert!(input_item_rule(&Bytes::from_static(b"not json"), &c).is_none());
     }
 
@@ -4856,6 +5421,154 @@ mod tests {
                 .to_owned(),
         );
         assert!(repair_input_items(&ok, &rules).is_none());
+    }
+
+    /// 上游查不到的那一项按类型分两档修：`reasoning` 整项丢、且**按类扫一遍**（那一批假 id
+    /// 来自同一段外来历史，上游一次只报一个）；自带内容的项只摘掉 `id`——顺手丢掉一条消息
+    /// 就是把用户的话变没了，而摘掉 `id` 之后上游不再拿它去查什么，内容一个字不丢。
+    #[test]
+    fn items_the_upstream_cannot_resolve_are_dropped_or_lose_their_id() {
+        let body = Bytes::from(
+            r#"{"model":"gpt-5.6-sol","input":[
+                {"type":"message","id":"msg_resp_chatcmpl-a","role":"user","content":"hi"},
+                {"type":"reasoning","id":"rs_resp_chatcmpl-a","summary":[]},
+                {"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"gAAAA"},
+                {"type":"item_reference","id":"msg_resp_chatcmpl-b"},
+                {"type":"function_call_output","call_id":"c1","output":"ok"}
+            ]}"#
+            .to_owned(),
+        );
+        let complain = |id: &str| InputItemComplaint {
+            at: ItemAt::Id(id.to_owned()),
+            want: Want::Unresolvable,
+        };
+        let fix = |rule: InputItemRule| -> serde_json::Value {
+            serde_json::from_slice(&repair_input_items(&body, &[rule]).expect("该改写")).unwrap()
+        };
+
+        let rule = input_item_rule(&body, &complain("rs_resp_chatcmpl-a")).expect("规则该出得来");
+        assert_eq!(
+            rule,
+            InputItemRule::UnknownItem {
+                item_type: "reasoning".to_owned(),
+                id: "rs_resp_chatcmpl-a".to_owned()
+            }
+        );
+        let v = fix(rule);
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3, "两条 reasoning 一起扫掉，一遍修完");
+        assert!(!input.iter().any(|i| i["type"] == "reasoning"));
+        assert_eq!(input[2]["call_id"], "c1", "工具结果一个字不动");
+
+        // 自带内容的消息：只摘掉 id。
+        let v = fix(input_item_rule(&body, &complain("msg_resp_chatcmpl-a")).unwrap());
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 5, "一项都不该少");
+        assert_eq!(input[0]["content"], "hi", "那句话一个字不丢");
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[1]["id"], "rs_resp_chatcmpl-a", "没被点名的项一个字不动");
+
+        // 光有个 id 的引用项：摘掉 id 就什么都不剩了，只能整项丢。
+        let v = fix(input_item_rule(&body, &complain("msg_resp_chatcmpl-b")).unwrap());
+        assert_eq!(v["input"].as_array().unwrap().len(), 4);
+        assert!(!v.to_string().contains("chatcmpl-b"));
+
+        // 那个 id 压根不在 input 里（上游拿去查的是别处的东西）：不猜，把 404 原样交回去。
+        assert!(input_item_rule(&body, &complain("rs_elsewhere")).is_none());
+    }
+
+    /// 上游不认的那个 schema 关键字要从它那句话里读准。读错一次就是白改一遍客户端的 schema，
+    /// 而**结构性的关键字一个都不许读进来**：剥掉它 schema 就被掏空了，客户端拿到的东西不再
+    /// 受任何约束，而且不报错。
+    #[test]
+    fn forbidden_schema_keywords_are_read_off_the_upstream_message() {
+        let out = br#"{"error":{"message":"Invalid schema for response_format 'codex_output_schema': In context=('properties', 'used_fact_ids'), 'uniqueItems' is not permitted.","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            detect_forbidden_schema_keyword(StatusCode::BAD_REQUEST, out).as_deref(),
+            Some("uniqueItems")
+        );
+        // 函数工具的参数 schema 犯同样的毛病时是同一句式。
+        let tool = br#"{"error":{"message":"Invalid schema for function 'apply_patch': In context=('properties', 'paths'), 'minItems' is not permitted."}}"#;
+        assert_eq!(
+            detect_forbidden_schema_keyword(StatusCode::BAD_REQUEST, tool).as_deref(),
+            Some("minItems")
+        );
+
+        // 状态码不对不判；别的 400 也不判。
+        assert!(detect_forbidden_schema_keyword(StatusCode::TOO_MANY_REQUESTS, out).is_none());
+        let other = br#"{"error":{"message":"Unsupported parameter: temperature"}}"#;
+        assert!(detect_forbidden_schema_keyword(StatusCode::BAD_REQUEST, other).is_none());
+        // 结构性的关键字：修不动，把 400 原样交回去。
+        let structural = br#"{"error":{"message":"Invalid schema for response_format 'r': In context=(), 'anyOf' is not permitted."}}"#;
+        assert!(detect_forbidden_schema_keyword(StatusCode::BAD_REQUEST, structural).is_none());
+        // 「要补一个东西」那类抱怨不归这一支管：补什么、补成什么样都是替客户端改语义。
+        let required = br#"{"error":{"message":"Invalid schema for response_format 'r': In context=('properties', 'x'), 'additionalProperties' is required to be supplied and to be false."}}"#;
+        assert!(detect_forbidden_schema_keyword(StatusCode::BAD_REQUEST, required).is_none());
+        assert!(detect_forbidden_schema_keyword(StatusCode::BAD_REQUEST, b"not json").is_none());
+    }
+
+    /// 剥关键字要**认得 schema 的形状**：schema 节点上的同名键该剥，而 `properties` 底下那一层
+    /// 的键是用户起的字段名——把叫 `uniqueItems` 的字段删掉，就是把他那个字段变没了。整张
+    /// schema 一遍扫干净（含 `anyOf` 里与工具参数里的），别处一个字不动。
+    #[test]
+    fn a_forbidden_keyword_is_stripped_from_every_schema_position_only() {
+        let body = Bytes::from(
+            r#"{"model":"gpt-5.6-sol",
+            "text":{"format":{"type":"json_schema","name":"codex_output_schema","strict":true,
+              "schema":{"type":"object","additionalProperties":false,
+                "required":["used_fact_ids"],
+                "properties":{
+                  "used_fact_ids":{"type":"array","uniqueItems":true,"items":{"type":"string"}},
+                  "uniqueItems":{"type":"string","description":"这个字段就叫这个名字"},
+                  "nested":{"anyOf":[
+                    {"type":"array","uniqueItems":true,"items":{"type":"number"}},
+                    {"type":"null"}]}}}}},
+            "tools":[{"type":"function","name":"shell","parameters":{"type":"object",
+              "properties":{"cmd":{"type":"array","uniqueItems":true,"items":{"type":"string"}}}}}],
+            "input":[{"type":"message","role":"user","content":"uniqueItems"}]}"#
+                .to_owned(),
+        );
+        let keys = vec!["uniqueItems".to_owned()];
+        let fixed = strip_schema_keywords(&body, &keys).expect("有这个关键字就该改写");
+        let v: serde_json::Value = serde_json::from_slice(&fixed).unwrap();
+        let schema = &v["text"]["format"]["schema"];
+        assert!(schema["properties"]["used_fact_ids"].get("uniqueItems").is_none());
+        assert!(schema["properties"]["nested"]["anyOf"][0].get("uniqueItems").is_none());
+        assert!(v["tools"][0]["parameters"]["properties"]["cmd"].get("uniqueItems").is_none());
+
+        // 同名的**字段**一个都不能少，结构与别处的内容也一样。
+        assert_eq!(schema["properties"]["uniqueItems"]["type"], "string");
+        assert_eq!(schema["properties"]["used_fact_ids"]["items"]["type"], "string");
+        assert_eq!(schema["required"][0], "used_fact_ids");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(v["text"]["format"]["strict"], true);
+        assert_eq!(v["input"][0]["content"], "uniqueItems", "请求的别处一个字不动");
+
+        // 剥干净之后再剥就没得剥了：返回 None，免得白发一次重试。
+        assert!(strip_schema_keywords(&fixed, &keys).is_none());
+        assert!(strip_schema_keywords(&body, &[]).is_none());
+        assert!(strip_schema_keywords(&Bytes::from_static(b"not json"), &keys).is_none());
+    }
+
+    /// 这份记忆**不按会话分**：上游收不收一个关键字对谁都一样，学一次就该让所有接入方都
+    /// 免掉那次注定 400 的往返。有上限，因为它是全局的。
+    #[test]
+    fn the_schema_keyword_memo_is_global_and_bounded() {
+        let memo = SchemaKeywordMemo::default();
+        note_schema_keyword(&memo, "uniqueItems");
+        note_schema_keyword(&memo, "uniqueItems");
+        assert_eq!(known_schema_keywords(&memo), vec!["uniqueItems".to_owned()], "重复记不该堆积");
+        note_schema_keyword(&memo, "minItems");
+        assert_eq!(known_schema_keywords(&memo).len(), 2);
+
+        for i in 0..SCHEMA_KEYWORD_MEMO_MAX * 2 {
+            note_schema_keyword(&memo, &format!("k{i}"));
+        }
+        assert!(memo.lock().len() <= SCHEMA_KEYWORD_MEMO_MAX);
+        // 顶掉的是最老的那个，退化成没有记忆的行为（下一条请求再学一次），而不是出错。
+        let last = format!("k{}", SCHEMA_KEYWORD_MEMO_MAX * 2 - 1);
+        assert!(known_schema_keywords(&memo).contains(&last));
+        assert!(!known_schema_keywords(&memo).contains(&"uniqueItems".to_owned()));
     }
 
     /// 记忆按会话认（**不按号**：项的形状是上游的统一约束，换个号一样不认），且有上限。

@@ -218,7 +218,7 @@ export function CacheHitTrendDialog({
 
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              `命中缓存的输入按十分之一计价，所以这条线基本等于「同一段会话有没有落在同一个号上」。空着的格子是那个时段没有请求——不是命中率掉到 0；柱子的深浅是那一格的 token 体量，很淡的那几根只有几百 token，那个百分比不必当真。流水只保留 30 天，跨度到此为止。`,
+              `命中缓存的输入按十分之一计价，所以这条线基本等于「同一段会话有没有落在同一个号上」。空着的格子是那个时段没有请求——不是命中率掉到 0；柱子的深浅是那一格的 token 体量，很淡的那几根只有几百 token，那个百分比不必当真。请求明细只保留 30 天，跨度到此为止。`,
               'Cached input bills at a tenth, so this line is essentially "did each conversation keep landing on one account". A gap means no traffic in that period, not a hit rate of zero; a bar\'s opacity is that period\'s token volume, so the faint ones carry only a few hundred tokens and their percentage means little. Request logs are kept for 30 days, which caps the range.',
             )}
           </p>

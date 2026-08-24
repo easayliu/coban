@@ -276,7 +276,11 @@ fn user_content(content: Option<&Value>, i: usize) -> Result<Vec<Value>, String>
 /// 取一条消息的纯文本：字符串原样，数组则把各 text 块按序拼起来。
 ///
 /// 拿不到任何文本时返回 `None`（区别于「有内容但是空串」——后者是合法的工具输出）。
-fn flatten_text(content: Option<&Value>) -> Option<String> {
+///
+/// Responses 那头的内容块（`input_text`/`output_text`）也认：块里那个键同样叫 `text`。
+/// [`crate::proxy::merge_system_messages`] 借的就是这一点——两条线格式把系统消息并进
+/// `instructions` 时，该认哪些形状必须是同一份判断。
+pub(crate) fn flatten_text(content: Option<&Value>) -> Option<String> {
     match content {
         Some(Value::String(s)) => Some(s.clone()),
         Some(Value::Array(parts)) => {
