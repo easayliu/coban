@@ -1440,6 +1440,32 @@ const INPUT_REPAIRS_MAX: u32 = 3;
 /// 工具结果是把用户的话、把这一轮的工具结果变没了——那比 400 更糟，因为它不报错。
 const DROP_WHOLE_ITEM: &[&str] = &["reasoning"];
 
+/// 工具调用与它的结果这几对项类型：`(调用, 结果)`。
+///
+/// 这两半靠 `call_id` 对上号——那是个纯粹的关联 token，不承载任何内容（内容在 `arguments`
+/// 与 `output` 里）。缺了它上游一句 `Missing required parameter: 'input[N].call_id'`，而这一类
+/// 项**丢不起**（丢掉等于把这一轮的工具调用或结果变没了，见 [`DROP_WHOLE_ITEM`]）——所以
+/// 补一个回去，见 [`mint_call_ids`]。
+///
+/// 逐对写死而不是「凡是带 `call_id` 的都算」：配对全靠这张表认出谁是调用、谁是结果，认错了
+/// 就是把两条不相干的项配到一起。上游新增一对时这里加一行，加之前那类项照旧把 400 原样
+/// 交回去——那比猜一个配法安全。
+const CALL_ID_PAIRS: &[(&str, &str)] = &[
+    ("function_call", "function_call_output"),
+    ("custom_tool_call", "custom_tool_call_output"),
+    ("local_shell_call", "local_shell_call_output"),
+];
+
+/// 这个项类型是不是一次工具**调用**（[`CALL_ID_PAIRS`] 的左半）。
+fn is_tool_call(item_type: &str) -> bool {
+    CALL_ID_PAIRS.iter().any(|(call, _)| *call == item_type)
+}
+
+/// 这个项类型是不是一次工具**结果**（[`CALL_ID_PAIRS`] 的右半）。
+fn is_tool_output(item_type: &str) -> bool {
+    CALL_ID_PAIRS.iter().any(|(_, out)| *out == item_type)
+}
+
 /// 上游对某类 `input` 项提的要求。
 ///
 /// **全都从上游那句 400 里学来**，不自己维护一张「项类型 → 该长什么样」的表：那是在猜上游的
@@ -1513,8 +1539,12 @@ impl InputItemRule {
     fn fix_for(&self, item: &serde_json::Value) -> Fix {
         let droppable = DROP_WHOLE_ITEM.contains(&item_type_of(item).unwrap_or_default().as_str());
         match self {
-            // 缺了必填字段的项补不回来，只能整项丢——所以这类规则只在丢得起的类型上学
-            // （见 [`input_item_rule`]），学到了就一定是丢。
+            // 缺了必填字段的项通常补不回来，只能整项丢——所以这类规则只在丢得起的类型上学
+            // （见 [`input_item_rule`]）。**`call_id` 是唯一的例外**：它不承载内容、只用来把
+            // 调用与结果对上号，补一个回去是无损的，而那几类项恰恰丢不起。
+            Self::RequiredField { field, .. } if field == "call_id" && !droppable => {
+                Fix::MintCallId
+            }
             Self::RequiredField { .. } => Fix::DropItem,
             // `id` 对多数类型是可选的，摘掉就好；[`DROP_WHOLE_ITEM`] 那几个不行。前缀不对与
             // 长过上限是同一味药：那个 `id` 不是上游会发的形状，而它本来也不必带。
@@ -1557,6 +1587,9 @@ enum Fix {
     DropId,
     /// 把项里那些上游解不开的图换成一句说明（[`BROKEN_IMAGE_NOTE`]）。
     ReplaceImages,
+    /// 给缺了 `call_id` 的工具调用/结果补一个，见 [`mint_call_ids`]。**整个 `input` 一起算**
+    /// （配对要看前后文），所以它在 [`repair_input_items`] 里是单独一趟，不在逐项那一圈。
+    MintCallId,
     /// 把 `role: "system"` 改成上游点名要的 `developer`。
     DemoteRole,
 }
@@ -1848,9 +1881,12 @@ fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<Input
         // （见 [`is_broken_image_data_url`] 那段刻意保守的判据），学了也修不动。
         Want::BadImage => has_broken_image(item).then_some(InputItemRule::BadImage { item_type }),
         Want::DeveloperRole => Some(InputItemRule::SystemRole),
-        Want::Field(field) => DROP_WHOLE_ITEM
-            .contains(&item_type.as_str())
-            .then(|| InputItemRule::RequiredField { item_type, field: field.clone() }),
+        // 学不学得看**修不修得动**：丢得起的类型整项丢，工具调用/结果缺 `call_id` 则补一个
+        // 回去（见 [`mint_call_ids`]）。别的「缺字段」一概不学——补不出来也丢不起，学了只是
+        // 白发一次重试，那句 400 该原样交回给客户端。
+        Want::Field(field) => (DROP_WHOLE_ITEM.contains(&item_type.as_str())
+            || (field == "call_id" && (is_tool_call(&item_type) || is_tool_output(&item_type))))
+        .then(|| InputItemRule::RequiredField { item_type, field: field.clone() }),
         Want::Unresolvable => match &complaint.at {
             ItemAt::Id(id) => Some(InputItemRule::UnknownItem { item_type, id: id.clone() }),
             // 上游没给 id 就没法认那一项，这条规则学不成。
@@ -1886,6 +1922,8 @@ fn repair_input_items(body: &Bytes, rules: &[InputItemRule]) -> Option<Bytes> {
                 touched |= match fix {
                     // 上一步已经丢掉了，留下来的项撞不上这一支。
                     Fix::DropItem => false,
+                    // 配对要看前后文，逐项这一圈里做不了——下面单独走一趟。
+                    Fix::MintCallId => false,
                     Fix::DropId => item.as_object_mut().is_some_and(|o| o.remove("id").is_some()),
                     Fix::ReplaceImages => replace_broken_images(item),
                     Fix::DemoteRole => item
@@ -1894,11 +1932,110 @@ fn repair_input_items(body: &Bytes, rules: &[InputItemRule]) -> Option<Bytes> {
                 };
             }
         }
+        // 补 `call_id` 那一趟：**整个 `input` 一起算**，配对靠的是项与项的先后（见
+        // [`mint_call_ids`]）。留到最后跑，是因为上面那一圈可能刚丢掉几项——照丢完之后的
+        // 序列配对才对得上。
+        if rules
+            .iter()
+            .any(|r| matches!(r, InputItemRule::RequiredField { field, .. } if field == "call_id"))
+        {
+            touched |= mint_call_ids(input);
+        }
     }
     if !touched {
         return None;
     }
     serde_json::to_vec(&serde_json::Value::Object(obj)).ok().map(Bytes::from)
+}
+
+/// 给 `input` 里缺了 `call_id` 的工具调用与结果补上一个，让两半对得上号。回「是否真的改过」。
+///
+/// 上游的原话：`Missing required parameter: 'input[3].call_id'.` 这类项**丢不起**——丢掉一次
+/// 工具调用或它的结果，是把这一轮发生过的事变没了，比 400 更糟（同 [`DROP_WHOLE_ITEM`] 那段
+/// 的界线）。而 `call_id` 又恰好是唯一补得回来的必填字段：它不承载任何内容（内容在
+/// `arguments` 与 `output` 里），只是把调用与结果拴在一起的一个 token，两边填成同一个值，
+/// 语义就一个字不差地还原了。
+///
+/// 配对按**先后顺序**：一次工具调用之后、下一次同族调用之前的那个结果就是它的结果。这不是
+/// 猜——`input` 是一段有序的历史，工具调用与它的结果本来就是这么排的。四种情形：
+/// - 两边都缺 → 铸一个新的，两边填上；
+/// - 只有调用缺、结果带着 → 把结果那个抄给调用（那才是这一对本来的 id，铸新的等于把它改名）；
+/// - 只有结果缺 → 把它配到的那次调用的 id 抄过来；
+/// - 配不上（一个没被应答的结果，前面找不到调用）→ **不动它**。那一项到底属于哪次调用无从得知，
+///   编一个只会让上游换一句「找不到对应的调用」，还不如把原来那句 400 交回去。
+///
+/// 铸出来的 id 从**这一项的内容**哈希来，不是随手取一个：同一段对话下一轮还会把这段历史原样
+/// 发回来，而我们会照样修一遍——每次铸出不同的值，就等于这段前缀每轮都在变，上游的缓存从这
+/// 一项往后全部作废（见 [`prefix_parts`] 那段「逐字节都是约定」）。
+fn mint_call_ids(input: &mut [serde_json::Value]) -> bool {
+    /// 这一项的 `call_id` 有没有（空串算没有，同 [`InputItemRule::RequiredField`] 认 `null`）。
+    fn call_id_of(item: &serde_json::Value) -> Option<&str> {
+        item.get("call_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+    }
+    /// 填上去。调用点都已经确认过这一项缺 `call_id`，所以填成功即改动。
+    fn set_call_id(item: &mut serde_json::Value, id: &str) -> bool {
+        item.as_object_mut().is_some_and(|o| {
+            o.insert("call_id".to_owned(), id.into());
+            true
+        })
+    }
+
+    let mut touched = false;
+    // 还没被应答的那几次调用，按先后排；元素是它在 `input` 里的下标。
+    let mut pending: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for i in 0..input.len() {
+        let Some(t) = item_type_of(&input[i]) else { continue };
+        if is_tool_call(&t) {
+            pending.push_back(i);
+            continue;
+        }
+        if !is_tool_output(&t) {
+            continue;
+        }
+        match call_id_of(&input[i]).map(str::to_owned) {
+            // 结果带着 id：把它配到的那次调用认掉。那次调用要是缺 id，就用结果这个——
+            // 那才是这一对本来的 id。
+            Some(id) => {
+                if let Some(c) = pending.pop_front()
+                    && call_id_of(&input[c]).is_none()
+                {
+                    touched |= set_call_id(&mut input[c], &id);
+                }
+            }
+            // 结果缺 id：从它配到的那次调用抄；那次也缺就铸一个，两边一起填。
+            None => {
+                let Some(c) = pending.pop_front() else { continue };
+                let id = match call_id_of(&input[c]) {
+                    Some(id) => id.to_owned(),
+                    None => {
+                        let id = minted_call_id(&input[c]);
+                        touched |= set_call_id(&mut input[c], &id);
+                        id
+                    }
+                };
+                touched |= set_call_id(&mut input[i], &id);
+            }
+        }
+    }
+    // 剩下的是没有结果的调用（合法形状）。缺 id 的那几个照样得补上一个，不然上游还是那句 400。
+    for c in pending {
+        if call_id_of(&input[c]).is_none() {
+            let id = minted_call_id(&input[c]);
+            touched |= set_call_id(&mut input[c], &id);
+        }
+    }
+    touched
+}
+
+/// 给一次工具调用铸一个 `call_id`：`call_` + 这一项内容的哈希。
+///
+/// **从内容来而不是随手取一个**，理由见 [`mint_call_ids`]：同一段历史每轮都会再发一次，
+/// 值每次都变的话，上游的前缀缓存从这一项往后全部作废。取前 12 字节够长到不会撞上。
+fn minted_call_id(call: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(serde_json::to_vec(call).unwrap_or_default());
+    format!("call_{}", crate::credentials::hex_lower(&h.finalize()[..12]))
 }
 
 /// 取这个会话已知的那几条规则。没有会话键就没有记忆，返回空。
@@ -6247,6 +6384,192 @@ mod tests {
             input_item_rule(&imgs, &c),
             Some(InputItemRule::BadImage { item_type: "function_call_output".to_owned() })
         );
+    }
+
+    /// 缺了 `call_id` 的工具调用/结果：补一个回去，不能丢——丢掉一次调用或它的结果，是把
+    /// 这一轮发生过的事变没了（上游那句：`Missing required parameter: 'input[3].call_id'.`）。
+    /// `call_id` 是唯一补得回来的必填字段：它不承载内容，两边填成同一个值语义就还原了。
+    #[test]
+    fn tool_calls_missing_their_call_id_get_one_minted_in_pairs() {
+        let rule = |t: &str| InputItemRule::RequiredField {
+            item_type: t.to_owned(),
+            field: "call_id".to_owned(),
+        };
+        let fix = |raw: &str, rules: &[InputItemRule]| -> Option<serde_json::Value> {
+            repair_input_items(&Bytes::from(raw.to_owned()), rules)
+                .map(|b| serde_json::from_slice(&b).unwrap())
+        };
+
+        // 两边都缺：铸一个新的，两边填上同一个——一项都不丢。
+        let v = fix(
+            r#"{"input":[
+                {"type":"message","role":"user","content":"run it"},
+                {"type":"function_call","name":"shell","arguments":"{\"cmd\":\"ls\"}"},
+                {"type":"function_call_output","output":"a.txt"}
+            ]}"#,
+            &[rule("function_call")],
+        )
+        .expect("缺了 call_id 就该补");
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3, "一项都不该丢");
+        let minted = input[1]["call_id"].as_str().unwrap();
+        assert!(minted.starts_with("call_"), "{minted}");
+        assert_eq!(input[2]["call_id"], minted, "调用与结果要对上号");
+        assert_eq!(input[1]["arguments"], r#"{"cmd":"ls"}"#, "内容一个字不动");
+        assert_eq!(input[2]["output"], "a.txt");
+
+        // 铸出来的值从**内容**哈希来：同一段历史下一轮再发一次，补出来的必须逐字节相同——
+        // 每轮换一个值等于这段前缀每轮都在变，上游的缓存从这一项往后全部作废。
+        let again = fix(
+            r#"{"input":[
+                {"type":"message","role":"user","content":"run it"},
+                {"type":"function_call","name":"shell","arguments":"{\"cmd\":\"ls\"}"},
+                {"type":"function_call_output","output":"a.txt"}
+            ]}"#,
+            &[rule("function_call")],
+        )
+        .unwrap();
+        assert_eq!(again["input"][1]["call_id"], minted, "同样的历史该补出同样的 id");
+        // 内容不同的调用铸出来的不一样，否则两次调用会串到一起。
+        let other = fix(
+            r#"{"input":[{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}]}"#,
+            &[rule("function_call")],
+        )
+        .unwrap();
+        assert_ne!(other["input"][0]["call_id"], minted);
+
+        // 只有调用缺、结果带着：把结果那个抄给调用——那才是这一对本来的 id，铸新的等于改名。
+        let v = fix(
+            r#"{"input":[
+                {"type":"function_call","name":"shell","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_real","output":"ok"}
+            ]}"#,
+            &[rule("function_call")],
+        )
+        .expect("调用缺 call_id 就该补");
+        assert_eq!(v["input"][0]["call_id"], "call_real");
+        assert_eq!(v["input"][1]["call_id"], "call_real", "结果那个原样不动");
+
+        // 只有结果缺：从它配到的那次调用抄过来。
+        let v = fix(
+            r#"{"input":[
+                {"type":"function_call","call_id":"call_a","name":"shell","arguments":"{}"},
+                {"type":"function_call_output","output":"ok"}
+            ]}"#,
+            &[rule("function_call_output")],
+        )
+        .expect("结果缺 call_id 就该补");
+        assert_eq!(v["input"][1]["call_id"], "call_a");
+
+        // 多对交错：按先后配对，各归各的，不能串。
+        let v = fix(
+            r#"{"input":[
+                {"type":"function_call","name":"a","arguments":"{}"},
+                {"type":"function_call_output","output":"ra"},
+                {"type":"function_call","name":"b","arguments":"{}"},
+                {"type":"function_call_output","output":"rb"}
+            ]}"#,
+            &[rule("function_call")],
+        )
+        .unwrap();
+        let i = v["input"].as_array().unwrap();
+        assert_eq!(i[0]["call_id"], i[1]["call_id"], "第一对该配在一起");
+        assert_eq!(i[2]["call_id"], i[3]["call_id"], "第二对该配在一起");
+        assert_ne!(i[0]["call_id"], i[2]["call_id"], "两对不能串到一起");
+
+        // 配不上的结果（前面没有调用）**不动它**：它属于哪次调用无从得知，编一个只会换来
+        // 上游另一句 400。这里只有那次没被应答的调用被补上。
+        let v = fix(
+            r#"{"input":[
+                {"type":"function_call_output","output":"orphan"},
+                {"type":"function_call","name":"shell","arguments":"{}"}
+            ]}"#,
+            &[rule("function_call")],
+        )
+        .unwrap();
+        assert!(v["input"][0].get("call_id").is_none(), "配不上的结果不该被编一个");
+        assert!(v["input"][1]["call_id"].as_str().unwrap().starts_with("call_"));
+
+        // 已经带着 call_id 的一个字都不动——那时返回 None，重发一遍白发一次。
+        assert!(
+            fix(
+                r#"{"input":[
+                    {"type":"function_call","call_id":"c1","name":"s","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"c1","output":"ok"}
+                ]}"#,
+                &[rule("function_call")],
+            )
+            .is_none()
+        );
+        // 空串与 null 都算缺（同 RequiredField 的判据）。
+        let v = fix(
+            r#"{"input":[{"type":"function_call","call_id":"","name":"s","arguments":"{}"},
+                        {"type":"function_call_output","call_id":null,"output":"ok"}]}"#,
+            &[rule("function_call")],
+        )
+        .expect("空的 call_id 等于没有");
+        assert_eq!(v["input"][0]["call_id"], v["input"][1]["call_id"]);
+        assert!(v["input"][0]["call_id"].as_str().unwrap().starts_with("call_"));
+
+        // custom / local_shell 那两族同样配对，各族之间不串。
+        let v = fix(
+            r#"{"input":[
+                {"type":"custom_tool_call","name":"c","input":"x"},
+                {"type":"custom_tool_call_output","output":"y"}
+            ]}"#,
+            &[rule("custom_tool_call")],
+        )
+        .expect("custom 工具那一族也该补");
+        assert_eq!(v["input"][0]["call_id"], v["input"][1]["call_id"]);
+    }
+
+    /// 「缺了必填字段」学不学规则，看的是**修不修得动**：丢得起的类型整项丢，工具调用/结果
+    /// 缺 `call_id` 补一个，别的一概不学——学了只是白发一次重试，那句 400 该原样交回客户端。
+    #[test]
+    fn only_repairable_missing_fields_become_a_rule() {
+        let raw = r#"{"input":[
+                {"type":"reasoning","summary":[]},
+                {"type":"function_call","name":"shell","arguments":"{}"},
+                {"type":"function_call_output","output":"ok"},
+                {"type":"message","role":"user","content":"hi"}
+            ]}"#;
+        let body = Bytes::from(raw.to_owned());
+        let items: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let rule = |index, field: &str| {
+            input_item_rule(
+                &body,
+                &InputItemComplaint {
+                    at: ItemAt::Index(index),
+                    want: Want::Field(field.to_owned()),
+                },
+            )
+        };
+
+        // 丢得起的那类：缺什么字段都学，学到了就是整项丢。
+        assert_eq!(
+            rule(0, "encrypted_content"),
+            Some(InputItemRule::RequiredField {
+                item_type: "reasoning".to_owned(),
+                field: "encrypted_content".to_owned(),
+            })
+        );
+        // 工具调用与结果缺 call_id：学，补一个回去。
+        for (i, t) in [(1, "function_call"), (2, "function_call_output")] {
+            let r = rule(i, "call_id").expect("call_id 该学得成");
+            assert_eq!(
+                r,
+                InputItemRule::RequiredField {
+                    item_type: t.to_owned(),
+                    field: "call_id".to_owned(),
+                }
+            );
+            assert!(matches!(r.fix_for(&items["input"][i]), Fix::MintCallId), "该补而不是丢");
+        }
+        // 同样是工具调用，缺的是别的字段就不学：`name`/`arguments` 编不出来，而这一项丢不起。
+        assert!(rule(1, "name").is_none());
+        assert!(rule(1, "arguments").is_none());
+        // 消息缺 call_id 也不学：它压根不是配对的一半，补一个上去毫无意义。
+        assert!(rule(3, "call_id").is_none());
     }
 
     /// 坏 `id` 按类型分两档修：`reasoning` 整项丢（`id` 是它的必填字段），别的只摘掉 `id`——
