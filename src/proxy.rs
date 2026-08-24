@@ -2188,6 +2188,8 @@ impl SessionCtx {
 /// - `upstream_cold`：租约有效、落点也没变、前缀身份也没变，上游那边就是没有。要么它自己的
 ///   缓存过期了，要么这个键被**假共享**了——两条开头完全一样的对话会算出同一个指纹、共用
 ///   同一个上游 session，交替请求互相踢掉对方（见 [`prefix_parts`] 的注）。
+/// - `too_short`：输入还够不着上游的缓存下限（见 [`CACHE_MIN_INPUT_TOKENS`]）。这一类连
+///   「未命中」都算不上——它压根没资格进缓存，谁也修不了。
 /// - `no_usage`：没嗅探到用量（错误响应、客户端提前断开）。谈不上命中与否。
 /// - `unattributed`：租约机制被关掉了（`session_lease_secs = 0`），上面那几类分不出来。
 /// - `no_session`：这条请求压根没有会话身份（体里没有 `input`，`models` 那类）。
@@ -2196,6 +2198,15 @@ impl SessionCtx {
 /// 「归因上线之前写下的旧流水」（迁移不回填，见 `store::migrate_cache_reason`）。让活着的
 /// 请求也写 NULL，就会把「那时还没有这个功能」和「这条请求没有会话」混成同一桶，而前者是
 /// 会自己老化掉的历史包袱、后者是当下的事实，混在一起两个都读不出来。
+/// 上游 prompt cache 的最小前缀长度（输入 token）。短于这个数的请求**不进缓存**，
+/// 与落点、指纹、上游冷热全无关系。
+///
+/// 没有这道下限的话，这类请求会被 [`cache_reason`] 的排除法一路挤进 `upstream_cold`
+/// ——那是「该命中的偏偏没命中」那一桶，掺进一堆本来就没资格命中的请求之后，它就不再指得到
+/// 任何该修的东西了。实测这条路上的常客是各种拿一句话去问一次的第三方接入（几十个 token
+/// 的体），它们一天能刷出成千上万条。
+const CACHE_MIN_INPUT_TOKENS: i64 = 1024;
+
 fn cache_reason(
     key: Option<&str>,
     lease: store::LeaseState,
@@ -2210,6 +2221,10 @@ fn cache_reason(
     let Some(u) = usage else { return "no_usage" };
     if u.cached_tokens > 0 {
         return "hit";
+    }
+    // 命中之后、归因之前：够不着下限的请求不必再问「为什么没命中」，它没资格命中。
+    if u.input_tokens < CACHE_MIN_INPUT_TOKENS {
+        return "too_short";
     }
     match lease {
         store::LeaseState::Off => "unattributed",
@@ -2494,7 +2509,46 @@ fn incoming_session_id(headers: &HeaderMap) -> Option<(&'static str, String)> {
         .find_map(|n| headers.get(*n).map(|v| (*n, v)))
         .and_then(|(n, v)| v.to_str().ok().map(|s| (n, s.trim().to_owned())))
         .filter(|(_, s)| !s.is_empty())
+        // 独立的会话头没有，再去那份 JSON 元数据里翻。顺序不能反：一个明写出来的头是更直接
+        // 的声明，而元数据里那几项是我们**认出来**的。
+        .or_else(|| session_id_in_turn_metadata(headers))
 }
+
+/// Codex Desktop 把会话身份埋在一份 JSON 元数据头里，不发独立的会话头。
+///
+/// 实测这个头长这样（还带着工作目录、git 远端、sandbox 档位等等，与会话身份无关的都不看）：
+///
+/// ```text
+/// x-codex-turn-metadata: {"installation_id":"…","session_id":"01a03433-…","thread_id":"01a03433-…",
+///                         "turn_id":"01a03433-fb63-…","window_id":"01a03433-…:0", …}
+/// ```
+///
+/// 只认 `session_id` 与 `thread_id`（实测两者相等，先用前者）。**`turn_id` 绝不能碰**：它每
+/// 一轮都变，拿它当会话键等于每轮换一个落点、每轮丢一次缓存，比没有键还糟。`window_id` 同理
+/// 不用——同一段对话开两个窗口是一段对话。
+///
+/// 认出它的收益是实打实的：在此之前 Codex Desktop 全靠前缀指纹认会话，而**两段开头一样的
+/// 对话会算出同一个指纹**、在上游共用一个 session 互相踢（见 [`cache_reason`] 的
+/// `upstream_cold`）。有了真会话 id 这条路整个消失。
+///
+/// 解不开就当没有：这个头是客户端塞的，形状变了也不该把一条请求判死——退回指纹那条路，
+/// 那是它本来就在走的。
+fn session_id_in_turn_metadata(headers: &HeaderMap) -> Option<(&'static str, String)> {
+    let raw = headers.get(TURN_METADATA_HEADER)?.to_str().ok()?;
+    let meta: serde_json::Value = serde_json::from_str(raw).ok()?;
+    [("session_id", TURN_METADATA_SESSION), ("thread_id", TURN_METADATA_THREAD)].iter().find_map(
+        |(field, label)| {
+            let v = meta.get(field)?.as_str()?.trim();
+            (!v.is_empty()).then(|| (*label, v.to_owned()))
+        },
+    )
+}
+
+/// Codex Desktop 那份元数据头的名字，见 [`session_id_in_turn_metadata`]。
+const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+/// 会话键的来源标记（只进日志，见 [`SessionCtx::source`]）：认出的是元数据里的哪一项。
+const TURN_METADATA_SESSION: &str = "x-codex-turn-metadata.session_id";
+const TURN_METADATA_THREAD: &str = "x-codex-turn-metadata.thread_id";
 
 /// 日志里要盖住值的那几个头：值本身就是凭据。**只有这几个**，其余一律照实打。
 ///
@@ -4958,6 +5012,32 @@ mod tests {
         // 没有用量读数谈不上命中与否。
         assert_eq!(r(LeaseState::Live(A), 9, None), "no_usage");
 
+        // 够不着上游缓存下限的请求自成一类，**排在归因之前**：否则它会被排除法一路挤进
+        // upstream_cold，把那一桶（真正「该命中却没命中」的那些）掺得指不到任何该修的东西。
+        let short = |cached: i64| {
+            Some(Usage {
+                input_tokens: CACHE_MIN_INPUT_TOKENS - 1,
+                cached_tokens: cached,
+                output_tokens: 1,
+                reasoning_tokens: 0,
+                total_tokens: CACHE_MIN_INPUT_TOKENS,
+            })
+        };
+        assert_eq!(r(LeaseState::Live(A), 1, short(0)), "too_short");
+        assert_eq!(r(LeaseState::Absent, 1, short(0)), "too_short", "第一轮也一样，短就是短");
+        assert_eq!(r(LeaseState::Live(B), 9, short(0)), "too_short", "短过头就谈不上换号亏了");
+        // 恰好够到下限就回到正常归因：边界这一条是判据本身，不能差一个。
+        let at_floor = Some(Usage {
+            input_tokens: CACHE_MIN_INPUT_TOKENS,
+            cached_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            total_tokens: CACHE_MIN_INPUT_TOKENS + 1,
+        });
+        assert_eq!(r(LeaseState::Live(A), 9, at_floor), "upstream_cold");
+        // 命中仍然压过一切：上游都报了命中，「它本不该命中」这种推断就是错的。
+        assert_eq!(r(LeaseState::Live(A), 9, short(200)), "hit");
+
         // 没有会话身份的请求自成一类，**不能回 None**：那一列留空专指升级前的旧流水，
         // 让活着的请求也写 NULL 就把两件事混成了一桶。
         assert_eq!(
@@ -5336,8 +5416,70 @@ mod tests {
         assert_eq!(name(&[("session_id", "   ")]), None);
         assert_eq!(incoming_session_id(&HeaderMap::new()), None);
 
-        // 名字差一点就不算——这正是那行 debug 日志要列出全部头名的原因。
+        // 名字差一点就不算——这正是那行日志要把全部头原样列出来的原因。
         assert_eq!(name(&[("x-conversation-id", "abc")]), None);
+    }
+
+    /// Codex Desktop 不发独立的会话头，会话身份埋在 `x-codex-turn-metadata` 那份 JSON 里。
+    /// 认出它，这个客户端才不必靠前缀指纹认会话（指纹会让两段开头一样的对话撞成一个键）。
+    #[test]
+    fn the_session_id_is_dug_out_of_the_codex_turn_metadata() {
+        // 实测那个头的形状（无关字段略去若干）：一行 JSON，session_id 与 thread_id 相等，
+        // turn_id 每轮都变。
+        let meta = concat!(
+            r#"{"installation_id":"d6e8466d-5631-403c-8dda-7c1911860d90","#,
+            r#""session_id":"01a03433-fad4-79b0-9c90-c2a2ae5b76ca","#,
+            r#""thread_id":"01a03433-fad4-79b0-9c90-c2a2ae5b76ca","#,
+            r#""turn_id":"01a03433-fb63-7db0-beec-185dc65209ef","#,
+            r#""window_id":"01a03433-fad4-79b0-9c90-c2a2ae5b76ca:0","#,
+            r#""request_kind":"turn","sandbox_mode":"read-only"}"#,
+        );
+        assert_eq!(
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", meta)])),
+            Some((TURN_METADATA_SESSION, "01a03433-fad4-79b0-9c90-c2a2ae5b76ca".to_owned()))
+        );
+
+        // 同一段对话的下一轮：turn_id 变了、会话键不能跟着变——那等于每轮换一个落点。
+        let next_turn = meta.replace(
+            "01a03433-fb63-7db0-beec-185dc65209ef",
+            "01a03433-ffff-7db0-beec-000000000000",
+        );
+        assert_eq!(
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", next_turn.as_str())])),
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", meta)])),
+            "turn_id 变了会话键不该变"
+        );
+
+        // 没有 session_id 就退到 thread_id。
+        let thread_only = r#"{"thread_id":"t-1","turn_id":"turn-9"}"#;
+        assert_eq!(
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", thread_only)])),
+            Some((TURN_METADATA_THREAD, "t-1".to_owned()))
+        );
+
+        // 明写出来的会话头压过元数据：那是更直接的声明。
+        assert_eq!(
+            incoming_session_id(&hm(&[
+                ("session_id", "explicit"),
+                ("x-codex-turn-metadata", meta)
+            ])),
+            Some(("session_id", "explicit".to_owned()))
+        );
+
+        // 解不开、缺项、或者只有 turn_id：一律当没有，退回前缀指纹那条路（它本来就在走）。
+        for junk in [
+            "not json at all",
+            r#"{"turn_id":"turn-9","window_id":"w:0"}"#,
+            r#"{"session_id":"","thread_id":"  "}"#,
+            r#"{"session_id":42}"#,
+            "",
+        ] {
+            assert_eq!(
+                incoming_session_id(&hm(&[("x-codex-turn-metadata", junk)])),
+                None,
+                "这份元数据不该给出会话键: {junk}"
+            );
+        }
     }
 
     /// 捕获 tracing 事件的最小订阅者：把每个事件的字段拍平成一行，供断言用。

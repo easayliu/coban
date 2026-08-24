@@ -82,10 +82,18 @@ export const CACHE_REASONS: Record<
   upstream_cold: {
     label: ['上游那边凉了', 'Cold upstream'],
     hint: [
-      '落点没变、前缀身份也没变，上游就是没有缓存了：要么它自己过期，要么两段开头一样的对话算出了同一个指纹、在上游共用一个会话互相踢。后者可以让客户端自报会话 id 来避开。',
-      'Same placement, same prefix identity, yet upstream had nothing: either its own cache expired, or two conversations with identical openings hashed to the same fingerprint and are evicting each other upstream. Having clients send a session id avoids the latter.',
+      '落点没变、前缀身份也没变，输入也够得着缓存下限，上游就是没有缓存了：要么它自己过期，要么两段开头一样的对话算出了同一个指纹、在上游共用一个会话互相踢。后者只发生在不自报会话 id 的客户端上（codex CLI、Codex Desktop 都自报，coban 认得出）。',
+      'Same placement, same prefix identity, input above the cache floor, yet upstream had nothing: either its own cache expired, or two conversations with identical openings hashed to the same fingerprint and are evicting each other upstream. The latter only happens with clients that do not report a session id (both codex CLI and Codex Desktop do, and coban reads it).',
     ],
     tone: 'bad',
+  },
+  too_short: {
+    label: ['请求太短', 'Below the cache floor'],
+    hint: [
+      '这条请求的输入还够不着上游的缓存下限（1024 token），压根没资格进缓存——不是「没命中」，是没得中。拿一句话问一次的第三方接入基本都落在这里，没什么可修的；它单独成一类，是为了不让它把「上游那边凉了」那一桶掺脏。',
+      "This request's input is below the upstream cache floor (1024 tokens), so it was never eligible for caching — not a miss, just out of scope. Third-party integrations that ask one short question per call all land here. Nothing to fix; it is split out so it does not muddy the cold-upstream bucket.",
+    ],
+    tone: 'neutral',
   },
   no_usage: {
     label: ['没有用量读数', 'No usage reported'],
