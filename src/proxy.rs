@@ -447,8 +447,8 @@ async fn forward_once(
     // **同一个号**再发一遍（见 [`strip_encrypted_reasoning`]）。所以体与头都得留着重用。
     let mut fwd_body = body.clone();
     let mut stripped = false;
-    // 这条请求已经为「`input` 里某项 `id` 前缀不对」修过几遍（见 [`drop_malformed_ids`]）。
-    let mut id_fixes = 0u32;
+    // 这条请求已经为「`input` 里有不合上游要求的项」修过几遍（见 [`repair_input_items`]）。
+    let mut input_repairs = 0u32;
     // 撞 401 之后强刷过一次 token 没有：只给一次，刷完还是 401 就是这个号真的坏了。
     let mut token_refreshed = false;
     // 这个会话在这个号上已经吃过一次「解不开」：直接摘掉，省下那次注定 400 的往返
@@ -459,11 +459,11 @@ async fn forward_once(
         fwd_body = fixed;
         stripped = true;
     }
-    // 这个会话已经被上游指出过「某类项的 `id` 前缀不对」：同样直接修掉，省下那次注定 400
-    // 的往返（见 [`MalformedIdMemo`]）。客户端每轮都会把同一段历史发回来，坏 `id` 就一直在。
-    let known_id_rules = malformed_id_rules(&state.malformed_ids, session_key);
-    if !known_id_rules.is_empty()
-        && let Some(fixed) = drop_malformed_ids(&fwd_body, &known_id_rules)
+    // 这个会话已经被上游指出过「某类项不合要求」：同样直接修掉，省下那次注定 400 的往返
+    // （见 [`InputRuleMemo`]）。客户端每轮都会把同一段历史发回来，那个坏项就一直在。
+    let known_rules = known_input_rules(&state.input_rules, session_key);
+    if !known_rules.is_empty()
+        && let Some(fixed) = repair_input_items(&fwd_body, &known_rules)
     {
         fwd_body = fixed;
     }
@@ -657,34 +657,33 @@ async fn forward_once(
             stripped = true;
             continue;
         }
-        // 上游嫌 `input` 里某一项的 `id` 前缀不对（`Invalid 'input[137].id': 'item_7bf…'.
-        // Expected an ID that begins with 'rs'.`）：把这类 `id` 修掉再发一遍。**不换号**——
-        // 坏 `id` 在客户端手里的那段历史里，换到第三个号还是同一句 400；也不能就这么把 400
-        // 交回去，客户端下一轮还会把同一段历史发回来，这段会话就此卡死（同摘密文那支的理由）。
+        // 上游嫌 `input` 里某一项不合要求（`id` 前缀不对、或缺了必填的 `encrypted_content`，
+        // 见 [`detect_input_item_complaint`]）：把这一类项修掉再发一遍。**不换号**——坏项在
+        // 客户端手里的那段历史里，换到第三个号还是同一句 400；也不能就这么把 400 交回去，
+        // 客户端下一轮还会把同一段历史发回来，这段会话就此卡死（同摘密文那支的理由）。
         //
         // 重发不再占 RPM 名额（名额由调用点在选号后占过一次）。修上几遍有硬顶
-        // [`MALFORMED_ID_FIXES_MAX`]：上游一次只报第一个坏项，一类项由一次扫描一起扫掉，
-        // 剩下的往返得有个尽头。
-        if id_fixes < MALFORMED_ID_FIXES_MAX
-            && let Some(rule) = detect_malformed_item_id(status, &bytes)
-                .and_then(|c| malformed_id_rule(&fwd_body, &c))
+        // [`INPUT_REPAIRS_MAX`]：上游一次只报第一个坏项，一类项由一次扫描一起扫掉，剩下的
+        // 往返得有个尽头。
+        if input_repairs < INPUT_REPAIRS_MAX
+            && let Some(rule) = detect_input_item_complaint(status, &bytes)
+                .and_then(|c| input_item_rule(&fwd_body, &c))
         {
-            note_malformed_id(&state.malformed_ids, session_key, &rule);
-            let mut rules = malformed_id_rules(&state.malformed_ids, session_key);
+            note_input_rule(&state.input_rules, session_key, &rule);
+            let mut rules = known_input_rules(&state.input_rules, session_key);
             // 没有会话键时上一行记不下也取不回，这条规则得自己带着。
             if !rules.contains(&rule) {
                 rules.push(rule.clone());
             }
-            if let Some(fixed) = drop_malformed_ids(&fwd_body, &rules) {
+            if let Some(fixed) = repair_input_items(&fwd_body, &rules) {
                 tracing::info!(
                     cred_id = cred.id,
-                    item_type = %rule.item_type,
-                    expected_prefix = %rule.prefix,
-                    "upstream rejected the id of an input item carried by this request; \
+                    rule = ?rule,
+                    "upstream rejected an input item carried by this request; \
                      retrying on the same credential without it"
                 );
                 fwd_body = fixed;
-                id_fixes += 1;
+                input_repairs += 1;
                 continue;
             }
         }
@@ -1183,105 +1182,182 @@ fn note_stale_reasoning(memo: &StaleReasoningMemo, session_key: Option<&str>, cr
     memo.push_back((key.to_owned(), cred_id));
 }
 
-/// 一条请求最多为坏 `id` 修几遍。
+/// 一条请求最多为 `input` 里的坏项修几遍。
 ///
-/// 上游一次只报**第一个**坏项，而一次修复会把同类项一起扫掉（见 [`drop_malformed_ids`]），
-/// 所以正常只要一遍；留几遍是给「历史里几类项的 `id` 都不对」那种客户端。有硬顶是因为每一
-/// 遍都是一次上游往返，客户端那头在干等——修不好就该把上游那句 400 原样交回去，让人看得见。
-const MALFORMED_ID_FIXES_MAX: u32 = 3;
+/// 上游一次只报**第一个**坏项，而一次修复会把同类项一起扫掉（见 [`repair_input_items`]），
+/// 所以正常只要一遍；留几遍是给「历史里几类项各有各的毛病」那种客户端。有硬顶是因为每一遍
+/// 都是一次上游往返，客户端那头在干等——修不好就该把上游那句 400 原样交回去，让人看得见。
+const INPUT_REPAIRS_MAX: u32 = 3;
 
-/// 上游对某类 `input` 项的 `id` 提的要求：`item_type` 这类项的 `id` 得以 `prefix` 开头。
+/// 能**整项丢掉**的项类型。
+///
+/// 只有 `reasoning`，两头的理由都成立：
+/// - 丢得起——「`input` 里没有 reasoning 项」正是没开 `include: reasoning.encrypted_content`
+///   的客户端天天在发的形状（同 [`strip_encrypted_reasoning`] 的取舍），代价只是模型看不见
+///   那几轮的思考过程；
+/// - 也只能这么修——它的 `id` 与 `encrypted_content` 都是上游的必填字段，摘掉字段换回来的是
+///   另一句 400（`Missing required parameter`），而密文更是补不出来。
+///
+/// 别的类型（`message`/`function_call`/`function_call_output`…）一律不丢：丢掉一条消息或一个
+/// 工具结果是把用户的话、把这一轮的工具结果变没了——那比 400 更糟，因为它不报错。
+const DROP_WHOLE_ITEM: &[&str] = &["reasoning"];
+
+/// 上游对某类 `input` 项提的要求。
+///
+/// **全都从上游那句 400 里学来**，不自己维护一张「项类型 → 该长什么样」的表：那是在猜上游的
+/// schema，猜错一次就是白把客户端的历史改一遍。
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct MalformedIdRule {
-    item_type: String,
-    prefix: String,
+pub enum InputItemRule {
+    /// 这类项的 `id` 得以 `prefix` 开头。
+    IdPrefix { item_type: String, prefix: String },
+    /// 这类项必须带着 `field` 这个字段。
+    RequiredField { item_type: String, field: String },
 }
 
-/// 「**这个会话**捎来的某类项 `id` 前缀不对」的记忆：`(会话键, 规则)` 的有界集合。
+impl InputItemRule {
+    /// 这一项是不是撞上了这条规则：类型对得上，而它确实不合要求。
+    fn violated_by(&self, item: &serde_json::Value) -> bool {
+        let t = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        match self {
+            // 没有 `id` 的项一律放过——规则管的是「`id` 的形状」，一个不带 `id` 的项没有
+            // 形状可言（客户端自己造的消息本来就不带）。
+            Self::IdPrefix { item_type, prefix } => {
+                item_type == t
+                    && item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| !id.starts_with(prefix.as_str()))
+            }
+            // `null` 与「字段不在」一样算缺：上游要的是内容，不是这个键存在。
+            Self::RequiredField { item_type, field } => {
+                item_type == t && item.get(field).is_none_or(|v| v.is_null())
+            }
+        }
+    }
+
+    /// 撞上之后怎么修：整项丢掉，还是只摘掉那个字段。
+    fn drops_whole_item(&self, item: &serde_json::Value) -> bool {
+        match self {
+            // 缺了必填字段的项补不回来，只能整项丢——所以这类规则只在丢得起的类型上学
+            // （见 [`input_item_rule`]），学到了就一定是丢。
+            Self::RequiredField { .. } => true,
+            // `id` 对多数类型是可选的，摘掉就好；[`DROP_WHOLE_ITEM`] 那几个不行。
+            Self::IdPrefix { .. } => {
+                DROP_WHOLE_ITEM.contains(&item.get("type").and_then(|t| t.as_str()).unwrap_or(""))
+            }
+        }
+    }
+}
+
+/// 「**这个会话**捎来的 `input` 项不合上游的要求」的记忆：`(会话键, 规则)` 的有界集合。
 ///
 /// 与 [`StaleReasoningMemo`] 同一个用途、同一个理由：修一次并不能一劳永逸——客户端每轮把整段
-/// 历史发回来，那个坏 `id` 一直躺在里面，不记住的话**每一轮**都要先吃一个注定失败的 400。
+/// 历史发回来，那个坏项一直躺在里面，不记住的话**每一轮**都要先吃一个注定失败的 400。
 ///
-/// **不按凭证分**（这是与那个记忆唯一的差别）：这不是「密文绑在哪个号上」那种事，`id` 的形状
-/// 是上游的统一约束，换个号一样不认。
-pub type MalformedIdMemo =
-    Arc<parking_lot::Mutex<std::collections::VecDeque<(String, MalformedIdRule)>>>;
+/// **不按凭证分**（这是与那个记忆唯一的差别）：这不是「密文绑在哪个号上」那种事，项的形状是
+/// 上游的统一约束，换个号一样不认。
+pub type InputRuleMemo =
+    Arc<parking_lot::Mutex<std::collections::VecDeque<(String, InputItemRule)>>>;
 
 /// 记忆体的上限，同 [`STALE_REASONING_MEMO_MAX`]：会话有生有灭，只能靠先进先出顶住。
-const MALFORMED_ID_MEMO_MAX: usize = 512;
+const INPUT_RULE_MEMO_MAX: usize = 512;
 
-/// 上游那句抱怨里能读出来的两件事：坏在第几项、该是什么前缀。
-struct MalformedIdComplaint {
+/// 上游那句抱怨里能读出来的两件事：坏在第几项、它想要什么。
+struct InputItemComplaint {
     index: usize,
-    prefix: String,
+    want: Want,
 }
 
-/// 判断这次 400 是不是「`input` 里某一项的 `id` 前缀不对」，顺手把项号与该有的前缀读出来。
+/// 上游想要的那件事。
+enum Want {
+    /// `id` 该以这个前缀开头。
+    IdPrefix(String),
+    /// 缺了这个必填字段。
+    Field(String),
+}
+
+/// 判断这次 400 是不是「`input` 里某一项不合上游的要求」，顺手把项号与它想要的那件事读出来。
 ///
-/// 上游的原话（2026-08 实测，Codex Desktop 0.149-alpha 发来的会话）：
-/// `Invalid 'input[137].id': 'item_7bf507811fb6e5f92c0ce7f2'. Expected an ID that begins with 'rs'.`
+/// 认两句话，都是 2026-08 在 Codex Desktop 的 alpha 版会话上实测到的原文：
+/// - `Invalid 'input[137].id': 'item_7bf507811fb6e5f92c0ce7f2'. Expected an ID that begins
+///   with 'rs'.`——客户端把一段别处来的历史照原样发了回来，那批项的 `id` 是 `item_…` 而不是
+///   Responses 的 `rs_…`。
+/// - `Missing required parameter: 'input[218].encrypted_content'.`——客户端手里那项 reasoning
+///   只剩 `id` 与 `summary`：密文在 `response.output_item.done` 里，上一轮的流没走到那个事件
+///   （人按了停、网断了、或客户端自己压缩历史时丢了那一截），而 `store=false` 时上游没处查，
+///   只能靠客户端捎回来。
 ///
-/// 坏 `id` 是客户端那头的事（它把一段别处来的历史照原样发了回来，那批项的 `id` 是
-/// `item_…` 而不是 Responses 的 `rs_…`），但**代价全在这条链路上**：这段会话从这一轮起每一
-/// 次都 400。所以照摘密文那套处置——修掉再发一遍。
+/// 两句都是客户端那头的事，但**代价全在这条链路上**：这段会话从这一轮起每一次都 400。所以照
+/// 摘密文那套处置——修掉再发一遍。
 ///
-/// 读项号与前缀而不是只判「是这个病」：改哪一项、按什么判，全靠上游这句话——自己维护一张
-/// 「项类型 → `id` 前缀」的表是在猜上游的 schema，猜错了就是白把客户端的历史改一遍。
-fn detect_malformed_item_id(status: StatusCode, body: &[u8]) -> Option<MalformedIdComplaint> {
+/// 读项号与它想要什么、而不是只判「是这个病」：改哪一项、按什么改，全靠上游这句话。
+fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputItemComplaint> {
     if status != StatusCode::BAD_REQUEST {
         return None;
     }
     let msg = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_owned))?;
-    let (_, rest) = msg.split_once("Invalid 'input[")?;
-    let (idx, rest) = rest.split_once("].id'")?;
+    if let Some((_, rest)) = msg.split_once("Invalid 'input[")
+        && let Some((idx, rest)) = rest.split_once("].id'")
+        && let Ok(index) = idx.parse::<usize>()
+        && let Some(prefix) =
+            rest.split_once("begins with '").and_then(|(_, r)| r.split('\'').next())
+        && !prefix.trim().is_empty()
+    {
+        return Some(InputItemComplaint { index, want: Want::IdPrefix(prefix.trim().to_owned()) });
+    }
+    let (_, rest) = msg.split_once("Missing required parameter: 'input[")?;
+    let (idx, rest) = rest.split_once("].")?;
     let index = idx.parse::<usize>().ok()?;
-    let prefix = rest.split_once("begins with '")?.1.split('\'').next()?.trim().to_owned();
-    (!prefix.is_empty()).then_some(MalformedIdComplaint { index, prefix })
+    let field = rest.split('\'').next()?;
+    // 只认项上那一层的裸字段名。`input[2].content[0].text` 这种更深的路径不认：按它学出来的
+    // 规则谁也撞不上，白发一次重试。
+    (!field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| InputItemComplaint { index, want: Want::Field(field.to_owned()) })
 }
 
 /// 把一句抱怨落成一条规则：抱怨只说了「第几项」，规则要的是「哪一类项」——项号在下一轮就
 /// 变了（客户端又往历史里加了几项），类型不会。
 ///
-/// 读不到那一项（项号越界、体不是 JSON、那一项没有 `type`）就返回 `None`：那时改哪一项都是
-/// 猜，不如把上游那句 400 原样交回去。
-fn malformed_id_rule(body: &Bytes, complaint: &MalformedIdComplaint) -> Option<MalformedIdRule> {
+/// 两种情况返回 `None`，都是「宁可把上游那句 400 原样交回去」：
+/// - 读不到那一项（项号越界、体不是 JSON、那一项没有 `type`）：改哪一项都是猜。
+/// - 缺字段、而这类项又**丢不起**（见 [`DROP_WHOLE_ITEM`]）：字段补不出来、整项又不能丢，
+///   这条规则学了也修不动，只会白发一次重试。
+fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<InputItemRule> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let item = v.get("input")?.as_array()?.get(complaint.index)?;
     let item_type = item.get("type")?.as_str()?.to_owned();
-    Some(MalformedIdRule { item_type, prefix: complaint.prefix.clone() })
+    match &complaint.want {
+        Want::IdPrefix(prefix) => {
+            Some(InputItemRule::IdPrefix { item_type, prefix: prefix.clone() })
+        }
+        Want::Field(field) => DROP_WHOLE_ITEM
+            .contains(&item_type.as_str())
+            .then(|| InputItemRule::RequiredField { item_type, field: field.clone() }),
+    }
 }
 
-/// 按规则把 `input` 里 `id` 前缀不对的那些项修掉，返回改写后的体；一项都没动则返回
-/// `None`——那说明这条 400 不是这个病，重发一遍白发一次。
+/// 按规则把 `input` 里不合要求的那些项修掉，返回改写后的体；一项都没动则返回 `None`——那说明
+/// 这条 400 不是这个病，重发一遍白发一次。
 ///
-/// 分两种改法，界线是「上游要不要求这类项带 `id`」：
-/// - `reasoning`：**整项丢掉**。`id` 是这类项的必填字段，只摘掉字段换回来的是另一句 400
-///   （`Missing required parameter`）；而「`input` 里没有 reasoning 项」是没开
-///   `include: reasoning.encrypted_content` 的客户端天天在发的形状，稳（同
-///   [`strip_encrypted_reasoning`] 的取舍）。代价是模型看不见那几轮的思考过程。
-/// - 其余类型（`message`/`function_call`/`function_call_output`…）：**只摘掉 `id` 字段**。
-///   那个字段对它们是可选的（客户端自己造的消息本来就不带），整项丢掉却是把用户的一段话或
-///   一次工具结果变没了——那比 400 更糟，因为它不报错。
-fn drop_malformed_ids(body: &Bytes, rules: &[MalformedIdRule]) -> Option<Bytes> {
-    /// `id` 是上游必填的那些项类型：这些只能整项丢。
-    const ID_REQUIRED: &[&str] = &["reasoning"];
-
+/// 两种改法，界线见 [`InputItemRule::drops_whole_item`]：整项丢掉，或只摘掉那个 `id`。
+/// **同一条规则把整个 `input` 扫一遍**：上游一次只报第一个坏项，而坏项通常是成片的（同一段
+/// 被压缩过的历史里，那一类项的毛病一模一样），一项一项修就是一项一次上游往返。
+fn repair_input_items(body: &Bytes, rules: &[InputItemRule]) -> Option<Bytes> {
     let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body).ok()?;
     let mut touched = false;
     {
         let input = obj.get_mut("input")?.as_array_mut()?;
         let before = input.len();
-        input.retain(|item| {
-            !(violates_id_rule(item, rules)
-                && ID_REQUIRED.contains(&item.get("type").and_then(|t| t.as_str()).unwrap_or("")))
-        });
+        input.retain(|item| !rules.iter().any(|r| r.violated_by(item) && r.drops_whole_item(item)));
         touched |= input.len() != before;
+        // 留下来的违规项都是「摘掉那个字段就好」的那种，目前只有坏 `id` 一种。
         for item in input.iter_mut() {
-            if violates_id_rule(item, rules)
-                && let Some(o) = item.as_object_mut()
-            {
+            let bad_id = rules
+                .iter()
+                .any(|r| matches!(r, InputItemRule::IdPrefix { .. }) && r.violated_by(item));
+            if bad_id && let Some(o) = item.as_object_mut() {
                 touched |= o.remove("id").is_some();
             }
         }
@@ -1292,29 +1368,20 @@ fn drop_malformed_ids(body: &Bytes, rules: &[MalformedIdRule]) -> Option<Bytes> 
     serde_json::to_vec(&serde_json::Value::Object(obj)).ok().map(Bytes::from)
 }
 
-/// 这一项是不是撞上了某条规则：类型对得上、而它的 `id` 不是规则要求的前缀。
-///
-/// 没有 `id` 的项一律放过——规则管的是「`id` 的形状」，一个不带 `id` 的项没有形状可言。
-fn violates_id_rule(item: &serde_json::Value, rules: &[MalformedIdRule]) -> bool {
-    let Some(id) = item.get("id").and_then(|v| v.as_str()) else { return false };
-    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
-    rules.iter().any(|r| r.item_type == item_type && !id.starts_with(&r.prefix))
-}
-
 /// 取这个会话已知的那几条规则。没有会话键就没有记忆，返回空。
-fn malformed_id_rules(memo: &MalformedIdMemo, session_key: Option<&str>) -> Vec<MalformedIdRule> {
+fn known_input_rules(memo: &InputRuleMemo, session_key: Option<&str>) -> Vec<InputItemRule> {
     let Some(key) = session_key.filter(|k| !k.is_empty()) else { return Vec::new() };
     memo.lock().iter().filter(|(k, _)| k == key).map(|(_, r)| r.clone()).collect()
 }
 
-/// 记下「这个会话捎来的这类项 `id` 前缀不对」。没有会话键就不记：那时无从对号。
-fn note_malformed_id(memo: &MalformedIdMemo, session_key: Option<&str>, rule: &MalformedIdRule) {
+/// 记下「这个会话捎来的项撞上了这条规则」。没有会话键就不记：那时无从对号。
+fn note_input_rule(memo: &InputRuleMemo, session_key: Option<&str>, rule: &InputItemRule) {
     let Some(key) = session_key.filter(|k| !k.is_empty()) else { return };
     let mut memo = memo.lock();
     if memo.iter().any(|(k, r)| k == key && r == rule) {
         return;
     }
-    while memo.len() >= MALFORMED_ID_MEMO_MAX {
+    while memo.len() >= INPUT_RULE_MEMO_MAX {
         memo.pop_front();
     }
     memo.push_back((key.to_owned(), rule.clone()));
@@ -4381,27 +4448,40 @@ mod tests {
         assert!(!stale_reasoning_known(&memo, Some("sess-a"), 1));
     }
 
-    /// 上游嫌某项 `id` 前缀不对时那句 400 要认出来，且项号与该有的前缀都要读准：认不出来，
-    /// 这段会话从此每一轮都 400（客户端下一轮还会把同一段历史发回来）。
+    /// 上游那两句抱怨都要认出来，项号与「它想要什么」都要读准：认不出来，这段会话从此每
+    /// 一轮都 400（客户端下一轮还会把同一段历史发回来）。
     #[test]
-    fn a_malformed_input_item_id_is_detected_with_its_index_and_prefix() {
-        let bad = br#"{"error":{"message":"Invalid 'input[137].id': 'item_7bf507811fb6e5f92c0ce7f2'. Expected an ID that begins with 'rs'.","type":"invalid_request_error"}}"#;
-        let c = detect_malformed_item_id(StatusCode::BAD_REQUEST, bad).expect("这句得认出来");
-        assert_eq!((c.index, c.prefix.as_str()), (137, "rs"));
+    fn input_item_complaints_are_read_off_the_upstream_message() {
+        let bad_id = br#"{"error":{"message":"Invalid 'input[137].id': 'item_7bf507811fb6e5f92c0ce7f2'. Expected an ID that begins with 'rs'.","type":"invalid_request_error"}}"#;
+        let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, bad_id).expect("这句得认出来");
+        assert_eq!(c.index, 137);
+        assert!(matches!(&c.want, Want::IdPrefix(p) if p == "rs"));
+
+        let missing = br#"{"error":{"message":"Missing required parameter: 'input[218].encrypted_content'.","type":"invalid_request_error"}}"#;
+        let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, missing).expect("这句也得认");
+        assert_eq!(c.index, 218);
+        assert!(matches!(&c.want, Want::Field(f) if f == "encrypted_content"));
 
         // 状态码不对不判；别的 400 也不判——误判一次就是白把客户端的历史改一遍。
-        assert!(detect_malformed_item_id(StatusCode::TOO_MANY_REQUESTS, bad).is_none());
+        assert!(detect_input_item_complaint(StatusCode::TOO_MANY_REQUESTS, bad_id).is_none());
         let other = br#"{"error":{"message":"Unsupported parameter: temperature"}}"#;
-        assert!(detect_malformed_item_id(StatusCode::BAD_REQUEST, other).is_none());
-        // 只说了坏在哪、没说该是什么前缀：读不出规则就不动手。
+        assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, other).is_none());
+        // 只说了坏在哪、没说该是什么前缀：读不出要求就不动手。
         let vague = br#"{"error":{"message":"Invalid 'input[3].id': 'x'."}}"#;
-        assert!(detect_malformed_item_id(StatusCode::BAD_REQUEST, vague).is_none());
-        assert!(detect_malformed_item_id(StatusCode::BAD_REQUEST, b"not json").is_none());
+        assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, vague).is_none());
+        // 更深的路径不认：按它学出来的规则谁也撞不上，白发一次重试。
+        let nested =
+            br#"{"error":{"message":"Missing required parameter: 'input[2].content[0].text'."}}"#;
+        assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, nested).is_none());
+        // 缺的不是 input 里的项（如顶层参数）：这一支管不着。
+        let top = br#"{"error":{"message":"Missing required parameter: 'model'."}}"#;
+        assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, top).is_none());
+        assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, b"not json").is_none());
     }
 
     /// 抱怨落成规则认的是**类型**而不是项号：项号下一轮就变了，类型不会。
     #[test]
-    fn the_complaint_becomes_a_rule_about_that_item_type() {
+    fn a_complaint_becomes_a_rule_about_that_item_type() {
         let body = Bytes::from(
             r#"{"input":[
                 {"type":"message","role":"user","content":"hi"},
@@ -4409,30 +4489,41 @@ mod tests {
             ]}"#
             .to_owned(),
         );
-        let c = MalformedIdComplaint { index: 1, prefix: "rs".to_owned() };
-        let rule = malformed_id_rule(&body, &c).expect("那一项有 type，规则该出得来");
-        assert_eq!((rule.item_type.as_str(), rule.prefix.as_str()), ("reasoning", "rs"));
+        let c = InputItemComplaint { index: 1, want: Want::IdPrefix("rs".to_owned()) };
+        let rule = input_item_rule(&body, &c).expect("那一项有 type，规则该出得来");
+        assert_eq!(
+            rule,
+            InputItemRule::IdPrefix { item_type: "reasoning".to_owned(), prefix: "rs".to_owned() }
+        );
+
+        // 缺字段：只在丢得起的类型上学。reasoning 学得下来……
+        let c = InputItemComplaint { index: 1, want: Want::Field("encrypted_content".to_owned()) };
+        assert_eq!(
+            input_item_rule(&body, &c).expect("reasoning 丢得起"),
+            InputItemRule::RequiredField {
+                item_type: "reasoning".to_owned(),
+                field: "encrypted_content".to_owned()
+            }
+        );
+        // ……而一条消息缺了什么，字段补不出来、整项又不能丢，那就别学：把 400 原样交回去。
+        let c = InputItemComplaint { index: 0, want: Want::Field("content".to_owned()) };
+        assert!(input_item_rule(&body, &c).is_none());
 
         // 项号越界 / 那一项没有 type / 体不是 JSON：都不猜。
-        let out_of_range = MalformedIdComplaint { index: 9, prefix: "rs".to_owned() };
-        assert!(malformed_id_rule(&body, &out_of_range).is_none());
+        let c = InputItemComplaint { index: 9, want: Want::IdPrefix("rs".to_owned()) };
+        assert!(input_item_rule(&body, &c).is_none());
         let untyped = Bytes::from(r#"{"input":[{"role":"user","content":"hi"}]}"#.to_owned());
-        assert!(
-            malformed_id_rule(
-                &untyped,
-                &MalformedIdComplaint { index: 0, prefix: "msg".to_owned() }
-            )
-            .is_none()
-        );
-        assert!(malformed_id_rule(&Bytes::from_static(b"not json"), &c).is_none());
+        let c = InputItemComplaint { index: 0, want: Want::IdPrefix("msg".to_owned()) };
+        assert!(input_item_rule(&untyped, &c).is_none());
+        assert!(input_item_rule(&Bytes::from_static(b"not json"), &c).is_none());
     }
 
-    /// 修法按类型分两档：`reasoning` 整项丢（`id` 是它的必填字段），别的只摘掉 `id`——
+    /// 坏 `id` 按类型分两档修：`reasoning` 整项丢（`id` 是它的必填字段），别的只摘掉 `id`——
     /// 顺手丢掉一条消息或一个 `function_call_output` 就是把用户的话或工具结果变没了。
     #[test]
-    fn malformed_ids_are_dropped_the_way_each_item_type_allows() {
+    fn bad_ids_are_repaired_the_way_each_item_type_allows() {
         let body = Bytes::from(
-            r#"{"model":"gpt-5.5","input":[
+            r#"{"model":"gpt-5.6-terra","input":[
                 {"type":"message","id":"msg_1","role":"user","content":"hi"},
                 {"type":"reasoning","id":"rs_ok","summary":[],"encrypted_content":"gAAAA"},
                 {"type":"reasoning","id":"item_bad","summary":[],"encrypted_content":"gBBBB"},
@@ -4442,10 +4533,13 @@ mod tests {
             .to_owned(),
         );
         let rules = vec![
-            MalformedIdRule { item_type: "reasoning".to_owned(), prefix: "rs".to_owned() },
-            MalformedIdRule { item_type: "function_call".to_owned(), prefix: "fc".to_owned() },
+            InputItemRule::IdPrefix { item_type: "reasoning".to_owned(), prefix: "rs".to_owned() },
+            InputItemRule::IdPrefix {
+                item_type: "function_call".to_owned(),
+                prefix: "fc".to_owned(),
+            },
         ];
-        let fixed = drop_malformed_ids(&body, &rules).expect("有坏 id 就该改写");
+        let fixed = repair_input_items(&body, &rules).expect("有坏 id 就该改写");
         let v: serde_json::Value = serde_json::from_slice(&fixed).unwrap();
         let input = v["input"].as_array().unwrap();
         assert_eq!(input.len(), 4, "只该少掉那一项 id 不合法的 reasoning");
@@ -4460,38 +4554,79 @@ mod tests {
         // 一项都没撞上规则时返回 None：重发一遍白发一次。
         let clean =
             Bytes::from(r#"{"input":[{"type":"reasoning","id":"rs_1","summary":[]}]}"#.to_owned());
-        assert!(drop_malformed_ids(&clean, &rules).is_none());
+        assert!(repair_input_items(&clean, &rules).is_none());
         // 不带 id 的项没有形状可言，不该被算成坏项。
         let no_id = Bytes::from(r#"{"input":[{"type":"reasoning","summary":[]}]}"#.to_owned());
-        assert!(drop_malformed_ids(&no_id, &rules).is_none());
-        // 非 JSON / 没有 input 的体一样不重发。
-        assert!(drop_malformed_ids(&Bytes::from_static(b"not json"), &rules).is_none());
-        assert!(drop_malformed_ids(&body, &[]).is_none());
+        assert!(repair_input_items(&no_id, &rules).is_none());
+        // 非 JSON / 没有 input 的体、以及一条规则都没有时，一样不重发。
+        assert!(repair_input_items(&Bytes::from_static(b"not json"), &rules).is_none());
+        assert!(repair_input_items(&body, &[]).is_none());
     }
 
-    /// 记忆按会话认（**不按号**：`id` 的形状是上游的统一约束，换个号一样不认），且有上限。
+    /// 缺了密文的 reasoning 项整项丢，**同一遍把成片的都扫掉**：上游一次只报第一个，一项一
+    /// 项修就是一项一次上游往返。带着密文的那些一个都不许动。
     #[test]
-    fn the_malformed_id_memo_is_keyed_by_session_and_bounded() {
-        let memo = MalformedIdMemo::default();
-        let rule = MalformedIdRule { item_type: "reasoning".to_owned(), prefix: "rs".to_owned() };
-        note_malformed_id(&memo, Some("sess-a"), &rule);
-        assert_eq!(malformed_id_rules(&memo, Some("sess-a")), vec![rule.clone()]);
-        assert!(malformed_id_rules(&memo, Some("sess-b")).is_empty(), "换段会话是另一件事");
-        // 没有会话键时不记也不认：那时无从对号。
-        note_malformed_id(&memo, None, &rule);
-        note_malformed_id(&memo, Some(""), &rule);
-        assert!(malformed_id_rules(&memo, None).is_empty());
-        note_malformed_id(&memo, Some("sess-a"), &rule);
-        assert_eq!(memo.lock().len(), 1, "同一条记两遍也只占一个位置");
-        // 同一段会话可以有几类项各自的规则。
-        let other = MalformedIdRule { item_type: "message".to_owned(), prefix: "msg".to_owned() };
-        note_malformed_id(&memo, Some("sess-a"), &other);
-        assert_eq!(malformed_id_rules(&memo, Some("sess-a")).len(), 2);
+    fn reasoning_items_missing_their_encrypted_content_are_dropped_in_one_sweep() {
+        let body = Bytes::from(
+            r#"{"model":"gpt-5.6-terra","input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAAA"},
+                {"type":"reasoning","id":"rs_2","summary":[]},
+                {"type":"function_call","name":"shell","call_id":"c1","arguments":"{}"},
+                {"type":"reasoning","id":"rs_3","summary":[],"encrypted_content":null},
+                {"type":"function_call_output","call_id":"c1","output":"ok"}
+            ]}"#
+            .to_owned(),
+        );
+        let rules = vec![InputItemRule::RequiredField {
+            item_type: "reasoning".to_owned(),
+            field: "encrypted_content".to_owned(),
+        }];
+        let fixed = repair_input_items(&body, &rules).expect("有残项就该改写");
+        let v: serde_json::Value = serde_json::from_slice(&fixed).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4, "两项残的（缺字段与 null）都该丢掉");
+        let reasoning: Vec<_> = input.iter().filter(|i| i["type"] == "reasoning").collect();
+        assert_eq!(reasoning.len(), 1, "带着密文的那项留着");
+        assert_eq!(reasoning[0]["id"], "rs_1");
+        assert_eq!(input[2]["call_id"], "c1", "工具调用与结果的配对不受影响");
+        assert_eq!(input[3]["call_id"], "c1");
 
-        for i in 0..MALFORMED_ID_MEMO_MAX * 2 {
-            note_malformed_id(&memo, Some(&format!("sess-{i}")), &rule);
+        // 一项不缺时返回 None。
+        let ok = Bytes::from(
+            r#"{"input":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"g"}]}"#
+                .to_owned(),
+        );
+        assert!(repair_input_items(&ok, &rules).is_none());
+    }
+
+    /// 记忆按会话认（**不按号**：项的形状是上游的统一约束，换个号一样不认），且有上限。
+    #[test]
+    fn the_input_rule_memo_is_keyed_by_session_and_bounded() {
+        let memo = InputRuleMemo::default();
+        let rule =
+            InputItemRule::IdPrefix { item_type: "reasoning".to_owned(), prefix: "rs".to_owned() };
+        note_input_rule(&memo, Some("sess-a"), &rule);
+        assert_eq!(known_input_rules(&memo, Some("sess-a")), vec![rule.clone()]);
+        assert!(known_input_rules(&memo, Some("sess-b")).is_empty(), "换段会话是另一件事");
+        // 没有会话键时不记也不认：那时无从对号。
+        note_input_rule(&memo, None, &rule);
+        note_input_rule(&memo, Some(""), &rule);
+        assert!(known_input_rules(&memo, None).is_empty());
+        note_input_rule(&memo, Some("sess-a"), &rule);
+        assert_eq!(memo.lock().len(), 1, "同一条记两遍也只占一个位置");
+        // 同一段会话可以有几条各管一件事的规则。
+        let other = InputItemRule::RequiredField {
+            item_type: "reasoning".to_owned(),
+            field: "encrypted_content".to_owned(),
+        };
+        note_input_rule(&memo, Some("sess-a"), &other);
+        assert_eq!(known_input_rules(&memo, Some("sess-a")).len(), 2);
+
+        for i in 0..INPUT_RULE_MEMO_MAX * 2 {
+            note_input_rule(&memo, Some(&format!("sess-{i}")), &rule);
         }
-        assert!(memo.lock().len() <= MALFORMED_ID_MEMO_MAX);
+        assert!(memo.lock().len() <= INPUT_RULE_MEMO_MAX);
     }
 
     /// 取最后一个 usage：中途事件也可能带一个不完整的读数。
