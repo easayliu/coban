@@ -1228,7 +1228,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             </ul>
           )}
 
-          {!isLoading && pageCount > 1 && (
+          {/* 门槛是「有数据」而不是「有多页」：每页条数选择器住在这条里，按 pageCount > 1 收掉的话，
+              一旦挑了 50 而账号不足 50，整条连同选择器一起消失，人就被锁死在 50 上换不回来了。
+              页码那半截自己在里面按 pageCount 收（见 [AccountPagination]）。 */}
+          {!isLoading && total > 0 && (
             <div className="relative py-2">
               <AccountPagination
                 total={total}
@@ -1306,55 +1309,58 @@ function AccountPagination({
           {t(' 个账号', ` ${total === 1 ? 'account' : 'accounts'}`)}
         </span>
       </span>
-      <CossPagination className="col-span-2 row-start-2 justify-center md:col-span-1 md:col-start-2 md:row-start-1">
-        <PaginationContent>
-          <PaginationItem>
-            <PaginationLink
-              href="#"
-              size="icon-sm"
-              className={cn(page <= 1 && 'pointer-events-none opacity-50')}
-              aria-disabled={page <= 1}
-              aria-label={t('上一页', 'Previous page')}
-              onClick={(event) => navigate(event, page - 1)}
-            >
-              <ChevronLeftIcon />
-            </PaginationLink>
-          </PaginationItem>
-          {pages.map((item) => (
-            <PaginationItem key={item} className="max-sm:hidden">
+      {/* 只有一页时页码没有意义，收掉；计数与每页条数留着。 */}
+      {pageCount > 1 && (
+        <CossPagination className="col-span-2 row-start-2 justify-center md:col-span-1 md:col-start-2 md:row-start-1">
+          <PaginationContent>
+            <PaginationItem>
               <PaginationLink
                 href="#"
                 size="icon-sm"
-                isActive={item === page}
-                aria-label={t(
-                  `第 ${formatNumber(item)} 页`,
-                  `Page ${formatNumber(item)}`,
-                )}
-                onClick={(event) => navigate(event, item)}
+                className={cn(page <= 1 && 'pointer-events-none opacity-50')}
+                aria-disabled={page <= 1}
+                aria-label={t('上一页', 'Previous page')}
+                onClick={(event) => navigate(event, page - 1)}
               >
-                <span className="tnum">{formatNumber(item)}</span>
+                <ChevronLeftIcon />
               </PaginationLink>
             </PaginationItem>
-          ))}
-          <PaginationItem className="sm:hidden">
-            <span className="tnum px-2 text-foreground">
-              {formatNumber(page)} / {formatNumber(pageCount)}
-            </span>
-          </PaginationItem>
-          <PaginationItem>
-            <PaginationLink
-              href="#"
-              size="icon-sm"
-              className={cn(page >= pageCount && 'pointer-events-none opacity-50')}
-              aria-disabled={page >= pageCount}
-              aria-label={t('下一页', 'Next page')}
-              onClick={(event) => navigate(event, page + 1)}
-            >
-              <ChevronRightIcon />
-            </PaginationLink>
-          </PaginationItem>
-        </PaginationContent>
-      </CossPagination>
+            {pages.map((item) => (
+              <PaginationItem key={item} className="max-sm:hidden">
+                <PaginationLink
+                  href="#"
+                  size="icon-sm"
+                  isActive={item === page}
+                  aria-label={t(
+                    `第 ${formatNumber(item)} 页`,
+                    `Page ${formatNumber(item)}`,
+                  )}
+                  onClick={(event) => navigate(event, item)}
+                >
+                  <span className="tnum">{formatNumber(item)}</span>
+                </PaginationLink>
+              </PaginationItem>
+            ))}
+            <PaginationItem className="sm:hidden">
+              <span className="tnum px-2 text-foreground">
+                {formatNumber(page)} / {formatNumber(pageCount)}
+              </span>
+            </PaginationItem>
+            <PaginationItem>
+              <PaginationLink
+                href="#"
+                size="icon-sm"
+                className={cn(page >= pageCount && 'pointer-events-none opacity-50')}
+                aria-disabled={page >= pageCount}
+                aria-label={t('下一页', 'Next page')}
+                onClick={(event) => navigate(event, page + 1)}
+              >
+                <ChevronRightIcon />
+              </PaginationLink>
+            </PaginationItem>
+          </PaginationContent>
+        </CossPagination>
+      )}
       <div className="row-start-1 flex items-center gap-2 justify-self-end md:col-start-3">
         <span className="max-sm:sr-only">{t('每页', 'Per page')}</span>
         <Select
