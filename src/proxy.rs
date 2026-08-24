@@ -2547,7 +2547,8 @@ fn incoming_session_id(headers: &HeaderMap) -> Option<(&'static str, String)> {
         .or_else(|| session_id_in_turn_metadata(headers))
 }
 
-/// Codex Desktop 把会话身份埋在一份 JSON 元数据头里，不发独立的会话头。
+/// Codex 的前端（Desktop、VS Code 扩展）把会话身份埋在一份 JSON 元数据头里，
+/// 不发独立的会话头。
 ///
 /// 实测这个头长这样（还带着工作目录、git 远端、sandbox 档位等等，与会话身份无关的都不看）：
 ///
@@ -2556,20 +2557,36 @@ fn incoming_session_id(headers: &HeaderMap) -> Option<(&'static str, String)> {
 ///                         "turn_id":"01a03433-fb63-…","window_id":"01a03433-…:0", …}
 /// ```
 ///
-/// 只认 `session_id` 与 `thread_id`（实测两者相等，先用前者）。**`turn_id` 绝不能碰**：它每
-/// 一轮都变，拿它当会话键等于每轮换一个落点、每轮丢一次缓存，比没有键还糟。`window_id` 同理
-/// 不用——同一段对话开两个窗口是一段对话。
+/// **认 `thread_id`，`session_id` 只作退路**。这两个不是一回事，虽然主线对话里它们恰好相等
+/// ——subagent 的请求里就分开了：
 ///
-/// 认出它的收益是实打实的：在此之前 Codex Desktop 全靠前缀指纹认会话，而**两段开头一样的
-/// 对话会算出同一个指纹**、在上游共用一个 session 互相踢（见 [`cache_reason`] 的
-/// `upstream_cold`）。有了真会话 id 这条路整个消失。
+/// ```text
+/// session_id=01a03429-…97a6  thread_id=01a03433-…4167  parent_thread_id=01a03429-…97a6
+/// window_id=01a03433-…4167:0  subagent_kind=guardian  thread_source=subagent
+/// ```
+///
+/// `session_id` 在这里等于 `parent_thread_id`——**父对话与它派出的每个 subagent 共用同一个
+/// `session_id`**，而它们各有各的前缀（instructions、工具、开头那条全不一样）。拿它当会话键
+/// 就是把这几段对话钉成一个：落点是同一个号，发往上游的 `session_id` 也是同一个
+/// （见 [`Credential::session_id`]），于是它们在上游共用一个 prompt cache 互相踢——正是
+/// [`cache_reason`] 里 `upstream_cold` 那类假共享，只不过这一回是我们自己造的。
+/// `thread_id` 才是「哪一段对话」：主线是它自己，subagent 是它自己，`window_id` 也是拿它加个
+/// 后缀拼的。
+///
+/// **`turn_id` 绝不能碰**：它每一轮都变，拿它当会话键等于每轮换一个落点、每轮丢一次缓存，
+/// 比没有键还糟。`parent_turn_id` / `root_turn_id` 同理（它们是那个派生动作的坐标，不是身份）。
+/// `window_id` 也不用——同一段对话开两个窗口是一段对话。
+///
+/// 认出它的收益是实打实的：在此之前这几个前端全靠前缀指纹认会话，而**两段开头一样的对话会
+/// 算出同一个指纹**、在上游共用一个 session 互相踢（见 [`cache_reason`] 的 `upstream_cold`）。
+/// 有了真会话 id 这条路整个消失。
 ///
 /// 解不开就当没有：这个头是客户端塞的，形状变了也不该把一条请求判死——退回指纹那条路，
 /// 那是它本来就在走的。
 fn session_id_in_turn_metadata(headers: &HeaderMap) -> Option<(&'static str, String)> {
     let raw = headers.get(TURN_METADATA_HEADER)?.to_str().ok()?;
     let meta: serde_json::Value = serde_json::from_str(raw).ok()?;
-    [("session_id", TURN_METADATA_SESSION), ("thread_id", TURN_METADATA_THREAD)].iter().find_map(
+    [("thread_id", TURN_METADATA_THREAD), ("session_id", TURN_METADATA_SESSION)].iter().find_map(
         |(field, label)| {
             let v = meta.get(field)?.as_str()?.trim();
             (!v.is_empty()).then(|| (*label, v.to_owned()))
@@ -2577,7 +2594,8 @@ fn session_id_in_turn_metadata(headers: &HeaderMap) -> Option<(&'static str, Str
     )
 }
 
-/// Codex Desktop 那份元数据头的名字，见 [`session_id_in_turn_metadata`]。
+/// Codex 那几个前端（Desktop、VS Code 扩展）那份元数据头的名字，
+/// 见 [`session_id_in_turn_metadata`]。
 const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 /// 会话键的来源标记（只进日志，见 [`SessionCtx::source`]）：认出的是元数据里的哪一项。
 const TURN_METADATA_SESSION: &str = "x-codex-turn-metadata.session_id";
@@ -5519,8 +5537,10 @@ mod tests {
         assert_eq!(name(&[("x-conversation-id", "abc")]), None);
     }
 
-    /// Codex Desktop 不发独立的会话头，会话身份埋在 `x-codex-turn-metadata` 那份 JSON 里。
-    /// 认出它，这个客户端才不必靠前缀指纹认会话（指纹会让两段开头一样的对话撞成一个键）。
+    /// Codex 的前端（Desktop、VS Code 扩展）不发独立的会话头，会话身份埋在
+    /// `x-codex-turn-metadata` 那份 JSON 里。认出它，这些客户端才不必靠前缀指纹认会话
+    /// （指纹会让两段开头一样的对话撞成一个键）。**认的是 `thread_id`**：`session_id` 在
+    /// subagent 的请求里是父对话的，父子共用它就撞回同一个键上了。
     #[test]
     fn the_session_id_is_dug_out_of_the_codex_turn_metadata() {
         // 实测那个头的形状（无关字段略去若干）：一行 JSON，session_id 与 thread_id 相等，
@@ -5535,7 +5555,41 @@ mod tests {
         );
         assert_eq!(
             incoming_session_id(&hm(&[("x-codex-turn-metadata", meta)])),
-            Some((TURN_METADATA_SESSION, "01a03433-fad4-79b0-9c90-c2a2ae5b76ca".to_owned()))
+            Some((TURN_METADATA_THREAD, "01a03433-fad4-79b0-9c90-c2a2ae5b76ca".to_owned()))
+        );
+
+        // subagent 的那份：session_id 是**父对话**的（= parent_thread_id），thread_id 才是这一段
+        // 自己的。取错了就是把父对话与它派出的每个 subagent 钉成同一个会话——同一个落点、
+        // 发往上游同一个 session_id，几段各有各前缀的对话在上游共用一份 prompt cache 互相踢。
+        let subagent = concat!(
+            r#"{"installation_id":"9b7653ff-f287-48f3-ba5e-96232c84f6ad","#,
+            r#""session_id":"01a03429-0df2-7a41-9f8a-a564fa9e97a6","#,
+            r#""thread_id":"01a03433-351c-7811-bab1-bd8d96b04167","#,
+            r#""turn_id":"01a03453-10f5-7ed3-b43d-e991d2ba5430","#,
+            r#""window_id":"01a03433-351c-7811-bab1-bd8d96b04167:0","#,
+            r#""parent_thread_id":"01a03429-0df2-7a41-9f8a-a564fa9e97a6","#,
+            r#""parent_turn_id":"01a03439-5f26-7ff1-afbd-2a2d754ccb6e","#,
+            r#""root_turn_id":"01a03439-5f26-7ff1-afbd-2a2d754ccb6e","#,
+            r#""subagent_kind":"guardian","thread_source":"subagent"}"#,
+        );
+        assert_eq!(
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", subagent)])),
+            Some((TURN_METADATA_THREAD, "01a03433-351c-7811-bab1-bd8d96b04167".to_owned())),
+            "subagent 该有自己的会话键，不能跟父对话共用"
+        );
+
+        // 父对话与它的 subagent 必须落在两个键上——取回 session_id 的话两者会相等，
+        // 而那正是我们要避开的。这一条钉的是两份元数据之间的**关系**，单独断言一次。
+        let parent = concat!(
+            r#"{"session_id":"01a03429-0df2-7a41-9f8a-a564fa9e97a6","#,
+            r#""thread_id":"01a03429-0df2-7a41-9f8a-a564fa9e97a6","#,
+            r#""turn_id":"01a03439-5f26-7ff1-afbd-2a2d754ccb6e","#,
+            r#""thread_source":"ambient_suggestions"}"#,
+        );
+        assert_ne!(
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", subagent)])),
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", parent)])),
+            "父对话与 subagent 不该共用一个会话键"
         );
 
         // 同一段对话的下一轮：turn_id 变了、会话键不能跟着变——那等于每轮换一个落点。
@@ -5549,11 +5603,11 @@ mod tests {
             "turn_id 变了会话键不该变"
         );
 
-        // 没有 session_id 就退到 thread_id。
-        let thread_only = r#"{"thread_id":"t-1","turn_id":"turn-9"}"#;
+        // 没有 thread_id 才退到 session_id。
+        let session_only = r#"{"session_id":"s-1","turn_id":"turn-9"}"#;
         assert_eq!(
-            incoming_session_id(&hm(&[("x-codex-turn-metadata", thread_only)])),
-            Some((TURN_METADATA_THREAD, "t-1".to_owned()))
+            incoming_session_id(&hm(&[("x-codex-turn-metadata", session_only)])),
+            Some((TURN_METADATA_SESSION, "s-1".to_owned()))
         );
 
         // 明写出来的会话头压过元数据：那是更直接的声明。
@@ -5568,9 +5622,11 @@ mod tests {
         // 解不开、缺项、或者只有 turn_id：一律当没有，退回前缀指纹那条路（它本来就在走）。
         for junk in [
             "not json at all",
-            r#"{"turn_id":"turn-9","window_id":"w:0"}"#,
+            // 只有轮次坐标：一个都不能当会话键，它们每轮都变。
+            r#"{"turn_id":"turn-9","parent_turn_id":"turn-8","root_turn_id":"turn-8"}"#,
+            r#"{"window_id":"01a03433-351c-7811-bab1-bd8d96b04167:0"}"#,
             r#"{"session_id":"","thread_id":"  "}"#,
-            r#"{"session_id":42}"#,
+            r#"{"session_id":42,"thread_id":null}"#,
             "",
         ] {
             assert_eq!(
