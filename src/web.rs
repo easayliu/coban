@@ -138,6 +138,7 @@ pub async fn run(
         .route("/settings/cooldown-secs", post(set_cooldown_secs))
         .route("/settings/session-lease-secs", post(set_session_lease_secs))
         .route("/settings/normalize-tool-order", post(set_normalize_tool_order))
+        .route("/settings/upstream-ua-mode", post(set_upstream_ua_mode))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
@@ -741,7 +742,7 @@ async fn refresh_credential(
     let client = state.clients.for_credential(&cred).map_err(|e| bad_request(format!("{e:#}")))?;
     // **失败要在服务端留痕**：`bad_request` 只把详情回给浏览器，而这条是排查授权问题时
     // 唯一有信息量的一行（上游的 error code 就在里面）。日志里只剩一句「400」等于没记。
-    let set = oauth::refresh_token(&client, &cred.refresh_token).await.map_err(|e| {
+    let set = oauth::refresh_token(&client, &cred.refresh_token, &cred.user_agent()).await.map_err(|e| {
         tracing::warn!(cred_id = id, label = %cred.label, error = %format!("{e:#}"), "manual token refresh failed");
         bad_request(format!("{e:#}"))
     })?;
@@ -1049,6 +1050,8 @@ struct SettingsResp {
     session_lease_secs: i64,
     /// 转发前是否把 `tools[]` 按名字排序。
     normalize_tool_order: bool,
+    /// 发往上游的 UA 怎么处理（0 透传 / 1 只改写不像官方客户端的 / 2 一律改写）。
+    upstream_ua_mode: i64,
     /// 管理鉴权是否已开启（前端据此决定要不要显示「导出」这类高危操作）。
     admin_configured: bool,
     version: &'static str,
@@ -1082,6 +1085,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
         normalize_tool_order: s
             .get_setting_i64(store::NORMALIZE_TOOL_ORDER, store::DEFAULT_NORMALIZE_TOOL_ORDER)
             != 0,
+        upstream_ua_mode: s
+            .get_setting_i64(store::UPSTREAM_UA_MODE, store::DEFAULT_UPSTREAM_UA_MODE),
         admin_configured: auth::admin_configured(&state),
         version: env!("CARGO_PKG_VERSION"),
     })
@@ -1193,6 +1198,17 @@ async fn set_normalize_tool_order(
     Json(req): Json<IntReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     set_int_setting(state, store::NORMALIZE_TOOL_ORDER, req.value, 0..=1).await
+}
+
+/// 发往上游的 `User-Agent` 怎么处理（见 `proxy::UaMode`）。
+///
+/// 三档走一个整数而不是两个布尔：`0/1/2` 是有序的三种收敛强度，拆成布尔组合会出现
+/// 「透传 + 一律改写」这种没有意义的取值。
+async fn set_upstream_ua_mode(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::UPSTREAM_UA_MODE, req.value, 0..=2).await
 }
 
 /// 0 是合法值：把会话租约整个关掉，落点退回按会话键现算（见 `store::SessionLeases`）。

@@ -90,6 +90,33 @@ impl Credential {
         bytes.copy_from_slice(&digest[..16]);
         uuid_from_bytes(bytes)
     }
+
+    /// 该凭证对上游呈现的 `User-Agent`：按 `account_id` 从 [`config::UA_PROFILES`] 里
+    /// 挑一份「机器画像」拼出来。
+    ///
+    /// 与 [`Self::session_id`] 同一个思路：**按账号派生，不透传来访客户端那份**。理由见
+    /// [`config::UA_PROFILES`] 的注——全池共用一条 UA 是一簇可关联的指纹，而透传来访的
+    /// 那份会造出「`originator` 说 codex CLI、UA 说 python SDK」这种官方客户端产生不出来
+    /// 的组合。
+    ///
+    /// 取 `account_id` 而不是 `id` 或 `label`：那两个都会变（重新导入换 id、改名换 label），
+    /// 一变就等于这个号换了台机器。`account_id` 是账号本身，只有重新登录另一个账号才会变。
+    ///
+    /// 哈希前缀里那个 `"ua"` 是**域分隔**：与 `session_id` 用同一份摘要的话，两个派生值之间
+    /// 就有了可推算的关系，而它们本该互不相干。
+    pub fn user_agent(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"ua");
+        hasher.update([0u8]); // 分隔符，避免拼接歧义
+        hasher.update(self.account_id.as_bytes());
+        let digest = hasher.finalize();
+        // 取 8 字节足够均匀，也不必关心表长是不是 2 的幂。
+        let mut pick = [0u8; 8];
+        pick.copy_from_slice(&digest[..8]);
+        let idx = u64::from_be_bytes(pick) as usize % config::UA_PROFILES.len();
+        config::user_agent(config::UA_PROFILES[idx])
+    }
 }
 
 /// 把 16 字节按 UUID v4 的形态（版本位/变体位就位）格式化成带连字符的小写串。
@@ -150,6 +177,35 @@ mod tests {
         assert_eq!(c.session_id("fp"), c.session_id("fp"));
         assert_ne!(c.session_id("fp"), c.session_id("other"));
         assert_ne!(c.session_id("fp"), cred("acct-2").session_id("fp"));
+    }
+
+    /// UA 是**按账号定死的**：同一个号每次算出来都一样，不同号可以撞（表就那么长），
+    /// 但整池不能只落在一份画像上。
+    #[test]
+    fn user_agent_is_stable_per_account_and_spread_over_profiles() {
+        let c = cred("acct-1");
+        assert_eq!(c.user_agent(), c.user_agent());
+
+        let seen: std::collections::HashSet<String> =
+            (0..200).map(|i| cred(&format!("acct-{i}")).user_agent()).collect();
+        // 200 个号只压在一两份画像上，说明取摘要那一步偏了——那时逐号派生就没意义了。
+        assert!(
+            seen.len() >= config::UA_PROFILES.len() / 2,
+            "only {} distinct UAs across 200 accounts",
+            seen.len()
+        );
+    }
+
+    /// 派生出来的 UA 必须**自己就被认成官方客户端**：`UaMode::Auto` 判的是同一个前缀，
+    /// 认不出来的话改写完还会被再改写一遍（而且下一档的判断就没有不动点了）。
+    #[test]
+    fn user_agent_looks_like_the_official_client() {
+        let ua = cred("acct-1").user_agent();
+        assert!(ua.starts_with(config::UA_PREFIX), "{ua}");
+        assert!(ua.starts_with(&format!("{}{}", config::UA_PREFIX, config::CODEX_VERSION)), "{ua}");
+        // 形态：`codex_cli_rs/<版本> (<OS>; <arch>) <终端>`
+        assert!(ua.contains("; ") && ua.contains(") "), "{ua}");
+        assert_eq!(config::UA_PREFIX, format!("{}/", config::ORIGINATOR));
     }
 
     /// 派生串必须过 UUID v4 的形态校验：长度、连字符位置、版本位与变体位。

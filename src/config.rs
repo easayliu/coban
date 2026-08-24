@@ -97,17 +97,77 @@ pub const ORIGINATOR: &str = "codex_cli_rs";
 /// 而是**连通性测试的模型下拉里少一大半模型**。
 pub const CODEX_VERSION: &str = "0.148.0";
 
-/// coban 自身发起的账号级请求（token 刷新）默认带的 `User-Agent`。
+/// 官方客户端 `User-Agent` 的固定前缀（[`ORIGINATOR`] 加一个斜杠）。
 ///
-/// 形态照官方客户端：`codex_cli_rs/<版本> (<OS>; <arch>) <终端>`。转发 `/v1/*` 时以
-/// 来访客户端自己的 UA 为准（转发头覆盖此默认值），故这里只影响刷新那类请求——
-/// 一个持有订阅 refresh_token 却不带 UA 的客户端非常显眼。
+/// 判「这条来访 UA 像不像官方客户端」用它，见 `proxy::UaMode`。要带上斜杠：少了它，
+/// `codex_cli_rs_wrapper/1.0` 这种也会被当成官方客户端放过去。
+pub const UA_PREFIX: &str = "codex_cli_rs/";
+
+/// 逐号派生 UA 用的「机器画像」表：`(OS 名与版本, arch, 终端)`。
+///
+/// **为什么不是一个常量**：一个号一台机器才是真实形态。二十个号报一模一样的
+/// `Mac OS 26.0.0; arm64) unknown`，这本身就是一簇可关联的指纹——上游不必看内容，
+/// 光按 UA 分组就能把这些号归到一起。按 `account_id` 派生（见
+/// [`crate::credentials::Credential::user_agent`]）之后，每个号看着是一台稳定的机器、
+/// 跨重启不变，与「逐账号代理」是同一个思路的两半。
+///
+/// **只在真实机器之间确实会不同的字段上取值**：OS 名与版本、arch、终端
+/// （官方客户端那一段取自 `TERM_PROGRAM`，取不到就是 `unknown`）。版本号一律用
+/// [`CODEX_VERSION`]、**不打散**：打散等于让一部分号看着像几个月没升级过的客户端，
+/// 正是那个常量的注在防的事；而「全都升到了最新版」本身是合理形态。
+///
+/// 表可以往后加，但**不能删、不能改顺序**：索引是按 `account_id` 算出来的，
+/// 动了表就等于给一批号换了机器——一个号的 UA 突然从 Mac 变成 Ubuntu，比它一直报同一份
+/// 更显眼。
+pub const UA_PROFILES: &[(&str, &str, &str)] = &[
+    ("Mac OS 26.0.0", "arm64", "unknown"),
+    ("Mac OS 26.0.0", "arm64", "iTerm.app"),
+    ("Mac OS 26.0.1", "arm64", "unknown"),
+    ("Mac OS 26.0.1", "arm64", "Apple_Terminal"),
+    ("Mac OS 26.0.1", "arm64", "vscode"),
+    ("Mac OS 15.6.1", "arm64", "unknown"),
+    ("Mac OS 15.6.1", "arm64", "iTerm.app"),
+    ("Mac OS 15.6.1", "x86_64", "unknown"),
+    ("Ubuntu 24.04", "x86_64", "unknown"),
+    ("Ubuntu 24.04", "x86_64", "vscode"),
+    ("Ubuntu 22.04", "x86_64", "unknown"),
+    ("Debian 12", "x86_64", "unknown"),
+];
+
+/// 按一份画像拼出 UA 串：`codex_cli_rs/<版本> (<OS>; <arch>) <终端>`。
 ///
 /// **版本号取自 [`CODEX_VERSION`] 而不是再写一遍**：两处各写一份的话，升级时必然漏掉
 /// 一处，于是出现「UA 说 0.98、别处说 0.99」这种真实客户端不会有的自相矛盾。
-pub static CODEX_USER_AGENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("codex_cli_rs/{CODEX_VERSION} (Mac OS 26.0.0; arm64) unknown")
-});
+pub fn user_agent((os, arch, term): (&str, &str, &str)) -> String {
+    format!("{UA_PREFIX}{CODEX_VERSION} ({os}; {arch}) {term}")
+}
+
+/// **没有凭证语境**时用的 `User-Agent`：出站客户端的默认头、授权码换 token。
+///
+/// 凡是能追溯到某个凭证的请求都不该用它，而要用那个号派生的那份（见 [`UA_PROFILES`]）
+/// ——转发、token 刷新、连通性测试、额度券那族接口都已经改成派生的。这里剩下的只有
+/// 「还没有凭证」的那一小段：授权码换 token 时账号身份还没落库。
+///
+/// 取值是 [`UA_PROFILES`] 的第一项，不另写一份：另写一份就等于多一种 coban 才有的形态。
+pub static CODEX_USER_AGENT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| user_agent(UA_PROFILES[0]));
+
+/// 改写 UA 时要一并清掉的来访侧客户端留痕头（精确匹配那族）。
+///
+/// 只在**真的改写了 UA** 的那条路上清（见 `proxy::build_forward_headers`）：UA 说这是
+/// codex CLI、而 `x-stainless-lang: python` 说这是 OpenAI 的 Python SDK——这种自相矛盾比
+/// 两者都老实报 python 更显眼。透传 UA 那一档不动它们，那时报的本来就是同一个客户端。
+///
+/// `openai-organization` / `openai-project` 是 API-key 模式的概念：拿着订阅 token 打
+/// `backend-api/codex` 时上游不看它们，而官方客户端从不发。
+pub const UA_REWRITE_STRIPPED_HEADERS: &[&str] = &["openai-organization", "openai-project"];
+
+/// 同上，按前缀匹配的那族。
+///
+/// OpenAI 各语言 SDK（stainless 生成的那批）都会带一串 `x-stainless-*`
+/// （`-lang`/`-os`/`-arch`/`-runtime`/`-runtime-version`/`-package-version`/`-retry-count`），
+/// 逐个列等于跟着上游 SDK 的版本追，按前缀一次清干净。
+pub const UA_REWRITE_STRIPPED_PREFIXES: &[&str] = &["x-stainless-"];
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -152,8 +212,11 @@ pub const RL_CREDITS_BALANCE: &str = "x-codex-credits-balance";
 /// 转发时**不**从来访请求复制给上游的头。
 ///
 /// 分三类，缺一不可：
-/// - **鉴权类**（`authorization`/`cookie`/`chatgpt-account-id`）：这几个是 coban 要换掉的
-///   东西本身。透传等于把来访客户端的接入 key 直接送给上游，而选中凭证的 token 反而被顶掉。
+/// - **鉴权类**（`authorization`/`api-key`/`x-api-key`/`cookie`/`chatgpt-account-id`）：这几个
+///   是 coban 要换掉的东西本身。透传等于把来访客户端的接入 key 直接送给上游，而选中凭证的
+///   token 反而被顶掉。`api-key`/`x-api-key` 一定要在这份清单里：[`crate::proxy`] 的
+///   `client_authorized` 认这两种写法，用它们接入的客户端，那个 key 就是 coban 的接入 key
+///   ——不掐掉就是把它原样发到 chatgpt.com，而上游压根不看这个头。
 /// - **逐跳类**（`host`/`connection`/`content-length`/`transfer-encoding` 等）：描述的是
 ///   「来访这一跳」的连接，与发往上游那一跳无关。`content-length` 尤其致命——改写过 body
 ///   之后它就是个错的长度，上游按它截断请求体，报错是一句指不到原因的 400。
@@ -161,6 +224,8 @@ pub const RL_CREDITS_BALANCE: &str = "x-codex-credits-balance";
 ///   直接写在头里，与整个转发形态的目标相反。
 pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "authorization",
+    "api-key",
+    "x-api-key",
     "cookie",
     "chatgpt-account-id",
     "host",

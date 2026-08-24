@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  CableIcon, CheckIcon, CopyIcon, EyeIcon, EyeOffIcon, GaugeIcon,
+  CableIcon, CheckIcon, CopyIcon, EyeIcon, EyeOffIcon, FingerprintIcon, GaugeIcon,
   LockKeyholeIcon, PinIcon, RefreshCwIcon, SaveIcon, ShieldAlertIcon, SparklesIcon, TimerResetIcon,
   Trash2Icon,
 } from 'lucide-react'
@@ -10,7 +10,7 @@ import { clearPw, setPw } from '@/api/client'
 import {
   getSettings, setApiKey, setCooldownSecs, setDefaultRpmLimit, setNormalizeToolOrder,
   setQuotaPausePct, setRateLimitRetryMax, setRateLimitRotate, setRateLimitWaitRetryMax,
-  setRateLimitWaitSecs, setSessionLeaseSecs, type Settings,
+  setRateLimitWaitSecs, setSessionLeaseSecs, setUpstreamUaMode, type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { copyText, extractError } from '@/lib/utils'
@@ -37,6 +37,7 @@ import {
   NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement, NumberFieldInput,
 } from '@/components/ui/number-field'
 import { Spinner } from '@/components/ui/spinner'
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
 import { SettingsGroup } from '@/components/settings-group'
@@ -160,6 +161,49 @@ function SwitchSetting({
       <div className="flex items-center gap-2 sm:justify-end">
         {pending && <Spinner />}
         <Switch checked={checked} disabled={pending} onCheckedChange={onToggle} aria-label={label} />
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * 一个「几选一」的设置项。与 [`SwitchSetting`] 一样**选完立刻保存**：选项本身就是终态，
+ * 没有「半个选择」这种中间态。
+ */
+function ChoiceSetting({
+  label, description, value, options, onSelect, pending,
+}: {
+  label: string
+  description: string
+  value: number
+  options: { value: number, label: string }[]
+  onSelect: (next: number) => void
+  pending: boolean
+}) {
+  // Select 的 value 走字符串：数字 0 在这套组件里与「没选」难分。
+  const items = options.map((o) => ({ label: o.label, value: String(o.value) }))
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{label}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">{description}</FieldDescription>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto sm:justify-end">
+        {pending && <Spinner />}
+        <Select
+          items={items}
+          value={String(value)}
+          onValueChange={(next) => { if (next !== null && Number(next) !== value) onSelect(Number(next)) }}
+        >
+          <SelectTrigger aria-label={label} className="w-full sm:w-64" disabled={pending}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectPopup>
+            {items.map((item) => (
+              <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+            ))}
+          </SelectPopup>
+        </Select>
       </div>
     </Field>
   )
@@ -506,6 +550,7 @@ export function LimitsSettingsContent() {
     setNormalizeToolOrder,
     t('已保存工具顺序设置', 'Tool order setting saved'),
   )
+  const uaMode = useSettingMutation(setUpstreamUaMode, t('已保存 UA 设置', 'UA setting saved'))
 
   if (settingsQuery.isPending) {
     return (
@@ -676,6 +721,31 @@ export function LimitsSettingsContent() {
           checked={data.normalize_tool_order}
           pending={toolOrder.isPending}
           onToggle={(on) => toolOrder.mutate(on)}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={FingerprintIcon}
+        title={t('上游指纹', 'Upstream fingerprint')}
+        description={t(
+          '转发出去的请求在上游看来是个什么客户端。',
+          'What kind of client the forwarded request looks like from upstream.',
+        )}
+      >
+        <ChoiceSetting
+          label={t('发往上游的 User-Agent', 'User-Agent sent upstream')}
+          description={t(
+            '默认原样透传，不动来访客户端报的东西。要不要收敛取决于你的接入方是什么：coban 报给上游的 originator 是写死的官方 codex CLI，所以一个 OpenAI SDK 客户端接进来，透传就会造出「originator 说 codex CLI、UA 说 OpenAI/Python」这种官方客户端产生不出来的组合，走 /v1/chat/completions 那条路（请求体会被翻成 Responses 形状）更是必然如此——这类接入方存在时该开到「只改写不像官方客户端的」，来访确实是 codex CLI 的照旧透传（它报的版本可能比 coban 写死的更新）。「一律改写」留给确定只有翻译类客户端接入的场景。改写的目标值按账号派生，一个号一台稳定的机器、跨重启不变——不是整池共用一条 UA，那本身就是一簇可关联的指纹；改写时还会把 x-stainless-* 这类 SDK 留痕头一起清掉。三档都不管「来访压根没报 UA」那一格：那时一律补上该账号派生的那份，一个不带 UA 的客户端拿着订阅 token 打上游最显眼。账号页里「来访客户端」那一列显示的始终是客户端自报的原值，不受这个设置影响。',
+            'Passes the caller\u2019s UA through untouched by default. Whether to converge depends on what connects to you: the originator coban reports upstream is hard-coded to the official codex CLI, so an OpenAI SDK client passed through makes upstream see "originator says codex CLI, UA says OpenAI/Python" — a combination the official client can never produce, and the /v1/chat/completions path (whose body is translated into Responses shape) is always like that. With such callers, switch to rewriting only what does not look official; a caller that really is the codex CLI still passes through, since its version may be newer than the one coban pins. "Always rewrite" is for setups where only translated clients connect. The replacement is derived per account, so each account is one stable machine across restarts — not one shared UA for the whole pool, which is a correlatable fingerprint in itself; rewriting also drops SDK trace headers such as x-stainless-*. None of the three settings covers a caller that sends no UA at all: that always gets the account\u2019s derived UA, because a client with no UA holding a subscription token is the most conspicuous thing there is. The "Client" column on the accounts page always shows what the caller reported, regardless of this setting.',
+          )}
+          value={data.upstream_ua_mode}
+          options={[
+            { value: 0, label: t('原样透传来访客户端的（默认）', 'Pass the caller\u2019s UA through (default)') },
+            { value: 1, label: t('只改写不像官方客户端的', 'Rewrite only non-official UAs') },
+            { value: 2, label: t('一律改写', 'Always rewrite') },
+          ]}
+          pending={uaMode.isPending}
+          onSelect={(mode) => uaMode.mutate(mode)}
         />
       </SettingsGroup>
     </div>

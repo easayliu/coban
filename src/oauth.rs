@@ -227,7 +227,10 @@ pub async fn exchange_code(client: &wreq::Client, code: &str, verifier: &str) ->
         ("client_id", config::CLIENT_ID),
         ("code_verifier", verifier),
     ];
-    post_token(client, &form, None).await.context("failed to exchange the authorization code")
+    // 这一步账号身份还没落库，派生不出逐号的 UA，用默认那份（这也是它剩下的唯一用处）。
+    post_token(client, &form, None, config::CODEX_USER_AGENT.as_str())
+        .await
+        .context("failed to exchange the authorization code")
 }
 
 /// 用 refresh_token 换一组新 token。
@@ -240,14 +243,24 @@ pub async fn exchange_code(client: &wreq::Client, code: &str, verifier: &str) ->
 /// scope 用 [`REFRESH_SCOPES`] 而不是登录时那串：codex 二进制里刷新用的字面量是
 /// `openid profile email`，不含 `offline_access`。实测两者（以及完全不带 scope）在
 /// 上游行为一致，但既然官方发哪串是可查的，就跟着它，不自己发明。
-pub async fn refresh_token(client: &wreq::Client, refresh: &str) -> Result<TokenSet> {
+///
+/// `user_agent` 要报**这个号派生的那份**（[`crate::credentials::Credential::user_agent`]），
+/// 不是出站客户端的默认头：刷新与转发在上游看来必须是同一台机器。报默认头的话，一个号的
+/// 转发全都来自机器 A、而它的 token 每小时被机器 B 刷一次——真实客户端不会这样。
+pub async fn refresh_token(
+    client: &wreq::Client,
+    refresh: &str,
+    user_agent: &str,
+) -> Result<TokenSet> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh),
         ("client_id", config::CLIENT_ID),
         ("scope", REFRESH_SCOPES),
     ];
-    post_token(client, &form, Some(refresh)).await.context("failed to refresh the access token")
+    post_token(client, &form, Some(refresh), user_agent)
+        .await
+        .context("failed to refresh the access token")
 }
 
 /// 向 token 端点发一次表单 POST 并解析响应。
@@ -255,10 +268,14 @@ async fn post_token(
     client: &wreq::Client,
     form: &[(&str, &str)],
     fallback_refresh: Option<&str>,
+    user_agent: &str,
 ) -> Result<TokenSet> {
     let resp = client
         .post(config::TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
+        // 显式钉住：客户端默认头那份是「没有凭证语境」时才该用的（见
+        // [`config::CODEX_USER_AGENT`]），刷新是有凭证的。
+        .header("User-Agent", user_agent)
         .body(urlencode_form(form))
         .send()
         .await

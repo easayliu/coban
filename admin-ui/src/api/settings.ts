@@ -29,6 +29,13 @@ export interface Settings {
   session_lease_secs: number
   /** 转发前是否把 `tools[]` 按名字排序。默认关，只有客户端确实在乱序发工具时才该开。 */
   normalize_tool_order: boolean
+  /**
+   * 发往上游的 `User-Agent` 怎么处理：
+   * `0`（默认）原样透传来访客户端那份、`1` 只改写「不像官方客户端」的、`2` 一律改写。
+   *
+   * 改写的目标值是**按账号派生**的，一个号一台稳定的机器，不是全池共用一条 UA。
+   */
+  upstream_ua_mode: number
   /** 管理密码是否已设置。未设置时管理接口是完全敞开的。 */
   admin_configured: boolean
   version: string
@@ -93,5 +100,11 @@ export async function setSessionLeaseSecs(secs: number): Promise<Settings> {
 /** 布尔项也走 0/1：设置那一族的写接口形状统一。 */
 export async function setNormalizeToolOrder(on: boolean): Promise<Settings> {
   const { data } = await api.post('/settings/normalize-tool-order', { value: on ? 1 : 0 })
+  return data
+}
+
+/** 0 透传 / 1 只改写不像官方客户端的 / 2 一律改写。 */
+export async function setUpstreamUaMode(mode: number): Promise<Settings> {
+  const { data } = await api.post('/settings/upstream-ua-mode', { value: mode })
   return data
 }

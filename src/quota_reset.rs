@@ -244,8 +244,11 @@ async fn fetch(
 ///
 /// `sec-fetch-*` / `oai-language` / `priority` 这几个**整组照抄 sub2api，不逐个裁剪**：
 /// 哪几个是上游真的在看，没法在本机证伪，而裁错一个的表现是 403——与「授权失效」长得
-/// 一模一样，会把人引去查 token。UA 仍是 CLI 那份：coban 只有那一种出站形态，为这三条
-/// 接口另建一个浏览器指纹的客户端（TLS 指纹也得跟着换）不值得。
+/// 一模一样，会把人引去查 token。UA 仍是 CLI 那族（而不是浏览器的）：coban 只有那一种出站
+/// 形态，为这三条接口另建一个浏览器指纹的客户端（TLS 指纹也得跟着换）不值得。
+///
+/// UA 取**这个号派生的那份**（[`Credential::user_agent`]），与转发、刷新报的是同一台机器
+/// ——这一族接口跟转发用的是同一个账号身份，报两台机器等于凭空多一处对不上的地方。
 fn wham_headers(cred: &Credential, token: &str, post: bool) -> wreq::header::HeaderMap {
     let mut out = wreq::header::HeaderMap::new();
     let mut set = |name: &'static str, v: &str| {
@@ -261,7 +264,7 @@ fn wham_headers(cred: &Credential, token: &str, post: bool) -> wreq::header::Hea
     set("oai-language", "zh-CN");
     set("accept", "application/json");
     set("accept-encoding", config::ACCEPT_ENCODING);
-    set("user-agent", config::CODEX_USER_AGENT.as_str());
+    set("user-agent", &cred.user_agent());
     set("sec-fetch-site", "none");
     set("sec-fetch-mode", "no-cors");
     set("sec-fetch-dest", "empty");

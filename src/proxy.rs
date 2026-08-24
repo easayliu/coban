@@ -468,8 +468,13 @@ async fn forward_once(
     // `responses` 后面只是往上游送一堆它不认识的参数。
     let query = uri.query().filter(|_| chat.is_none());
     let url = upstream_url(upstream_path, query);
+    // 每次转发现读一次：改了这个开关该立刻生效，而它与 sort_tools 一样是一次本地 SQLite
+    // 读，与这条请求本来要做的事相比不值一提。
+    let ua_mode = UaMode::from_setting(
+        state.store.get_setting_i64(store::UPSTREAM_UA_MODE, store::DEFAULT_UPSTREAM_UA_MODE),
+    );
     let mut fwd_headers =
-        build_forward_headers(headers, cred, &token, session_key.unwrap_or_default());
+        build_forward_headers(headers, cred, &token, session_key.unwrap_or_default(), ua_mode);
     if collapse || chat.is_some() {
         // 体里的 `stream` 已被我们钉成 true，`accept` 得跟着说 SSE：官方客户端不存在
         // 「体里要流、头里要 JSON」这种自相矛盾的形态，别让上游去猜。
@@ -1654,20 +1659,79 @@ fn upstream_url(path: &str, query: Option<&str>) -> String {
     }
 }
 
+/// 发往上游的 `User-Agent` 怎么处理。三档与库里 [`store::UPSTREAM_UA_MODE`] 一一对应。
+///
+/// **入站不按 UA 拦人**：门是接入 key 在把（见 [`client_authorized`]），而 UA 是客户端
+/// 一行配置就能改的东西，拦不住任何有意绕的人。这个开关管的是**出站形态**——上游看到的
+/// 是不是一个自相一致的客户端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UaMode {
+    /// 来访客户端报什么就发什么（默认，见 [`store::DEFAULT_UPSTREAM_UA_MODE`]）。
+    Passthrough,
+    /// 不像官方 codex CLI 的一律改写成这个号派生的那份。
+    Auto,
+    /// 一律改写，不看来访报的是什么。
+    Pin,
+}
+
+impl UaMode {
+    fn from_setting(v: i64) -> Self {
+        match v {
+            1 => Self::Auto,
+            2 => Self::Pin,
+            // 库里存了个越界的值（手工改库也能塞进来）时退回默认档，与 `get_setting_i64`
+            // 对读不出来的值的处置一致：一个错值不该让转发形态变成没人选过的那一种。
+            _ => Self::Passthrough,
+        }
+    }
+
+    /// 来访 UA 是 `ua` 时，这条请求的 UA 要不要改写。
+    fn rewrites(self, ua: Option<&str>) -> bool {
+        match (self, ua) {
+            // 来访压根没报 UA：三档都补。一个不带 UA 的客户端拿着订阅 token 打上游，
+            // 比报错的 UA 更显眼（见 [`config::CODEX_USER_AGENT`]）。
+            (_, None) => true,
+            (Self::Passthrough, _) => false,
+            (Self::Auto, Some(ua)) => !ua.starts_with(config::UA_PREFIX),
+            (Self::Pin, _) => true,
+        }
+    }
+}
+
+/// 这个头名是不是「来访客户端留痕」那一族，见 [`config::UA_REWRITE_STRIPPED_HEADERS`]。
+///
+/// `HeaderMap` 里的名字已经是小写的，不必再归一化。
+fn is_client_fingerprint_header(name: &str) -> bool {
+    config::UA_REWRITE_STRIPPED_HEADERS.contains(&name)
+        || config::UA_REWRITE_STRIPPED_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 /// 构造发往上游的头：来访头去掉逐跳/鉴权项后照抄，再补上这个凭证的身份。
 ///
 /// `fingerprint` 是这条请求的会话键（见 [`prefix_parts`]）。它决定派生出来的
 /// `session_id`，而那正是上游 prompt cache 的键——**不能在这里就地从头里取**：绝大多数
 /// 客户端不发会话头，那样算出来的指纹恒为空，于是一个号上所有会话共用同一个 cache key。
+///
+/// UA 的处置见 [`UaMode`]。**入库那份 UA 不受它影响**：[`ua_of`] 记的是来访客户端自报的
+/// 原值，页面上「谁在发」看的就是它——改写完再记等于每一行都显示 coban 自己。
 fn build_forward_headers(
     incoming: &HeaderMap,
     cred: &Credential,
     token: &str,
     fingerprint: &str,
+    ua_mode: UaMode,
 ) -> wreq::header::HeaderMap {
+    // 改写 UA 的话，与旧 UA 同源的那族留痕头就**一条都不抄进来**：UA 说 codex CLI、
+    // `x-stainless-lang` 说 python SDK，这种自相矛盾比两者都老实报 python 更显眼。
+    let rewrite_ua =
+        ua_mode.rewrites(incoming.get(header::USER_AGENT).and_then(|v| v.to_str().ok()));
+
     let mut out = wreq::header::HeaderMap::new();
     for (name, value) in incoming.iter() {
         if config::HOP_BY_HOP_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        if rewrite_ua && is_client_fingerprint_header(name.as_str()) {
             continue;
         }
         out.insert(name.clone(), value.clone());
@@ -1686,8 +1750,8 @@ fn build_forward_headers(
     set(&mut out, "session_id", &cred.session_id(fingerprint));
     // 解压 feature 开着，声明什么就可能收到什么压缩形态；这一项要与官方客户端一致。
     set(&mut out, "accept-encoding", config::ACCEPT_ENCODING);
-    if !out.contains_key(header::USER_AGENT.as_str()) {
-        set(&mut out, "user-agent", config::CODEX_USER_AGENT.as_str());
+    if rewrite_ua {
+        set(&mut out, "user-agent", &cred.user_agent());
     }
     out
 }
@@ -3089,13 +3153,17 @@ fn probe_resume(state: &AppState, cred: &Credential, model: &str) {
 /// 鉴权、账号身份、`session_id`、UA 全走转发路径那份 [`build_forward_headers`]——两处各写
 /// 一份的话，改了转发形态而漏改这里，测出来的就不是真实转发会走的那条路。`accept` 由调用方
 /// 给：转发时它由来访客户端提供，合成请求得自己报，且两条路要的类型不同。
+///
+/// UA 档位固定报 [`UaMode::Pin`]：这里压根没有来访客户端，三档在「没有 UA」上本来就同解，
+/// 写死那一档只是把「这份 UA 必然是派生的」说清楚——合成请求要与真实转发看着是同一台机器，
+/// 不该受开关影响。
 fn synthetic_headers(
     cred: &Credential,
     token: &str,
     accept: &'static str,
 ) -> wreq::header::HeaderMap {
     // 合成请求没有来访会话，指纹留空——它们也不该去蹭真实会话的 prompt cache。
-    let mut headers = build_forward_headers(&HeaderMap::new(), cred, token, "");
+    let mut headers = build_forward_headers(&HeaderMap::new(), cred, token, "", UaMode::Pin);
     headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
     headers
 }
@@ -4375,12 +4443,14 @@ mod tests {
         };
         let incoming = hm(&[
             ("authorization", "Bearer client-key"),
+            ("x-api-key", "client-key"),
+            ("api-key", "client-key"),
             ("content-length", "123"),
             ("x-forwarded-for", "1.2.3.4"),
             ("chatgpt-account-id", "spoofed"),
             ("content-type", "application/json"),
         ]);
-        let out = build_forward_headers(&incoming, &cred, "fresh-token", "fp");
+        let out = build_forward_headers(&incoming, &cred, "fresh-token", "fp", UaMode::Auto);
         assert_eq!(out.get("authorization").unwrap(), "Bearer fresh-token");
         assert_eq!(out.get("chatgpt-account-id").unwrap(), "acct-9");
         assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR);
@@ -4388,6 +4458,112 @@ mod tests {
         assert!(out.get("content-length").is_none(), "stale length truncates the body upstream");
         assert!(out.get("x-forwarded-for").is_none(), "would advertise the proxy hop");
         assert!(out.get("session_id").is_some());
+        // 这两个头里装的是 coban 自己的接入 key（见 client_authorized），发到上游是白送。
+        for leaked in ["x-api-key", "api-key"] {
+            assert!(out.get(leaked).is_none(), "{leaked} carries coban's own access key");
+        }
+    }
+
+    fn ua_cred(account_id: &str) -> Credential {
+        Credential {
+            id: 1,
+            label: "l".into(),
+            email: None,
+            plan_type: None,
+            account_id: account_id.into(),
+            id_token: None,
+            access_token: "at".into(),
+            refresh_token: "r".into(),
+            expires_at: u64::MAX,
+            priority: 0,
+            disabled: false,
+            rpm_limit: 0,
+            ban_reason: None,
+            resume_at: None,
+            proxy: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// 三档 UA 的判定表。`Auto` 那一行是默认档，它与另两档的差别全在「来访报的像不像
+    /// 官方客户端」这一件事上。
+    #[test]
+    fn ua_modes_decide_whether_the_incoming_ua_survives() {
+        let official = format!("{}{} (Mac OS 15.6.1; arm64) unknown", config::UA_PREFIX, "0.150.0");
+        let sdk = "OpenAI/Python 1.108.1";
+        for (mode, ua, rewrites) in [
+            // 没报 UA：三档都补，一个不带 UA 的客户端最显眼。
+            (UaMode::Passthrough, None, true),
+            (UaMode::Auto, None, true),
+            (UaMode::Pin, None, true),
+            (UaMode::Passthrough, Some(sdk), false),
+            (UaMode::Auto, Some(sdk), true),
+            (UaMode::Pin, Some(sdk), true),
+            // 来访确实是官方客户端：只有 Pin 还改——那时它报的版本可能比我们写死的更新。
+            (UaMode::Passthrough, Some(official.as_str()), false),
+            (UaMode::Auto, Some(official.as_str()), false),
+            (UaMode::Pin, Some(official.as_str()), true),
+            // 挂个官方前缀的壳不算官方客户端：斜杠是判据的一部分。
+            (UaMode::Auto, Some("codex_cli_rs_wrapper/1.0"), true),
+        ] {
+            assert_eq!(mode.rewrites(ua), rewrites, "{mode:?} + {ua:?}");
+        }
+        // 库里存了越界值时退回默认档（透传），不能落到没人选过的那一档上。
+        assert_eq!(UaMode::from_setting(7), UaMode::Passthrough);
+        assert_eq!(UaMode::from_setting(-1), UaMode::Passthrough);
+        assert_eq!(
+            UaMode::from_setting(store::DEFAULT_UPSTREAM_UA_MODE),
+            UaMode::Passthrough,
+            "默认档必须是透传"
+        );
+        assert_eq!(UaMode::from_setting(1), UaMode::Auto);
+        assert_eq!(UaMode::from_setting(2), UaMode::Pin);
+    }
+
+    /// 改写 UA 的那条路必须把 SDK 留痕头一起清掉，透传那条路必须一个都不动——留一半就是
+    /// 「UA 说 codex CLI、x-stainless 说 python」这种官方客户端产生不出来的组合。
+    #[test]
+    fn rewriting_the_ua_also_clears_the_sdk_fingerprint_headers() {
+        let cred = ua_cred("acct-9");
+        let incoming = hm(&[
+            ("user-agent", "OpenAI/Python 1.108.1"),
+            ("x-stainless-lang", "python"),
+            ("x-stainless-runtime-version", "3.12.5"),
+            ("openai-organization", "org-abc"),
+            ("content-type", "application/json"),
+        ]);
+
+        let rewritten = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Auto);
+        assert_eq!(rewritten.get("user-agent").unwrap(), cred.user_agent().as_str());
+        for stripped in ["x-stainless-lang", "x-stainless-runtime-version", "openai-organization"] {
+            assert!(rewritten.get(stripped).is_none(), "{stripped} outlived the UA it came with");
+        }
+        // 清的只是那一族，别的头照旧。
+        assert_eq!(rewritten.get("content-type").unwrap(), "application/json");
+
+        let passed = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Passthrough);
+        assert_eq!(passed.get("user-agent").unwrap(), "OpenAI/Python 1.108.1");
+        assert_eq!(passed.get("x-stainless-lang").unwrap(), "python");
+    }
+
+    /// 同一个号派生出来的 UA 处处一致：转发（改写档）与 coban 自己合成的探测请求必须报同
+    /// 一台机器，否则一个号在上游看来是两个客户端在轮流用。
+    #[test]
+    fn the_derived_ua_is_the_same_on_forwarded_and_synthetic_requests() {
+        let cred = ua_cred("acct-9");
+        let forwarded = build_forward_headers(
+            &hm(&[("user-agent", "curl/8.7.1")]),
+            &cred,
+            "t",
+            "fp",
+            UaMode::Auto,
+        );
+        let synthetic = probe_headers(&cred, "t");
+        assert_eq!(forwarded.get("user-agent").unwrap(), synthetic.get("user-agent").unwrap());
+        assert_eq!(synthetic.get("user-agent").unwrap(), cred.user_agent().as_str());
+        // 而两个号不该报同一台机器（这两个 account_id 落在不同画像上）。
+        assert_ne!(cred.user_agent(), ua_cred("acct-1").user_agent());
     }
 
     /// 只有「主体 + 状态」两类词同时命中才算**一眼可辨**的账号级问题：那一类当场停用、

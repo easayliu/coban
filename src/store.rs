@@ -397,6 +397,29 @@ pub const NORMALIZE_TOOL_ORDER: &str = "normalize_tool_order";
 /// 工具一分不赚。
 pub const DEFAULT_NORMALIZE_TOOL_ORDER: i64 = 0;
 
+/// 发往上游的 `User-Agent` 怎么处理：`0` 原样透传来访客户端那份，`1` 只改写「不像官方
+/// 客户端」的那些，`2` 一律改写。见 [`crate::proxy`] 的 `UaMode`。
+pub const UPSTREAM_UA_MODE: &str = "upstream_ua_mode";
+/// 同上的默认值。
+///
+/// **默认 0（原样透传）**：这个开关改的是**发出去的请求本身**，而不是 coban 内部怎么算。
+/// 默认不动来访客户端报的东西，与 [`DEFAULT_NORMALIZE_TOOL_ORDER`] 同一个态度——要不要
+/// 收敛，取决于接入方是什么，那件事只有用户知道。
+///
+/// 什么时候该开到 `1`：接入方里有 OpenAI SDK、各种翻译类客户端那一类。转发那头写死了
+/// `originator`（见 [`crate::config::ORIGINATOR`]），透传 UA 会与它对不上——上游看到的是
+/// 「`originator` 说 codex CLI、UA 说 OpenAI/Python」这种官方客户端产生不出来的组合，走
+/// `/v1/chat/completions` 那条路（体被翻成 Responses 形状）更是必然如此。
+///
+/// `2` 留给「确定只有翻译类客户端接入」的场景：来访 UA 确实是 `codex_cli_rs/*` 时透传是
+/// 对的——那客户端报的版本号可能比 [`crate::config::CODEX_VERSION`] 这个写死的常量更新，
+/// 一律改写等于把一个真实的新版客户端降级成旧版指纹。
+///
+/// **注意这一档管不到「来访压根没报 UA」那一格**：那时三档都会补上这个号派生的那份。
+/// 补一份不是收敛，而是补上原本就该有的东西——一个不带 UA 的客户端拿着订阅 token 打上游
+/// 最显眼，改这个开关之前的代码也一样会补（补的是一条全池共用的常量）。
+pub const DEFAULT_UPSTREAM_UA_MODE: i64 = 0;
+
 /// 会话落点的租约时长（秒，`0` = 关掉租约、退回纯 HRW 现算）。见 [`SessionLeases`]。
 pub const SESSION_LEASE_SECS: &str = "session_lease_secs";
 /// 同上的默认值。
@@ -1561,7 +1584,7 @@ impl CredentialStore {
             return Ok(fresh.access_token);
         }
         let client = clients.for_credential(&fresh)?;
-        let set = refresh_with_retry(&client, &fresh.refresh_token).await?;
+        let set = refresh_with_retry(&client, &fresh.refresh_token, &fresh.user_agent()).await?;
         self.update_tokens(
             fresh.id,
             &set.access_token,
@@ -1598,7 +1621,7 @@ impl CredentialStore {
         }
 
         let client = clients.for_credential(&fresh)?;
-        match refresh_with_retry(&client, &fresh.refresh_token).await {
+        match refresh_with_retry(&client, &fresh.refresh_token, &fresh.user_agent()).await {
             Ok(set) => {
                 self.update_tokens(
                     fresh.id,
@@ -1648,13 +1671,14 @@ impl CredentialStore {
 async fn refresh_with_retry(
     client: &wreq::Client,
     refresh_token: &str,
+    user_agent: &str,
 ) -> Result<crate::oauth::TokenSet> {
     const MAX_ATTEMPTS: u32 = 3;
     const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
     let mut attempt = 1;
     loop {
-        match crate::oauth::refresh_token(client, refresh_token).await {
+        match crate::oauth::refresh_token(client, refresh_token, user_agent).await {
             Ok(set) => return Ok(set),
             Err(e) if attempt < MAX_ATTEMPTS && is_connect_error(&e) => {
                 // 指数退避，同 sub2api 的 `RetryBackoffSeconds * 2^(attempt-1)`。
