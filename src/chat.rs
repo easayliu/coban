@@ -460,7 +460,7 @@ fn translate_response_format(rf: Option<&Value>) -> Result<Option<Value>, String
 ///
 /// 短、且说的正是客户端已经用 `response_format` 表达过的那件事——补一句长的等于替客户端改
 /// 提示词。
-const JSON_HINT: &str = "Respond in JSON.";
+pub(crate) const JSON_HINT: &str = "Respond in JSON.";
 
 /// `text.format` 是 `json_object` 时，保证 `input` 里的消息提到过 "json"。
 ///
@@ -480,9 +480,16 @@ const JSON_HINT: &str = "Respond in JSON.";
 ///
 /// 客户端的提示词里压根没提过 JSON 时也补：那种请求直接发上游一样会被这道口子拦（跟我们这
 /// 一跳无关），而它要的东西已经写在 `response_format` 里了，补一句正是它的本意。
-fn mention_json(input: &mut Vec<Value>) {
+///
+/// 敲 `responses` 的客户端绕过整个 [`crate::chat`]，但撞的是同一道口子、而且同样是被我们这
+/// 一跳造出来的（那条路上把系统消息并进 `instructions` 的是
+/// [`crate::proxy::merge_system_messages`]），所以这个函数两条路共用，见
+/// [`crate::proxy::mention_json_for_object_mode`]。
+///
+/// 回「是否真的补了」：调用方要靠它决定重不重新序列化请求体。
+pub(crate) fn mention_json(input: &mut Vec<Value>) -> bool {
     if input.iter().any(message_mentions_json) {
-        return;
+        return false;
     }
     let hint = json!({ "type": "input_text", "text": JSON_HINT });
     if let Some(content) = input
@@ -493,9 +500,10 @@ fn mention_json(input: &mut Vec<Value>) {
         .and_then(|c| c.as_array_mut())
     {
         content.push(hint);
-        return;
+        return true;
     }
     input.push(json!({ "role": "user", "content": [hint] }));
+    true
 }
 
 /// 这条消息的正文里提到过 "json" 没有。

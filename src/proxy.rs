@@ -1113,6 +1113,8 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
     // 动 `instructions` 与 `input` 的头，而这两段正是前缀的前两截（见 [`prefix_parts`]）。
     let rewrote_input = normalize_input_shape(&mut obj);
     let merged_system = merge_system_messages(&mut obj);
+    // **必须排在搬系统消息之后**：那一步正是把「请输出 JSON」从 `input` 挪走的人。
+    let said_json = mention_json_for_object_mode(&mut obj);
     let reordered = sort_tools && normalize_tool_order(&mut obj);
     let prefix = prefix_parts(&obj);
     let input_len = obj.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
@@ -1127,6 +1129,7 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
         && !reordered
         && !rewrote_input
         && !merged_system
+        && !said_json
     {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
         return Normalized { body, collapse, chat: None, prefix, input_len };
@@ -1164,6 +1167,36 @@ fn normalize_input_shape(obj: &mut serde_json::Map<String, serde_json::Value>) -
         }]),
     );
     true
+}
+
+/// `text.format` 是 `json_object` 时，保证 `input` 里的消息提到过 "json"。回「是否真的补过」。
+///
+/// 上游的原话：`Response input messages must contain the word 'json' in some form to use
+/// 'text.format' of type 'json_object'.` 那道口子**只看 `input` 里的消息，不看
+/// `instructions`**——而 [`merge_system_messages`] 刚刚干的正是把系统消息搬进 `instructions`：
+/// 客户端那句「请输出 JSON」十有八九就写在系统提示里，搬过去之后 `input` 里再没有这个词，
+/// **这条 400 于是成了我们这一跳造出来的**。实测就是这么发生的：`instructions` 两万多字符、
+/// `input` 只剩一项，客户端（Go SDK）那头只看到一句「请求失败」。
+///
+/// 与 [`crate::chat`] 那条路撞的是同一道口子、补法也是同一个（[`crate::chat::mention_json`]），
+/// 只是那边的搬运工是 `translate_messages`、这边是 [`merge_system_messages`]。共用一份实现，
+/// 不然两条路上「补的那句话」迟早各自漂成一句——而它进前缀，两句不一样就是同一段对话走两条
+/// 路算出两个指纹、白丢一次缓存。
+///
+/// **调用点必须排在 [`merge_system_messages`] 之后、[`prefix_parts`] 之前**：前者决定了
+/// 这一句该不该补，后者要照**补完之后**的体算指纹——`input` 只有一项时这一句就落在 `input[0]`
+/// 上，也就是前缀的第四段（见 [`prefix_parts`]）。顺序反了，指纹认的是一份我们并不会发出去
+/// 的体。
+///
+/// 客户端没开 `json_object` 档就一个字都不动：这道口子只对那一档存在，别的档补一句是往人家
+/// 的提示词里塞私货。
+fn mention_json_for_object_mode(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    if obj.get("text").and_then(|t| t.pointer("/format/type")).and_then(|t| t.as_str())
+        != Some("json_object")
+    {
+        return false;
+    }
+    obj.get_mut("input").and_then(|v| v.as_array_mut()).is_some_and(chat::mention_json)
 }
 
 /// 把 `input` 里 `role: "system"` 的消息搬进顶层的 `instructions`；搬不动的那几条就地把角色
@@ -5191,6 +5224,72 @@ mod tests {
 
         // 非 JSON 体不崩，报个长度就够了。
         assert_eq!(body_shape(b"not json at all"), "<not a JSON object, 15 bytes>");
+    }
+
+    /// json_object 那档：`input` 里必须出现 "json" 这个词，否则上游一句 400。那道口子不看
+    /// `instructions`，而系统消息正是被上一步搬进 `instructions` 的——不补这一句，等于我们
+    /// 这一跳把一份本来能过的请求弄成了 400（实测的那条：instructions 两万多字符、input 只
+    /// 剩一项）。与 chat 那条路共用同一份补法，两条路补出来的必须一字不差。
+    #[test]
+    fn json_object_mode_makes_sure_the_input_says_json() {
+        let v = |raw: &str| -> serde_json::Value {
+            serde_json::from_slice(&norm("responses", raw).body).unwrap()
+        };
+
+        // 实测那条的形状：「请输出 JSON」写在系统消息里，搬走之后 input 里就没这个词了。
+        let out = v(r#"{"model":"m","text":{"format":{"type":"json_object"}},"input":[
+            {"role":"system","content":"Return a JSON object with the field `answer`."},
+            {"role":"user","content":[{"type":"input_text","text":"how tall is Everest"}]}]}"#);
+        assert_eq!(out["instructions"], "Return a JSON object with the field `answer`.");
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "不该凭空多一个对话轮次");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "how tall is Everest", "客户端那段话原样留着");
+        assert_eq!(content[1]["text"], crate::chat::JSON_HINT, "补的一句挂在最后一条用户消息后面");
+
+        // 客户端自己在 input 里提过就一个字都不动，大小写不论（上游那句话说的是 "in some form"）。
+        let out = v(r#"{"model":"m","text":{"format":{"type":"json_object"}},
+            "input":[{"role":"user","content":"reply as Json"}]}"#);
+        assert_eq!(out["input"].as_array().unwrap().len(), 1);
+        assert_eq!(out["input"][0]["content"], "reply as Json");
+
+        // 一条用户消息都没有（只有工具结果那种请求）时才新起一条。
+        let out = v(r#"{"model":"m","text":{"format":{"type":"json_object"}},"input":[
+            {"type":"function_call_output","call_id":"c1","output":"ok"}]}"#);
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], crate::chat::JSON_HINT);
+
+        // 别的档一个字都不动：这道口子只对 json_object 存在，别的档补一句是往人家的提示词
+        // 里塞私货。json_schema 那档尤其——它的形状由 schema 说了算。
+        let untouched = r#"{"model":"m","store":false,"stream":true,"text":{"format":{"type":"json_schema",
+                "name":"r","schema":{"type":"object"}}},"input":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(norm("responses", untouched).body, Bytes::from(untouched.to_owned()));
+        let plain =
+            r#"{"model":"m","store":false,"stream":true,"input":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(
+            norm("responses", plain).body,
+            Bytes::from(plain.to_owned()),
+            "codex CLI 那条路"
+        );
+
+        // 指纹照**补完之后**的体算：这一句落在 input[0] 上，也就是前缀的第四段。顺序反了的话
+        // 指纹认的是一份我们并不会发出去的体。
+        let n = norm(
+            "responses",
+            r#"{"model":"m","text":{"format":{"type":"json_object"}},
+            "input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
+        let mut obj = sent.as_object().unwrap().clone();
+        obj.remove("store");
+        obj.remove("stream");
+        assert_eq!(
+            n.prefix.unwrap().head,
+            prefix_parts(&obj).unwrap().head,
+            "指纹要认发出去的那份体"
+        );
     }
 
     /// `input` 里的 `role: "system"` 消息要搬进 `instructions`：上游不收这个角色，回的是
