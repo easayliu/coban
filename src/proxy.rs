@@ -751,25 +751,33 @@ async fn forward_once(
         // [`INPUT_REPAIRS_MAX`]：上游一次只报第一个坏项，一类项由一次扫描一起扫掉，剩下的
         // 往返得有个尽头。
         if input_repairs < INPUT_REPAIRS_MAX
-            && let Some(rule) = detect_input_item_complaint(status, &bytes)
-                .and_then(|c| input_item_rule(&fwd_body, &c))
+            && let Some(complaint) = detect_input_item_complaint(status, &bytes)
         {
-            note_input_rule(&state.input_rules, session_key, &rule);
-            let mut rules = known_input_rules(&state.input_rules, session_key);
-            // 没有会话键时上一行记不下也取不回，这条规则得自己带着。
-            if !rules.contains(&rule) {
-                rules.push(rule.clone());
-            }
-            if let Some(fixed) = repair_input_items(&fwd_body, &rules) {
-                tracing::info!(
-                    cred_id = cred.id,
-                    rule = ?rule,
-                    "upstream rejected an input item carried by this request; \
-                     retrying on the same credential without it"
-                );
-                fwd_body = fixed;
-                input_repairs += 1;
-                continue;
+            // 学不出规则、或者规则一项都没撞上：这条 400 我们修不动，要交回给客户端了。
+            // 把那一项的形状打出来再走（见 [`note_unrepairable_item`]）——不然客户端只看到
+            // 一句「请求失败」，而这一跳连「上游嫌的那一项长什么样」都没留下。
+            let repaired = input_item_rule(&fwd_body, &complaint).and_then(|rule| {
+                note_input_rule(&state.input_rules, session_key, &rule);
+                let mut rules = known_input_rules(&state.input_rules, session_key);
+                // 没有会话键时上一行记不下也取不回，这条规则得自己带着。
+                if !rules.contains(&rule) {
+                    rules.push(rule.clone());
+                }
+                repair_input_items(&fwd_body, &rules).map(|fixed| (rule, fixed))
+            });
+            match repaired {
+                Some((rule, fixed)) => {
+                    tracing::info!(
+                        cred_id = cred.id,
+                        rule = ?rule,
+                        "upstream rejected an input item carried by this request; \
+                         retrying on the same credential without it"
+                    );
+                    fwd_body = fixed;
+                    input_repairs += 1;
+                    continue;
+                }
+                None => note_unrepairable_item(&fwd_body, &complaint, cred.id),
             }
         }
         // 上游不认这张 schema 里的某个关键字（`uniqueItems` 这类，见
@@ -1706,6 +1714,7 @@ struct InputItemComplaint {
 }
 
 /// 上游是怎么指认那一项的。两种都有，取决于它踩的是哪条口子。
+#[derive(Debug)]
 enum ItemAt {
     /// 按 `input` 里的项号（`input[137]`）。
     Index(usize),
@@ -1717,6 +1726,7 @@ enum ItemAt {
 }
 
 /// 上游想要的那件事。
+#[derive(Debug)]
 enum Want {
     /// `id` 该以这个前缀开头。
     IdPrefix(String),
@@ -1860,17 +1870,7 @@ fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<Input
         return Some(InputItemRule::SystemRole);
     }
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let input = v.get("input")?.as_array()?;
-    let item = match &complaint.at {
-        ItemAt::Index(i) => input.get(*i)?,
-        // 按 id 指认时那一项**不一定在 `input` 里**（`previous_response_id` 之类也会被上游
-        // 拿去查）：找不到就不学，那条 400 原样交回去。
-        ItemAt::Id(id) => {
-            input.iter().find(|it| it.get("id").and_then(|x| x.as_str()) == Some(id.as_str()))?
-        }
-        // 上面那一支已经把「没指认哪一项」接走了，别的 want 没有项号就无从下手。
-        ItemAt::Anywhere => return None,
-    };
+    let item = complained_item(&v, &complaint.at)?;
     let item_type = item_type_of(item)?;
     match &complaint.want {
         Want::IdPrefix(prefix) => {
@@ -1893,6 +1893,89 @@ fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<Input
             ItemAt::Index(_) | ItemAt::Anywhere => None,
         },
     }
+}
+
+/// 上游点名的是 `input` 里的哪一项。
+///
+/// 按 id 指认时那一项**不一定在 `input` 里**（`previous_response_id` 之类也会被上游拿去查），
+/// 找不到就回 `None`。`Anywhere` 压根没指认哪一项，同样回 `None`。
+fn complained_item<'a>(body: &'a serde_json::Value, at: &ItemAt) -> Option<&'a serde_json::Value> {
+    let input = body.get("input")?.as_array()?;
+    match at {
+        ItemAt::Index(i) => input.get(*i),
+        ItemAt::Id(id) => {
+            input.iter().find(|it| it.get("id").and_then(|x| x.as_str()) == Some(id.as_str()))
+        }
+        ItemAt::Anywhere => None,
+    }
+}
+
+/// 修不动的那一项长什么样：**类型 + 字段名，一个字的内容都不带**。
+///
+/// 上游只说「`input[521]` 缺 `name`」，说不出那一项现在长什么样——而这两件事决定了修法。
+/// 缺的字段要是编不出来（`name`、`arguments` 这些是内容，不像 `call_id` 那样只是个关联
+/// token），能不能修就全看**客户端把它写在哪儿了**：写在一个嵌套的对象里（Chat 那种
+/// `function: {name, arguments}` 的形状漏过来）是搬一下就好，压根没发才是真的没救。
+///
+/// 所以这里把字段名列出来，值一个都不带（`input` 里是用户的整段对话）。空值与 `null` 标成
+/// `=null`：「字段在那儿但是空的」与「压根没这个字段」是两种毛病，混在一起就白列了。
+///
+/// 嵌套一层的对象把它的字段名也列出来（`function{name,arguments}`）：上面那句「写在哪儿了」
+/// 正是要看这一层，只列一个 `function` 等于没说。再深就不列了——排错要的是这一项的形状，
+/// 不是把整段历史的结构画出来。
+fn rejected_item_shape(item: &serde_json::Value) -> String {
+    let Some(obj) = item.as_object() else {
+        return format!("<not an object: {}>", kind_of(item));
+    };
+    obj.iter()
+        .map(|(k, v)| match v {
+            serde_json::Value::Null => format!("{k}=null"),
+            serde_json::Value::Object(inner) => {
+                let keys: Vec<&str> = inner.keys().map(String::as_str).collect();
+                format!("{k}{{{}}}", keys.join(","))
+            }
+            _ => k.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 一个 JSON 值是哪一类。只给 [`rejected_item_shape`] 报「这一项压根不是个对象」用。
+fn kind_of(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// 上游点名嫌了 `input` 里的某一项，而我们**修不动**：把那一项的形状打出来，好让下一次这
+/// 类 400 是一次诊断而不是一次猜。
+///
+/// 只在给不出修法的那一刻打（`WARN`，与上面那句「是请求本身错了」同级、紧挨着）：修得动的
+/// 那几类已经在重发了，不必占日志；而修不动的那几条，客户端拿到的只是一句「请求失败」，
+/// 这一行是**唯一**能说清「上游嫌的是哪一项、那一项现在长什么样」的地方。
+fn note_unrepairable_item(body: &Bytes, complaint: &InputItemComplaint, cred_id: i64) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return };
+    let (item_type, shape) = match complained_item(&v, &complaint.at) {
+        Some(item) => {
+            (item_type_of(item).unwrap_or_else(|| "?".to_owned()), rejected_item_shape(item))
+        }
+        // 指认的那一项不在 `input` 里（按 id 查的那种），或上游没指认。形状无从谈起，
+        // 但「上游嫌了、而我们找不到它说的那一项」本身就是要报的事。
+        None => ("<not in input>".to_owned(), String::new()),
+    };
+    tracing::warn!(
+        cred_id,
+        at = ?complaint.at,
+        want = ?complaint.want,
+        item_type = %item_type,
+        shape = %shape,
+        "upstream rejected an input item and this hop has no lossless way to repair it;          handing the 400 back to the client"
+    );
 }
 
 /// 按规则把 `input` 里不合要求的那些项修掉，返回改写后的体；一项都没动则返回 `None`——那说明
@@ -6521,6 +6604,53 @@ mod tests {
         )
         .expect("custom 工具那一族也该补");
         assert_eq!(v["input"][0]["call_id"], v["input"][1]["call_id"]);
+    }
+
+    /// 修不动那一项时留下的形状：**类型 + 字段名，一个字的内容都不带**。缺的字段编不出来
+    /// 时，能不能修全看客户端把它写在哪儿了——只有这一行说得出那一项现在长什么样。
+    #[test]
+    fn an_unrepairable_item_is_logged_by_its_shape_never_its_content() {
+        let item: serde_json::Value = serde_json::from_str(
+            r#"{"type":"function_call","call_id":"call_1","id":null,
+                "function":{"name":"shell","arguments":"{\"cmd\":\"rm -rf /secret\"}"},
+                "content":"用户的原话"}"#,
+        )
+        .unwrap();
+        let shape = rejected_item_shape(&item);
+
+        // 字段名在。
+        for key in ["type", "call_id", "content"] {
+            assert!(shape.contains(key), "{shape}");
+        }
+        // 「字段在那儿但是空的」与「压根没这个字段」是两种毛病，得分得开。
+        assert!(shape.contains("id=null"), "{shape}");
+        // 嵌套一层的对象连它的字段名一起列——「name 被写在哪儿了」正是要看这一层。
+        assert!(shape.contains("function{name,arguments}"), "{shape}");
+        // **一个字的内容都不许出现**：input 里是用户的整段对话。
+        for content in ["shell", "rm -rf /secret", "用户的原话", "call_1"] {
+            assert!(!shape.contains(content), "内容不该进日志: {shape}");
+        }
+
+        // 不是对象的项也不崩，报一句它是什么。
+        assert_eq!(rejected_item_shape(&serde_json::json!("bare")), "<not an object: string>");
+        assert_eq!(rejected_item_shape(&serde_json::json!({})), "");
+    }
+
+    /// 上游点名的是哪一项：按项号取，按 id 得在 `input` 里找得到，`Anywhere` 没指认任何一项。
+    #[test]
+    fn the_complained_item_is_found_by_index_or_by_id() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"input":[{"type":"message","role":"user","content":"hi"},
+                         {"type":"reasoning","id":"rs_1","summary":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(complained_item(&body, &ItemAt::Index(1)).unwrap()["id"], "rs_1");
+        assert_eq!(complained_item(&body, &ItemAt::Id("rs_1".to_owned())).unwrap()["id"], "rs_1");
+        // 越界、以及按 id 指认但那一项不在 input 里（previous_response_id 之类）。
+        assert!(complained_item(&body, &ItemAt::Index(9)).is_none());
+        assert!(complained_item(&body, &ItemAt::Id("rs_absent".to_owned())).is_none());
+        assert!(complained_item(&body, &ItemAt::Anywhere).is_none());
+        assert!(complained_item(&serde_json::json!({}), &ItemAt::Index(0)).is_none());
     }
 
     /// 「缺了必填字段」学不学规则，看的是**修不修得动**：丢得起的类型整项丢，工具调用/结果
