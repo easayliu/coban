@@ -64,6 +64,8 @@ pub struct AppState {
     pub models_cache: proxy::ModelListCache,
     /// 「这个会话捎来的加密推理在这个号上解不开」的记忆，见 [`crate::proxy::StaleReasoningMemo`]。
     pub stale_reasoning: proxy::StaleReasoningMemo,
+    /// 「这个会话捎来的某类项 `id` 前缀不对」的记忆，见 [`crate::proxy::MalformedIdMemo`]。
+    pub malformed_ids: proxy::MalformedIdMemo,
 }
 
 type ApiError = (StatusCode, String);
@@ -87,6 +89,7 @@ pub async fn run(
         in_flight: Arc::default(),
         models_cache: Arc::default(),
         stale_reasoning: Arc::default(),
+        malformed_ids: Arc::default(),
     };
 
     spawn_usage_pruner(state.store.clone());
@@ -1261,6 +1264,7 @@ mod tests {
             in_flight: Arc::default(),
             models_cache: Arc::default(),
             stale_reasoning: Arc::default(),
+            malformed_ids: Arc::default(),
         };
         let a = PkceChallenge::generate();
         let b = PkceChallenge::generate();
@@ -1290,6 +1294,7 @@ mod tests {
             in_flight: Arc::default(),
             models_cache: Arc::default(),
             stale_reasoning: Arc::default(),
+            malformed_ids: Arc::default(),
         };
         for _ in 0..PKCE_MAX_PENDING * 2 {
             remember_pkce(&state, PkceChallenge::generate());
