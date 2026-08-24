@@ -149,8 +149,11 @@ pub async fn handle(
     //
     // 客户端自报的会话 id 优先——那是真的会话身份；实测三个真实 codex 客户端一个都不发，
     // 所以绝大多数请求靠的是前缀指纹那条路。
-    let session_key =
-        incoming_session_id(&headers).or_else(|| prefix.as_ref().map(|p| p.key.clone()));
+    let incoming_session = incoming_session_id(&headers);
+    let session_key = incoming_session
+        .as_ref()
+        .map(|(_, v)| v.clone())
+        .or_else(|| prefix.as_ref().map(|p| p.key.clone()));
     // 租约状态与前缀漂移都在**选号之前**读一次并带着走：转发成功会把两张表都更新到这次的
     // 值上，之后再读永远是「没换号、没变过」，归因就永远看不见这两类（见 cache_reason）。
     let session = SessionCtx {
@@ -165,6 +168,8 @@ pub async fn handle(
         key: session_key,
         prefix,
         input_len,
+        source: incoming_session.as_ref().map_or("fingerprint", |(name, _)| *name),
+        headers: header_dump(&headers).into(),
     };
 
     let started = Instant::now();
@@ -980,6 +985,8 @@ fn stream_upstream(
         lease: session.lease,
         drift: session.drift,
         input_len: session.input_len,
+        source: session.source,
+        headers: session.headers.clone(),
         path: path.to_owned(),
         ua: ua.incoming.clone(),
         upstream_ua: ua.upstream.clone(),
@@ -2139,6 +2146,16 @@ struct SessionCtx {
     prefix: Option<PrefixParts>,
     /// `input[]` 有几项。
     input_len: usize,
+    /// 会话键是哪来的：带来它的那个头名，没带就是 `"fingerprint"`。只进日志——键本身看不出
+    /// 来源（客户端发个 32 位 hex 当会话 id，跟这边算的指纹长得一模一样）。
+    source: &'static str,
+    /// 来访请求的全部头，凭据类的值已盖住（见 [`header_dump`]）。
+    ///
+    /// **每条请求都建这一份，哪怕最后不打**：头只在转发那一刻抓得住，而这条请求是不是
+    /// `upstream_cold` 要等流走完、嗅探到 `cached_tokens` 才知道（见 [`cache_reason`]）。
+    /// 几百字节的一次分配，比它要诊断的那次上游往返便宜几个数量级。`Arc` 是为了流式那条路
+    /// ——落库的 guard 要拿着它活到流的末尾（见 [`UsageLogGuard`]）。
+    headers: Arc<str>,
 }
 
 impl SessionCtx {
@@ -2214,6 +2231,38 @@ fn cache_reason(
             store::PrefixDrift::NoBaseline => "new_conversation",
         },
     }
+}
+
+/// 归因判成 `upstream_cold` 时，把这条请求的来访头打出来（`info`，线上默认就能看见）。
+///
+/// **只挑这一类打**：其余每一类在请求明细里已经指得到根因——换号、换模型、提示变了、租约
+/// 过期——看见名字就知道下一步做什么。只有这一类是「该命中的偏偏没命中」，而它的下一步
+/// **在库里答不了**：那条请求当时到底带了些什么头。
+///
+/// 两种成因就靠这行分开：
+/// - `source=fingerprint`（客户端一个会话头都没带）→ 两段开头一样的对话会算出同一个键、
+///   在上游共用一个 session 互相踢。同一个 `key` 上 `input_len` 一大一小地交替就是它坐实了
+///   ——一段对话的 `input[]` 只会越来越长，中途变短只能是另一段对话挤在同一个键上。
+///   `headers` 里要是躺着个 [`incoming_session_id`] 没认的会话 id 头名，那就是一行的修法。
+/// - `source` 是个头名（客户端带了会话 id）→ 键是它给的，撞不上，那就是上游自己的缓存过期
+///   了，没什么可修。
+fn note_cold_upstream(
+    reason: &str,
+    source: &str,
+    key: Option<&str>,
+    input_len: usize,
+    headers: &str,
+) {
+    if reason != "upstream_cold" {
+        return;
+    }
+    tracing::info!(
+        source,
+        key = key.unwrap_or("-"),
+        input_len,
+        headers,
+        "cold upstream: the placement and the prefix both held, yet upstream had no cache"
+    );
 }
 
 /// 会话键，**外加四段各自的短哈希**。
@@ -2434,14 +2483,45 @@ fn build_forward_headers(
     out
 }
 
-/// 取来访请求自报的会话 id。codex CLI 用 `session_id` 头，也有客户端写成 `x-session-id`。
-fn incoming_session_id(headers: &HeaderMap) -> Option<String> {
+/// 取来访请求自报的会话 id，**连同是哪个头带来的**。codex CLI 用 `session_id` 头，也有客户端
+/// 写成 `x-session-id`。
+///
+/// 头名要一并回，是因为排错时「客户端到底带没带会话头」只能靠它回答——键本身看不出来源：
+/// 客户端要是发了个 32 位 hex 当会话 id，跟这边算出来的前缀指纹长得一模一样。
+fn incoming_session_id(headers: &HeaderMap) -> Option<(&'static str, String)> {
     ["session_id", "x-session-id", "conversation_id"]
         .iter()
-        .find_map(|n| headers.get(*n))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
+        .find_map(|n| headers.get(*n).map(|v| (*n, v)))
+        .and_then(|(n, v)| v.to_str().ok().map(|s| (n, s.trim().to_owned())))
+        .filter(|(_, s)| !s.is_empty())
+}
+
+/// 日志里要盖住值的那几个头：值本身就是凭据。**只有这几个**，其余一律照实打。
+///
+/// 盖住不等于不打——名字和长度照报，「带没带、是不是个空值」靠这两样就够判，而真正的值进了
+/// 日志就等于把接入 key 写进一份随时会被贴进 issue 的文件里。
+const REDACTED_HEADERS: [&str; 5] =
+    ["authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"];
+
+/// 来访请求的**全部**头，逐条 `name=value`。
+///
+/// 全打是刻意的：会话 id 可能藏在任何一个 [`incoming_session_id`] 没认的头名底下，而那时要
+/// 判断「这是不是个会话 id」，光有名字不够——得看见值长什么样（UUID？递增的整数？每轮都在变
+/// 的东西？）。只列名字会恰好把答案的那一半盖掉。
+///
+/// 值不是合法 UTF-8 时报 `<binary>`：上游这条路上不该有这种头，看见了本身就是线索。
+fn header_dump(headers: &HeaderMap) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str();
+            if REDACTED_HEADERS.contains(&name) {
+                return format!("{name}=<redacted len={}>", value.len());
+            }
+            format!("{name}={}", value.to_str().unwrap_or("<binary>"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// 来访 UA（截断后入库）。
@@ -3100,6 +3180,10 @@ struct UsageLogGuard {
     lease: store::LeaseState,
     drift: store::PrefixDrift,
     input_len: usize,
+    /// 只为归因判成 `upstream_cold` 那一刻的日志（见 [`note_cold_upstream`]）：会话键的来源，
+    /// 与来访的全部头。流式请求几十秒才走完，这两样得跟着 guard 活到那时候。
+    source: &'static str,
+    headers: Arc<str>,
     path: String,
     /// 来访客户端自报的 UA 与实际发出去那份（见 [`UaPair`]）。
     ua: Option<String>,
@@ -3125,17 +3209,25 @@ impl Drop for UsageLogGuard {
             }
             _ => None,
         };
+        let reason = cache_reason(
+            self.session_key.as_deref(),
+            self.lease,
+            self.drift,
+            self.input_len,
+            self.cred_id,
+            usage,
+        );
+        note_cold_upstream(
+            reason,
+            self.source,
+            self.session_key.as_deref(),
+            self.input_len,
+            &self.headers,
+        );
         let rec = UsageRecord {
             cred_id: Some(self.cred_id),
             cred_label: std::mem::take(&mut self.cred_label),
-            cache_reason: Some(cache_reason(
-                self.session_key.as_deref(),
-                self.lease,
-                self.drift,
-                self.input_len,
-                self.cred_id,
-                usage,
-            )),
+            cache_reason: Some(reason),
             session_id: self.session_key.take(),
             model,
             path: std::mem::take(&mut self.path),
@@ -3179,17 +3271,19 @@ fn log_usage(
         }
         _ => None,
     };
+    let reason = cache_reason(
+        session.key(),
+        session.lease,
+        session.drift,
+        session.input_len,
+        cred.id,
+        usage,
+    );
+    note_cold_upstream(reason, session.source, session.key(), session.input_len, &session.headers);
     let rec = UsageRecord {
         cred_id: Some(cred.id),
         cred_label: cred.label.clone(),
-        cache_reason: Some(cache_reason(
-            session.key(),
-            session.lease,
-            session.drift,
-            session.input_len,
-            cred.id,
-            usage,
-        )),
+        cache_reason: Some(reason),
         session_id: session.key.clone(),
         model,
         path: path.to_owned(),
@@ -5224,6 +5318,103 @@ mod tests {
             );
         }
         h
+    }
+
+    /// 会话头认三个名字，而且**要报出是哪一个**——排错时「客户端到底带没带」全靠它，
+    /// 键本身看不出来源。空值与只有空白的值不算带。
+    #[test]
+    fn the_session_header_is_reported_with_the_name_that_carried_it() {
+        let name = |h: &[(&str, &str)]| incoming_session_id(&hm(h)).map(|(n, _)| n);
+        let val = |h: &[(&str, &str)]| incoming_session_id(&hm(h)).map(|(_, v)| v);
+
+        assert_eq!(name(&[("session_id", "abc")]), Some("session_id"));
+        assert_eq!(name(&[("x-session-id", "abc")]), Some("x-session-id"));
+        assert_eq!(name(&[("conversation_id", "abc")]), Some("conversation_id"));
+        assert_eq!(val(&[("session_id", "  abc  ")]), Some("abc".into()), "两头的空白要去掉");
+
+        // 带了个空的等于没带：那时该退回前缀指纹，而不是拿空串当会话键去选号。
+        assert_eq!(name(&[("session_id", "   ")]), None);
+        assert_eq!(incoming_session_id(&HeaderMap::new()), None);
+
+        // 名字差一点就不算——这正是那行 debug 日志要列出全部头名的原因。
+        assert_eq!(name(&[("x-conversation-id", "abc")]), None);
+    }
+
+    /// 捕获 tracing 事件的最小订阅者：把每个事件的字段拍平成一行，供断言用。
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Flatten(String);
+            impl tracing::field::Visit for Flatten {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={v:?} ", f.name()));
+                }
+            }
+            let mut line = Flatten(String::new());
+            event.record(&mut line);
+            self.0.lock().push(line.0);
+        }
+    }
+
+    fn capture(f: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let cap = Captured::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(cap.clone()), f);
+        cap.0.lock().clone()
+    }
+
+    /// **只有 `upstream_cold` 才留下一行**。这条日志是 info 级、线上默认开着的，每类都打就是
+    /// 一条请求一行——上量的机器一天几百兆，而其余那几类在请求明细里本来就指得到根因。
+    #[test]
+    fn only_a_cold_upstream_gets_a_line() {
+        let lines = capture(|| {
+            for quiet in ["hit", "rotated", "lease_expired", "first_turn", "no_usage"] {
+                note_cold_upstream(quiet, "fingerprint", Some("k1"), 3, "user-agent=curl/8.7.1");
+            }
+            note_cold_upstream("upstream_cold", "fingerprint", Some("k2"), 7, "session_id=s1");
+        });
+
+        assert_eq!(lines.len(), 1, "只有上游凉了该留下一行: {lines:?}");
+        let line = &lines[0];
+        // 认假共享要的那两样：哪个键、这一轮 input[] 有几项（同一个键上一大一小地交替就是它）。
+        assert!(line.contains("key=\"k2\""), "{line}");
+        assert!(line.contains("input_len=7"), "{line}");
+        // 会话键是客户端给的还是这边算的——两种成因就靠它分。
+        assert!(line.contains("source=\"fingerprint\""), "{line}");
+        assert!(line.contains("session_id=s1"), "{line}");
+    }
+
+    /// 头原样进日志——**除了凭据那几个，它们只留名字和长度**。
+    #[test]
+    fn the_header_dump_keeps_everything_but_the_credentials() {
+        let dump = header_dump(&hm(&[
+            ("authorization", "Bearer sk-secret"),
+            ("x-api-key", "sk-also-secret"),
+            ("cookie", "session=secret"),
+            ("session_id", "s1"),
+            ("user-agent", "codex_cli_rs/0.5.0"),
+        ]));
+
+        // 排错要的那一半：值照打，而且是原样，不截断。
+        assert!(dump.contains("session_id=s1"), "{dump}");
+        assert!(dump.contains("user-agent=codex_cli_rs/0.5.0"), "{dump}");
+
+        // 凭据那一半：名字在、长度在、值不在。名字要在——「客户端到底带没带鉴权头」本身
+        // 就是个要查的问题。
+        assert!(dump.contains("authorization=<redacted len=16>"), "{dump}");
+        assert!(dump.contains("x-api-key=<redacted len=14>"), "{dump}");
+        assert!(dump.contains("cookie=<redacted len=14>"), "{dump}");
+        for secret in ["sk-secret", "sk-also-secret", "session=secret"] {
+            assert!(!dump.contains(secret), "凭据绝不能进日志: {dump}");
+        }
+
+        assert_eq!(header_dump(&HeaderMap::new()), "");
     }
 
     #[test]

@@ -153,6 +153,15 @@ export function cacheReasonHint(reason: string, t: (zh: string, en: string) => s
   return meta ? t(...meta.hint) : null
 }
 
+/**
+ * 一个原因标识的基调，给「一眼看出哪几条值得管」用。没登记过的标识回 `null`。
+ *
+ * 与这张表里条子的深浅同一个来源：`bad` 是真的有东西可修，其余那几类本来就该未命中。
+ */
+export function cacheReasonTone(reason: string): 'good' | 'neutral' | 'bad' | null {
+  return reasonMeta(reason)?.tone ?? null
+}
+
 /** 未命中的那部分输入 token——这张表的排序键，也是每一行条子的长度。 */
 function wasted(r: CacheReasonStat): number {
   return Math.max(0, r.input_tokens - r.cached_tokens)

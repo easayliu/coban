@@ -13,7 +13,7 @@ import {
   formatPercent,
   formatUsd,
 } from '@/lib/utils'
-import { cacheReasonHint, cacheReasonLabel } from '@/components/cache-reason-breakdown'
+import { cacheReasonHint, cacheReasonLabel, cacheReasonTone } from '@/components/cache-reason-breakdown'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
@@ -442,14 +442,13 @@ function UsageCards({
                 <span className="font-mono" title={log.session_id ?? undefined}>{sessionShort}</span>
               </LogFact>
               {/* 缓存结局紧跟着会话：这两个只有摆在一起才有意义——「哪一段对话」+
-                  「它这次为什么没命中」。悬浮上去是那一类该怎么处置。 */}
-              {log.cache_reason && (
-                <LogFact label={t('缓存结局', 'Cache outcome')}>
-                  <span title={cacheReasonHint(log.cache_reason, t) ?? undefined}>
-                    {cacheReasonLabel(log.cache_reason, t)}
-                  </span>
-                </LogFact>
-              )}
+                  「它这次为什么没命中」。悬浮上去是那一类该怎么处置。
+                  空值按 `legacy` 显示，理由同 [`CacheReasonCell`]。 */}
+              <LogFact label={t('缓存结局', 'Cache outcome')}>
+                <span title={cacheReasonHint(log.cache_reason ?? 'legacy', t) ?? undefined}>
+                  {cacheReasonLabel(log.cache_reason ?? 'legacy', t)}
+                </span>
+              </LogFact>
             </dl>
             {(log.ua || log.upstream_ua) && (
               // 改写过也**只占一行**（同 UaCell）：这份卡片是给窄屏看的，每多一行就少看一条。
@@ -505,7 +504,7 @@ function UsageTable({
           tabIndex={0}
         />
       )}
-      className="min-w-[76.5rem] table-fixed text-xs"
+      className="min-w-[84rem] table-fixed text-xs"
       aria-describedby={descriptionId}
     >
       <TableCaption className="sr-only">
@@ -519,6 +518,7 @@ function UsageTable({
         <col className="w-[4.25rem]" />
         <col className="w-[6.5rem]" />
         <col className="w-[4.5rem]" />
+        <col className="w-[7.5rem]" />
         <col className="w-[7.25rem]" />
         <col className="w-[5rem]" />
         <col className="w-[6.5rem]" />
@@ -527,7 +527,10 @@ function UsageTable({
       <TableHeader className="sticky top-0 z-10 bg-muted/96 backdrop-blur-sm">
         <TableRow className="bg-muted/72 [&>th]:border-b [&>th]:text-2xs">
           <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">{t('请求', 'Request')}</TableHead>
-          <TableHead scope="colgroup" colSpan={4} className="h-7 text-center">Token</TableHead>
+          <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">Token</TableHead>
+          {/* 缓存率与缓存结局自成一组：一个是「命中了多少」，一个是「没命中的那部分为什么」，
+              摆在一起才读得成一句话。上一组只剩纯粹的 token 计数。 */}
+          <TableHead scope="colgroup" colSpan={2} className="h-7 text-center">{t('缓存', 'Cache')}</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('性能', 'Performance')}</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('费用', 'Billing')}</TableHead>
           <TableHead scope="colgroup" colSpan={2} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
@@ -547,6 +550,15 @@ function UsageTable({
             )}
           >
             {t('缓存率', 'Cache hit')}
+          </TableHead>
+          <TableHead
+            className="whitespace-nowrap"
+            title={t(
+              '这条请求为什么是这个缓存率：命中、还是哪一种未命中。悬到具体那一格上看这一类该怎么处置；各类的合计在总览页「未命中都花在哪了」那张表里。',
+              'Why this request got that cache rate: a hit, or which kind of miss. Hover a cell for what to do about that kind; the totals per kind live in "Where the misses went" on the overview.',
+            )}
+          >
+            {t('缓存结局', 'Outcome')}
           </TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
@@ -602,6 +614,7 @@ function UsageTable({
               >
                 {formatPercent(cacheHitRate(log.input_tokens, log.cached_tokens))}
               </TableCell>
+              <CacheReasonCell reason={log.cache_reason} />
               <TableCell className="whitespace-nowrap text-right tabular-nums">
                 {ms(log.ttft_ms)} / {ms(log.total_ms)}
               </TableCell>
@@ -625,6 +638,29 @@ function UsageTable({
         })}
       </TableBody>
     </Table>
+  )
+}
+
+/**
+ * 缓存结局单元格。
+ *
+ * 空值（`cache_reason` 为 NULL）按 `legacy` 显示，不显示成 `—`：这一列留空只有一个含义
+ * ——归因上线之前写下的旧流水（后端的聚合也是这么归的，见 `store::cache_reasons`）。显示成
+ * 一个横杠会让人以为是「这条没算出来」，而那是另一类（`unattributed`，租约被关了）。
+ *
+ * 只有 `bad` 那几类给正常字色，其余转灰：一屏几十条里真正有东西可修的就那么几行，其余
+ * （新对话第一轮、换了模型）本来就该未命中，全用同一个字重会让人一条条读过去才分得清。
+ */
+function CacheReasonCell({ reason }: { reason: string | null }) {
+  const { t } = useI18n()
+  const key = reason ?? 'legacy'
+  return (
+    <TableCell
+      className={cn('truncate', cacheReasonTone(key) !== 'bad' && 'text-muted-foreground')}
+      title={cacheReasonHint(key, t) ?? undefined}
+    >
+      {cacheReasonLabel(key, t)}
+    </TableCell>
   )
 }
 
