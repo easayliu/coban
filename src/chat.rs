@@ -21,7 +21,7 @@
 //! 一句「请求失败」。已实测**能**过的：`tools`/`tool_choice`/`parallel_tool_calls`/
 //! `reasoning.effort`/`text.format`（含 `json_schema` 严格模式）/`input_image`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::body::Bytes;
 use serde_json::{Value, json};
@@ -151,6 +151,8 @@ pub fn translate_request(raw: &[u8], sort_tools: bool) -> Result<Translated, Str
 fn translate_messages(messages: &[Value]) -> Result<(String, Vec<Value>), String> {
     let mut instructions = String::new();
     let mut input: Vec<Value> = Vec::new();
+    // 这段历史里哪几次调用是 `custom` 的：它们的结果项换一种类型（见下面那两处）。
+    let mut custom_calls: HashSet<String> = HashSet::new();
 
     for (i, m) in messages.iter().enumerate() {
         let role = m
@@ -190,6 +192,33 @@ fn translate_messages(messages: &[Value]) -> Result<(String, Vec<Value>), String
                         .get("id")
                         .and_then(|x| x.as_str())
                         .ok_or_else(|| format!("messages[{i}].tool_calls[{j}] has no `id`"))?;
+                    // `custom` 那种工具调用带的是一段自由文本（`custom.input`），不是 JSON
+                    // 参数——项类型与字段名都换一套，而 `call_id` 记下来：它的结果那条消息
+                    // 也得跟着换项类型（Chat 那头两种结果长得一模一样）。
+                    if tc.get("type").and_then(|x| x.as_str()) == Some("custom")
+                        || tc.get("custom").is_some()
+                    {
+                        let name = tc
+                            .pointer("/custom/name")
+                            .or_else(|| tc.get("name"))
+                            .and_then(|x| x.as_str())
+                            .ok_or_else(|| {
+                                format!("messages[{i}].tool_calls[{j}] has no `custom.name`")
+                            })?;
+                        let text = tc
+                            .pointer("/custom/input")
+                            .or_else(|| tc.get("input"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default();
+                        custom_calls.insert(call_id.to_owned());
+                        input.push(json!({
+                            "type": "custom_tool_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "input": text,
+                        }));
+                        continue;
+                    }
                     let name =
                         tc.pointer("/function/name").and_then(|x| x.as_str()).ok_or_else(|| {
                             format!("messages[{i}].tool_calls[{j}] has no `function.name`")
@@ -216,8 +245,15 @@ fn translate_messages(messages: &[Value]) -> Result<(String, Vec<Value>), String
                     .ok_or_else(|| format!("messages[{i}] (tool) has no `tool_call_id`"))?;
                 // 工具结果为空是正常的（一条什么都没输出的命令），按空串送过去。
                 let output = flatten_text(m.get("content")).unwrap_or_default();
+                // 这次调用是 `custom` 的话，结果项也得是 `custom_tool_call_output`：Chat 那头
+                // 两种结果都是一条 `role: "tool"`，只有前面那条助手消息认得出是哪一种。
+                let ty = if custom_calls.contains(call_id) {
+                    "custom_tool_call_output"
+                } else {
+                    "function_call_output"
+                };
                 input.push(json!({
-                    "type": "function_call_output",
+                    "type": ty,
                     "call_id": call_id,
                     "output": output,
                 }));
@@ -299,11 +335,19 @@ pub(crate) fn flatten_text(content: Option<&Value>) -> Option<String> {
 }
 
 /// `tools[]`：Chat 的 `{type, function:{…}}` 摊平成 Responses 的 `{type, name, …}`。
+///
+/// `custom` 工具（freeform tool calling，工具吃的是一段自由文本而不是 JSON 参数）也认：两头
+/// 的差别同样只是「嵌一层还是摊平」。**以前这里直接回一句 400 把整条请求拦在门口**，而上游
+/// 本来收这种工具——那句话是这条链路自己发明的限制，客户端照它去改也改不出个所以然。
 fn translate_tools(tools: &Value) -> Result<Vec<Value>, String> {
     let arr = tools.as_array().ok_or_else(|| "`tools` must be an array".to_owned())?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, t) in arr.iter().enumerate() {
         let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("function");
+        if ty == "custom" {
+            out.push(translate_custom_tool(i, t)?);
+            continue;
+        }
         if ty != "function" {
             return Err(format!("tools[{i}]: only `function` tools are supported (got `{ty}`)"));
         }
@@ -336,17 +380,44 @@ fn translate_tools(tools: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-/// `tool_choice`：字符串档位原样，指定函数的那种要摊平。
+/// `{type:"custom", custom:{name, description, format}}` → Responses 那头的扁平形状。
+///
+/// 字段直接写在外层的写法也认（有 SDK 这么发）：取不到 `custom` 就在外层找。
+/// `description`/`format` 缺了就**不送**——`format` 缺省就是自由文本，替客户端编一个语法约束
+/// 是在替它改工具定义。
+fn translate_custom_tool(i: usize, t: &Value) -> Result<Value, String> {
+    let c = t.get("custom").filter(|c| c.is_object()).unwrap_or(t);
+    let name = c
+        .get("name")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| format!("tools[{i}] (custom) has no `name`"))?;
+    let mut o = serde_json::Map::new();
+    o.insert("type".into(), Value::String("custom".into()));
+    o.insert("name".into(), Value::String(name.into()));
+    for k in ["description", "format"] {
+        if let Some(v) = c.get(k).filter(|v| !v.is_null()) {
+            o.insert(k.into(), v.clone());
+        }
+    }
+    Ok(Value::Object(o))
+}
+
+/// `tool_choice`：字符串档位原样，指定某个工具的那种要摊平。
+///
+/// `custom` 工具（见 [`translate_custom_tool`]）指名时那个 `type` 得跟着换：上游按它去
+/// `tools` 里找，写成 `function` 就找不到那个工具了。
 fn translate_tool_choice(tc: &Value) -> Result<Value, String> {
     match tc {
         Value::String(s) if matches!(s.as_str(), "auto" | "none" | "required") => Ok(tc.clone()),
         Value::Object(_) => {
+            let custom = tc.get("type").and_then(|x| x.as_str()) == Some("custom")
+                || tc.get("custom").is_some();
             let name = tc
-                .pointer("/function/name")
+                .pointer(if custom { "/custom/name" } else { "/function/name" })
                 .and_then(|x| x.as_str())
                 .or_else(|| tc.get("name").and_then(|x| x.as_str()))
                 .ok_or_else(|| "`tool_choice` has no `function.name`".to_owned())?;
-            Ok(json!({ "type": "function", "name": name }))
+            Ok(json!({ "type": if custom { "custom" } else { "function" }, "name": name }))
         }
         other => Err(format!("unsupported `tool_choice`: {other}")),
     }
@@ -465,6 +536,8 @@ enum Ev {
         item_id: String,
         call_id: String,
         name: String,
+        /// 这是个 `custom` 工具调用（自由文本），不是 JSON 参数的函数调用。
+        custom: bool,
     },
     ToolArgs {
         item_id: String,
@@ -504,16 +577,20 @@ fn parse_event(data: &str) -> Option<Ev> {
         }
         "response.output_item.added" => {
             let item = v.get("item")?;
-            if item.get("type").and_then(|t| t.as_str())? != "function_call" {
-                return None;
-            }
+            let custom = match item.get("type").and_then(|t| t.as_str())? {
+                "function_call" => false,
+                "custom_tool_call" => true,
+                _ => return None,
+            };
             let call_id = item.get("call_id").and_then(|x| x.as_str())?.to_owned();
             let name = item.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
             // 后续的参数增量按 `item_id` 归位；上游没给 id 时退回 call_id 当键。
             let item_id = item.get("id").and_then(|x| x.as_str()).unwrap_or(&call_id).to_owned();
-            Some(Ev::ToolStart { item_id, call_id, name })
+            Some(Ev::ToolStart { item_id, call_id, name, custom })
         }
-        "response.function_call_arguments.delta" => {
+        // 两种工具调用的增量事件名不同，落到的地方是同一个：调用本身是 `custom` 还是函数，
+        // 在 `output_item.added` 那一步就已经记下了。
+        "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
             Some(Ev::ToolArgs { item_id: s("/item_id").unwrap_or_default(), delta: s("/delta")? })
         }
         "response.completed" | "response.incomplete" => Some(Ev::Completed {
@@ -590,10 +667,12 @@ pub struct StreamXlate {
     role_sent: bool,
     /// `item_id` → Chat 的 `tool_calls[].index`。上游的 `output_index` 把推理项也数在内，
     /// 与 Chat 只数工具调用的下标不是一回事，故自己分配。
-    tools: HashMap<String, usize>,
-    /// 最近一个开始的工具调用下标：参数增量的 `item_id` 对不上时按它归位（上游是逐个
-    /// 生成工具调用的），总比把参数丢掉好。
-    last_tool: Option<usize>,
+    /// 值里那个 `bool` 是「这是个 `custom` 调用」：增量要往 `custom.input` 还是
+    /// `function.arguments` 上落，得靠它。
+    tools: HashMap<String, (usize, bool)>,
+    /// 最近一个开始的工具调用：参数增量的 `item_id` 对不上时按它归位（上游是逐个生成工具
+    /// 调用的），总比把参数丢掉好。
+    last_tool: Option<(usize, bool)>,
     saw_tool: bool,
     /// 收尾（finish chunk + `[DONE]`）发过没有。
     closed: bool,
@@ -670,39 +749,34 @@ impl StreamXlate {
                 self.ensure_role(out);
                 sse(out, &self.chunk(json!({ "reasoning_content": t }), None));
             }
-            Ev::ToolStart { item_id, call_id, name } => {
+            Ev::ToolStart { item_id, call_id, name, custom } => {
                 self.ensure_role(out);
                 let index = self.tools.len();
-                self.tools.insert(item_id, index);
-                self.last_tool = Some(index);
+                self.tools.insert(item_id, (index, custom));
+                self.last_tool = Some((index, custom));
                 self.saw_tool = true;
-                sse(
-                    out,
-                    &self.chunk(
-                        json!({ "tool_calls": [{
-                            "index": index,
-                            "id": call_id,
-                            "type": "function",
-                            "function": { "name": name, "arguments": "" },
-                        }] }),
-                        None,
-                    ),
-                );
+                let mut tc = json!({ "index": index, "id": call_id });
+                if custom {
+                    tc["type"] = "custom".into();
+                    tc["custom"] = json!({ "name": name, "input": "" });
+                } else {
+                    tc["type"] = "function".into();
+                    tc["function"] = json!({ "name": name, "arguments": "" });
+                }
+                sse(out, &self.chunk(json!({ "tool_calls": [tc] }), None));
             }
             Ev::ToolArgs { item_id, delta } => {
-                let Some(index) = self.tools.get(&item_id).copied().or(self.last_tool) else {
+                let Some((index, custom)) = self.tools.get(&item_id).copied().or(self.last_tool)
+                else {
                     return;
                 };
-                sse(
-                    out,
-                    &self.chunk(
-                        json!({ "tool_calls": [{
-                            "index": index,
-                            "function": { "arguments": delta },
-                        }] }),
-                        None,
-                    ),
-                );
+                let mut tc = json!({ "index": index });
+                if custom {
+                    tc["custom"] = json!({ "input": delta });
+                } else {
+                    tc["function"] = json!({ "arguments": delta });
+                }
+                sse(out, &self.chunk(json!({ "tool_calls": [tc] }), None));
             }
             Ev::Completed { usage, incomplete, model } => {
                 if let Some(m) = model {
@@ -788,7 +862,8 @@ pub fn aggregate(sse_body: &[u8], model: &str) -> Result<Vec<u8>, (Option<String
     let mut text = String::new();
     let mut reasoning = String::new();
     // (call_id, name, arguments)，按上游给出的顺序。
-    let mut calls: Vec<(String, String, String)> = Vec::new();
+    // `(call_id, 工具名, 攒起来的参数/自由文本, 是不是 custom 调用)`
+    let mut calls: Vec<(String, String, String, bool)> = Vec::new();
     let mut index_of: HashMap<String, usize> = HashMap::new();
     let mut usage: Option<Usage> = None;
     let mut incomplete: Option<String> = None;
@@ -804,9 +879,9 @@ pub fn aggregate(sse_body: &[u8], model: &str) -> Result<Vec<u8>, (Option<String
             }
             Ev::Text(t) => text.push_str(&t),
             Ev::Reasoning(t) => reasoning.push_str(&t),
-            Ev::ToolStart { item_id, call_id, name } => {
+            Ev::ToolStart { item_id, call_id, name, custom } => {
                 index_of.insert(item_id, calls.len());
-                calls.push((call_id, name, String::new()));
+                calls.push((call_id, name, String::new(), custom));
             }
             Ev::ToolArgs { item_id, delta } => {
                 // 与流式那头同一套归位规则：`item_id` 对不上就落到最近开始的那个调用上。
@@ -855,7 +930,16 @@ pub fn aggregate(sse_body: &[u8], model: &str) -> Result<Vec<u8>, (Option<String
             Value::Array(
                 calls
                     .into_iter()
-                    .map(|(call_id, name, args)| {
+                    .map(|(call_id, name, args, custom)| {
+                        // `custom` 那种带的是自由文本：空就是空，补一个 `{}` 反而是往工具的
+                        // 输入里塞了两个字符。
+                        if custom {
+                            return json!({
+                                "id": call_id,
+                                "type": "custom",
+                                "custom": { "name": name, "input": args },
+                            });
+                        }
                         json!({
                             "id": call_id,
                             "type": "function",
@@ -977,6 +1061,82 @@ mod tests {
         // 严格模式的附加约束，那会让每个带工具的请求都 400。
         assert_eq!(v["tools"][0]["strict"], false);
         assert_eq!(v["tool_choice"], json!({ "type": "function", "name": "shell" }));
+    }
+
+    /// `custom` 工具（自由文本入参）整轮都要过得去：工具定义摊平、调用与结果换成 Responses
+    /// 那两种项。以前这里直接回一句「只支持 function 工具」把整条请求拦在门口。
+    #[test]
+    fn a_custom_tool_round_trip_translates() {
+        let v = upstream(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"patch it"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"custom","custom":{"name":"apply_patch","input":"*** Begin Patch"}}
+                ]},
+                {"role":"tool","tool_call_id":"call_1","content":"done"}
+            ],
+            "tools":[
+                {"type":"custom","custom":{"name":"apply_patch","description":"edit files",
+                 "format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}},
+                {"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}
+            ]}"#,
+        );
+        // 工具定义：摊平，`format` 原样带过去（那是客户端定的语法约束，不许替它改）。
+        let tools = v["tools"].as_array().unwrap();
+        let custom = tools.iter().find(|t| t["type"] == "custom").expect("custom 工具得在");
+        assert_eq!(custom["name"], "apply_patch");
+        assert_eq!(custom["description"], "edit files");
+        assert_eq!(custom["format"]["syntax"], "lark");
+        assert!(custom.get("custom").is_none(), "嵌的那一层该摊平");
+        assert!(custom.get("parameters").is_none(), "自由文本工具没有 JSON 参数");
+
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["type"], "custom_tool_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "apply_patch");
+        assert_eq!(input[1]["input"], "*** Begin Patch");
+        // 结果项也得跟着换类型：Chat 那头两种结果都是一条 `role: "tool"`，只有前面那条
+        // 助手消息认得出是哪一种。
+        assert_eq!(input[2]["type"], "custom_tool_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["output"], "done");
+
+        // 函数调用的结果不受影响。
+        let v = upstream(
+            r#"{"model":"m","messages":[
+                {"role":"assistant","tool_calls":[
+                    {"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"a.txt"}]}"#,
+        );
+        assert_eq!(v["input"][1]["type"], "function_call_output");
+
+        // 指名一个 custom 工具时 `type` 得跟着换：写成 function 上游就找不到那个工具了。
+        let v = upstream(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"custom","custom":{"name":"apply_patch"}}],
+                "tool_choice":{"type":"custom","custom":{"name":"apply_patch"}}}"#,
+        );
+        assert_eq!(v["tool_choice"], json!({ "type": "custom", "name": "apply_patch" }));
+
+        // 名字都没有的 custom 工具：这就不是能翻的形状，如实报错（同 function 那头）。
+        assert!(
+            translate_request(
+                br#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "tools":[{"type":"custom","custom":{"description":"x"}}]}"#,
+                false
+            )
+            .is_err()
+        );
+        // 别的工具类型仍然拦在门口：那才是真没法翻。
+        assert!(
+            translate_request(
+                br#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "tools":[{"type":"web_search"}]}"#,
+                false
+            )
+            .is_err()
+        );
     }
 
     /// 改名要改对，而上游不认的参数**一个都不能带过去**——带了是每条请求都 400。
@@ -1267,6 +1427,40 @@ mod tests {
         assert_eq!(msg["tool_calls"][0]["function"]["arguments"], r#"{"cmd":"ls"}"#);
         assert_eq!(msg["tool_calls"][1]["id"], "call_2");
         assert_eq!(msg["tool_calls"][1]["function"]["arguments"], "{}");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    const CUSTOM_TOOL_SSE: &str = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"apply_patch\"}}\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"delta\":\"*** Begin\"}\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"delta\":\" Patch\"}\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n",
+    );
+
+    /// `custom` 工具调用回程也得是 `custom` 那套字段：落到 `function.arguments` 上，客户端
+    /// 会拿一段自由文本去 JSON.parse。两条渲染路径必须给出同一种形状。
+    #[test]
+    fn a_custom_tool_call_comes_back_in_the_custom_shape() {
+        let evs = events(&stream_out(CUSTOM_TOOL_SSE, false));
+        let calls: Vec<&Value> =
+            evs.iter().filter_map(|e| e["choices"][0]["delta"].get("tool_calls")).collect();
+        assert_eq!(calls[0][0]["type"], "custom");
+        assert_eq!(calls[0][0]["id"], "call_1");
+        assert_eq!(calls[0][0]["custom"]["name"], "apply_patch");
+        assert_eq!(calls[0][0]["custom"]["input"], "");
+        assert!(calls[0][0].get("function").is_none());
+        assert_eq!(calls[1][0]["custom"]["input"], "*** Begin");
+        assert_eq!(calls[2][0]["custom"]["input"], " Patch");
+        assert_eq!(evs.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+
+        let v: Value =
+            serde_json::from_slice(&aggregate(CUSTOM_TOOL_SSE.as_bytes(), "m").unwrap()).unwrap();
+        let tc = &v["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["type"], "custom");
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["custom"]["name"], "apply_patch");
+        assert_eq!(tc["custom"]["input"], "*** Begin Patch");
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
     }
 

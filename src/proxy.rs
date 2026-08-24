@@ -735,8 +735,9 @@ async fn forward_once(
             stripped = true;
             continue;
         }
-        // 上游嫌 `input` 里某一项不合要求（`id` 前缀不对、缺了必填的 `encrypted_content`、或
-        // 那个 id 上游根本查不到，见 [`detect_input_item_complaint`]）：把这一类项修掉再发
+        // 上游嫌 `input` 里某一项不合要求（`id` 前缀不对或太长、缺了必填的
+        // `encrypted_content`、那个 id 上游根本查不到、挂着一张解不开的图、或带着上游不收的
+        // `role: "system"`，见 [`detect_input_item_complaint`]）：把这一类项修掉再发
         // 一遍。**不换号**——坏项在
         // 客户端手里的那段历史里，换到第三个号还是同一句 400；也不能就这么把 400 交回去，
         // 客户端下一轮还会把同一段历史发回来，这段会话就此卡死（同摘密文那支的理由）。
@@ -1073,8 +1074,8 @@ fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized,
 /// - `store` 漏传或传 `true` → `Store must be set to false`（会话不落在 ChatGPT 侧）；
 /// - `stream` 漏传或传 `false` → `Stream must be set to true`（这条路径只出 SSE）；
 /// - `input` 给一段裸文本 → `Input must be a list`（见 [`normalize_input_shape`]）；
-/// - `input` 里有 `role: "system"` 的消息 → `System messages are not allowed`
-///   （见 [`merge_system_messages`]）。
+/// - `input` 里有 `role: "system"` 的消息 → `System messages are not allowed`，或换一种说法的
+///   `Invalid value: 'system'. Value must be 'developer'.`（见 [`merge_system_messages`]）。
 ///
 /// codex CLI 两项都带对了，但照 OpenAI 官方 Responses API 写的客户端不会——那边 `store`
 /// 默认 `true`、`stream` 默认 `false`，两条默认值正好都踩在雷上。改写只此一处：这是上游的
@@ -1158,7 +1159,8 @@ fn normalize_input_shape(obj: &mut serde_json::Map<String, serde_json::Value>) -
     true
 }
 
-/// 把 `input` 里 `role: "system"` 的消息搬进顶层的 `instructions`。回「是否真的改过」。
+/// 把 `input` 里 `role: "system"` 的消息搬进顶层的 `instructions`；搬不动的那几条就地把角色
+/// 改成 `developer`。回「是否真的改过」。
 ///
 /// 上游不收这个角色，回的是 `System messages are not allowed`——而这条路上的客户端分两拨：
 /// codex CLI 从来不发系统消息（这段对它是空动作），照 Chat Completions 的心智写的接入方则
@@ -1176,40 +1178,57 @@ fn normalize_input_shape(obj: &mut serde_json::Map<String, serde_json::Value>) -
 /// 该由上游那句 400 说话。[`crate::chat`] 那头补一句默认提示，是因为「Chat 客户端
 /// 不发系统消息」再正常不过，这条路上不是。
 ///
-/// 三种情况一个字都不动，宁可把请求原样交给上游判：`input` 不是列表、某条系统消息读不出
-/// 文本（只有图片块之类）、`instructions` 已经在那儿但不是字符串。都是「搬过去会丢东西或
-/// 搬不动」，那时一句明确的 400 好过一段语义可疑的请求。
+/// **搬不动的那几条改角色，而不是放弃整条请求**：读不出文本（只有图片块、或干脆是空的）、
+/// 或 `instructions` 已经在那儿但不是字符串——这两种情况搬过去会丢东西，可原样发出去是**必**
+/// 400，而上游那句话点名要 `developer`（`Invalid value: 'system'. Value must be 'developer'.`），
+/// 那就只改这一个字：内容一个字不动、在对话里的位置也不动，比搬走还轻。
+///
+/// 早先这里是「一条搬不动就一条也不搬」，代价是那条请求连同整段会话从此每轮都 400——一句
+/// 「明确的 400」并没有让谁看见，客户端那头显示的只是「请求失败」。
+///
+/// `input` 不是列表、或里面一条系统消息都没有：一个字都不动（codex CLI 走的正是后一条路）。
 fn merge_system_messages(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
     let Some(input) = obj.get("input").and_then(|v| v.as_array()) else { return false };
     if !input.iter().any(is_system_message) {
         return false;
     }
-    if obj.get("instructions").is_some_and(|v| !v.is_string()) {
-        return false;
-    }
+    // `instructions` 在那儿但不是字符串：拼不上去，那就一条都不搬，全部改角色。
+    let can_merge = obj.get("instructions").is_none_or(|v| v.is_string());
     let mut merged = String::new();
-    for item in input.iter().filter(|i| is_system_message(i)) {
-        // 读不出文本就整条请求不动：把一条系统消息悄悄丢掉比 400 糟。
-        let Some(text) = chat::flatten_text(item.get("content")).filter(|t| !t.trim().is_empty())
-        else {
-            return false;
-        };
-        if !merged.is_empty() {
-            merged.push_str("\n\n");
+    // 搬不动、只能改角色的那几项的下标。
+    let mut demote = Vec::new();
+    for (i, item) in input.iter().enumerate().filter(|(_, it)| is_system_message(it)) {
+        match can_merge
+            .then(|| chat::flatten_text(item.get("content")).filter(|t| !t.trim().is_empty()))
+            .flatten()
+        {
+            Some(text) => {
+                if !merged.is_empty() {
+                    merged.push_str("\n\n");
+                }
+                merged.push_str(&text);
+            }
+            None => demote.push(i),
         }
-        merged.push_str(&text);
     }
-    // 已有的 `instructions` 排在前面：它是这条请求的基座提示，客户端另外塞的那几句是补充。
-    let mut instructions =
-        obj.get("instructions").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
-    if !instructions.is_empty() {
-        instructions.push_str("\n\n");
+    if !merged.is_empty() {
+        // 已有的 `instructions` 排在前面：它是这条请求的基座提示，客户端另外塞的那几句是补充。
+        let mut instructions =
+            obj.get("instructions").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(&merged);
+        obj.insert("instructions".to_owned(), serde_json::Value::String(instructions));
     }
-    instructions.push_str(&merged);
-    obj.insert("instructions".to_owned(), serde_json::Value::String(instructions));
-    if let Some(arr) = obj.get_mut("input").and_then(|v| v.as_array_mut()) {
-        arr.retain(|i| !is_system_message(i));
+    let Some(arr) = obj.get_mut("input").and_then(|v| v.as_array_mut()) else { return false };
+    // 先改角色再按角色筛：改过的那几条已经不是系统消息，留得下来。
+    for i in demote {
+        if let Some(o) = arr.get_mut(i).and_then(|v| v.as_object_mut()) {
+            o.insert("role".to_owned(), "developer".into());
+        }
     }
+    arr.retain(|i| !is_system_message(i));
     true
 }
 
@@ -1389,11 +1408,18 @@ const DROP_WHOLE_ITEM: &[&str] = &["reasoning"];
 pub enum InputItemRule {
     /// 这类项的 `id` 得以 `prefix` 开头。
     IdPrefix { item_type: String, prefix: String },
+    /// 这类项的 `id` 长过了上游的上限（`max` 个字符）。
+    IdTooLong { item_type: String, max: usize },
     /// 这类项必须带着 `field` 这个字段。
     RequiredField { item_type: String, field: String },
     /// 上游查不到 `id` 指的那一项：`store=false` 时它压根没被存下来（见
-    /// [`detect_input_item_complaint`] 认的第三句）。
+    /// [`detect_input_item_complaint`] 认的 `Item with id … not found` 那句）。
     UnknownItem { item_type: String, id: String },
+    /// 这类项里挂着一张上游解不开的图（见 [`is_broken_image_data_url`]）。
+    BadImage { item_type: String },
+    /// `input` 里有项带着 `role: "system"`，而上游只收 `developer`。**不认项类型**：上游那句
+    /// 话没指认是哪一项，它否的是这个值本身。
+    SystemRole,
 }
 
 impl InputItemRule {
@@ -1410,6 +1436,15 @@ impl InputItemRule {
                         .and_then(|v| v.as_str())
                         .is_some_and(|id| !id.starts_with(prefix.as_str()))
             }
+            // 同上，不带 `id` 的项放过。上游数的是字符（它说的是 string length），而这些 id
+            // 全是 ASCII，两种数法在这里没有差别。
+            Self::IdTooLong { item_type, max } => {
+                item_type == &t
+                    && item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| id.chars().count() > *max)
+            }
             // `null` 与「字段不在」一样算缺：上游要的是内容，不是这个键存在。
             Self::RequiredField { item_type, field } => {
                 item_type == &t && item.get(field).is_none_or(|v| v.is_null())
@@ -1425,31 +1460,157 @@ impl InputItemRule {
                     item.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
                 }
             }
+            // 坏图按**类**扫，判据却是本地的（见 [`is_broken_image_data_url`]）：上游一次只报
+            // 一个块，而一次工具结果里往往挂着好几张同样坏的图。本地判据只认铁定坏的那几种，
+            // 所以扫不到好图。
+            Self::BadImage { item_type } => item_type == &t && has_broken_image(item),
+            // 项类型一概不认：`role` 挂在哪种项上，上游都否这个值。
+            Self::SystemRole => item.get("role").and_then(|r| r.as_str()) == Some("system"),
         }
     }
 
-    /// 撞上之后怎么修：整项丢掉，还是只摘掉那个字段。
-    fn drops_whole_item(&self, item: &serde_json::Value) -> bool {
+    /// 撞上之后怎么修。
+    fn fix_for(&self, item: &serde_json::Value) -> Fix {
+        let droppable = DROP_WHOLE_ITEM.contains(&item_type_of(item).unwrap_or_default().as_str());
         match self {
             // 缺了必填字段的项补不回来，只能整项丢——所以这类规则只在丢得起的类型上学
             // （见 [`input_item_rule`]），学到了就一定是丢。
-            Self::RequiredField { .. } => true,
-            // `id` 对多数类型是可选的，摘掉就好；[`DROP_WHOLE_ITEM`] 那几个不行。
-            Self::IdPrefix { .. } => {
-                DROP_WHOLE_ITEM.contains(&item_type_of(item).unwrap_or_default().as_str())
+            Self::RequiredField { .. } => Fix::DropItem,
+            // `id` 对多数类型是可选的，摘掉就好；[`DROP_WHOLE_ITEM`] 那几个不行。前缀不对与
+            // 长过上限是同一味药：那个 `id` 不是上游会发的形状，而它本来也不必带。
+            Self::IdPrefix { .. } | Self::IdTooLong { .. } => {
+                if droppable {
+                    Fix::DropItem
+                } else {
+                    Fix::DropId
+                }
             }
             // 自带内容的项（消息、工具调用、工具结果）**只摘掉 `id`**：摘掉之后上游不再拿这个
             // id 去查什么，而那条消息、那次调用、那段结果一个字不丢——这是无损的。反过来，
             // 丢得起的类型（[`DROP_WHOLE_ITEM`]）与光有个 `id`、没带任何内容的引用项
             // （`item_reference`）只能整项丢：前者本来就该丢，后者摘掉 `id` 就什么都不剩了。
             Self::UnknownItem { .. } => {
-                DROP_WHOLE_ITEM.contains(&item_type_of(item).unwrap_or_default().as_str())
+                if droppable
                     || !["content", "arguments", "output"]
                         .iter()
                         .any(|k| item.get(*k).is_some_and(|v| !v.is_null()))
+                {
+                    Fix::DropItem
+                } else {
+                    Fix::DropId
+                }
             }
+            // **只换那一块**，整项不动：那一项通常是一次工具结果（截图），丢掉等于把这一轮的
+            // 结果变没了——比 400 更糟，因为它不报错（同 [`DROP_WHOLE_ITEM`] 那段的界线）。
+            Self::BadImage { .. } => Fix::ReplaceImages,
+            // 改角色是无损的：那条消息的内容一个字不动，在对话里的位置也不动。
+            Self::SystemRole => Fix::DemoteRole,
         }
     }
+}
+
+/// 撞上规则之后这一项怎么改。
+enum Fix {
+    /// 整项丢掉。
+    DropItem,
+    /// 只摘掉 `id`。
+    DropId,
+    /// 把项里那些上游解不开的图换成一句说明（[`BROKEN_IMAGE_NOTE`]）。
+    ReplaceImages,
+    /// 把 `role: "system"` 改成上游点名要的 `developer`。
+    DemoteRole,
+}
+
+/// 内容块里那张图上游解不开时换上去的一句说明。
+///
+/// 既不留一个空块、也不把这一项丢掉：数组变空是上游的另一个 400，而那一项往往是一次工具
+/// 结果。留一句话，模型至少知道这里本来有张它看不了的图。
+const BROKEN_IMAGE_NOTE: &str = "[image omitted: not a valid base64 data URL]";
+
+/// 这一项里有没有上游解不开的图。
+fn has_broken_image(item: &serde_json::Value) -> bool {
+    image_parts(item).any(|(_, url)| is_broken_image_data_url(&url))
+}
+
+/// 把这一项里上游解不开的那些图换成 [`BROKEN_IMAGE_NOTE`]。回「是否真的换过」。
+fn replace_broken_images(item: &mut serde_json::Value) -> bool {
+    let bad: Vec<(&'static str, usize)> = image_parts(item)
+        .filter(|(_, url)| is_broken_image_data_url(url))
+        .map(|(at, _)| at)
+        .collect();
+    if bad.is_empty() {
+        return false;
+    }
+    let Some(obj) = item.as_object_mut() else { return false };
+    for (key, i) in bad {
+        if let Some(part) =
+            obj.get_mut(key).and_then(|v| v.as_array_mut()).and_then(|a| a.get_mut(i))
+        {
+            // 文本块的类型照 Codex 实际发的形状写：工具结果与用户消息里的文本都是
+            // `input_text`（`output_text` 是助手那头的，图不会挂在那儿）。
+            *part = serde_json::json!({ "type": "input_text", "text": BROKEN_IMAGE_NOTE });
+        }
+    }
+    true
+}
+
+/// 走一遍这一项里的图片块，给出「它在哪个数组的第几个」与那个 URL。
+///
+/// 只看项上的 `content` 与 `output` 两个数组：Responses 的内容块就挂在这两处，而块里不再
+/// 嵌块。`image_url` 收字符串与 `{"url": …}` 两种写法（同 [`crate::chat`] 那头的判断）。
+fn image_parts(
+    item: &serde_json::Value,
+) -> impl Iterator<Item = ((&'static str, usize), String)> + '_ {
+    ["content", "output"].into_iter().flat_map(move |key| {
+        item.get(key)
+            .and_then(|v| v.as_array())
+            .map(|parts| {
+                parts.iter().enumerate().filter_map(move |(i, p)| {
+                    let u = p.get("image_url")?;
+                    let url = u
+                        .as_str()
+                        .or_else(|| u.pointer("/url").and_then(|x| x.as_str()))?
+                        .to_owned();
+                    Some(((key, i), url))
+                })
+            })
+            .into_iter()
+            .flatten()
+    })
+}
+
+/// 这个 `image_url` 是不是「自称 base64 data URL，而那段 base64 压根解不开」。
+///
+/// 只判 `data:` 开头的：`http(s)` 的远端图由上游自己去取，这条链路没有判据，动它就是在猜。
+///
+/// 判据刻意只认**铁定坏**的那几种：载荷是空的、里面有 base64 字母表之外的字符、补位后面还
+/// 跟着字符、或去掉补位后长度余 1——任何解码器都过不去这几关。合法的 base64 一定过得了这一
+/// 关，所以不会误伤一张好图；漏判的那些退回「把上游那句 400 原样交回去」，与没有这条规则时
+/// 一样。
+///
+/// 空白字符不计：有客户端把 data URL 折行发过来。
+fn is_broken_image_data_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("data:") else { return false };
+    // 不带 `;base64,` 的 data URL 不判：那是另一种写法（百分号转义），上游收不收另说。
+    let Some((_, payload)) = rest.split_once("base64,") else { return false };
+    let mut len = 0usize;
+    let mut padded = false;
+    for c in payload.chars() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        // 补位不计长度：`=` 只影响末尾几位，不影响「余 1 就是坏的」这个判断。
+        if c == '=' {
+            padded = true;
+            continue;
+        }
+        // 补位只许在末尾：`=` 后面再冒出字符，任何解码器都过不去。
+        if padded || !(c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '-' | '_')) {
+            return true;
+        }
+        len += 1;
+    }
+    len == 0 || len % 4 == 1
 }
 
 /// 「**这个会话**捎来的 `input` 项不合上游的要求」的记忆：`(会话键, 规则)` 的有界集合。
@@ -1477,16 +1638,25 @@ enum ItemAt {
     Index(usize),
     /// 按项的 `id`。
     Id(String),
+    /// 没指认任何一项：它否的是一个**值**（`Invalid value: 'system'.`），而不是「第几项写
+    /// 错了」。
+    Anywhere,
 }
 
 /// 上游想要的那件事。
 enum Want {
     /// `id` 该以这个前缀开头。
     IdPrefix(String),
+    /// `id` 长过了这个上限。
+    IdMaxLen(usize),
     /// 缺了这个必填字段。
     Field(String),
     /// 这一项它查不到，得从 `input` 里拿掉。
     Unresolvable,
+    /// 这一项里挂着一张它解不开的图。
+    BadImage,
+    /// `role` 只收 `developer`。
+    DeveloperRole,
 }
 
 /// 取一项的类型。
@@ -1502,10 +1672,13 @@ fn item_type_of(item: &serde_json::Value) -> Option<String> {
 
 /// 判断这次拒绝是不是「`input` 里某一项上游不收」，顺手把是哪一项、它想要什么读出来。
 ///
-/// 认三句话，都是 2026-08 实测到的原文（前两句在 Codex Desktop 的 alpha 版会话上）：
+/// 认这几句，都是 2026-08 实测到的原文（大多在 Codex Desktop 的 alpha 版会话上）：
 /// - `Invalid 'input[137].id': 'item_7bf507811fb6e5f92c0ce7f2'. Expected an ID that begins
 ///   with 'rs'.`——客户端把一段别处来的历史照原样发了回来，那批项的 `id` 是 `item_…` 而不是
 ///   Responses 的 `rs_…`。
+/// - `Invalid 'input[26].id': string too long. Expected a string with maximum length 64, but got
+///   a string with length 67 instead.`——同一个病的另一张脸：那批外来的 `id` 不但前缀不对，还
+///   长过了上游的上限。药也同一味（见 [`InputItemRule::fix_for`]）。
 /// - `Missing required parameter: 'input[218].encrypted_content'.`——客户端手里那项 reasoning
 ///   只剩 `id` 与 `summary`：密文在 `response.output_item.done` 里，上一轮的流没走到那个事件
 ///   （人按了停、网断了、或客户端自己压缩历史时丢了那一截），而 `store=false` 时上游没处查，
@@ -1514,28 +1687,32 @@ fn item_type_of(item: &serde_json::Value) -> Option<String> {
 ///   to false.`——**404**，不是 400。那个 id 不是上游会发的形状（官方的 reasoning id 里没有
 ///   `resp_chatcmpl-` 这一截），它是别的兼容网关造的：客户端在那边跑过几轮，rollout 里存下了
 ///   那批假 id，现在同一段会话接着往真上游发。`store=false` 时上游没处查，只能把那批项拿掉。
+/// - `Invalid 'input[390].output[3].image_url'. Expected a base64-encoded data URL with an image
+///   MIME type …, but got an invalid base64-encoded value.`——坏的不是「一项」，是那一项里的
+///   一个内容块：客户端捎回来的截图在它自己那头就已经坏了（编码时截断、或那一格压根没截到）。
+/// - `Invalid value: 'system'. Value must be 'developer'.`（也见过 `System messages are not
+///   allowed`）——`input` 里有项带着 `role: "system"`。发出前那一遍（[`merge_system_messages`]）
+///   已经把搬得动的都搬进 `instructions` 了，还漏到这里说明那一项它不认（`type` 不是
+///   `message`）——上游既然点名要 `developer`，就地改角色。
 ///
-/// 三句都是客户端那头的事，但**代价全在这条链路上**：这段会话从这一轮起每一次都 400/404。
+/// 每一句说的都是客户端那头的事，但**代价全在这条链路上**：这段会话从这一轮起每一次都
+/// 400/404。
 /// 所以照摘密文那套处置——修掉再发一遍。
 ///
 /// 读是哪一项、它想要什么，而不是只判「是这个病」：改哪一项、按什么改，全靠上游这句话。
 fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputItemComplaint> {
-    // 400 与 404 两种码：前两句是 400，第三句（查不到那一项）是 404。
+    // 400 与 404 两种码：只有「查不到那一项」那句是 404，别的都是 400。
     if status != StatusCode::BAD_REQUEST && status != StatusCode::NOT_FOUND {
         return None;
     }
     let msg = upstream_error_text(body)?;
+    // `Invalid 'input[N].<字段>': …` 这一族：项号的读法一样，想要什么看后半句。
     if let Some((_, rest)) = msg.split_once("Invalid 'input[")
-        && let Some((idx, rest)) = rest.split_once("].id'")
+        && let Some((idx, rest)) = rest.split_once("].")
         && let Ok(index) = idx.parse::<usize>()
-        && let Some(prefix) =
-            rest.split_once("begins with '").and_then(|(_, r)| r.split('\'').next())
-        && !prefix.trim().is_empty()
+        && let Some(want) = invalid_field_want(rest)
     {
-        return Some(InputItemComplaint {
-            at: ItemAt::Index(index),
-            want: Want::IdPrefix(prefix.trim().to_owned()),
-        });
+        return Some(InputItemComplaint { at: ItemAt::Index(index), want });
     }
     // 这一句按 id 指认，不给项号——它本来就不是在说「第几项写错了」，而是「这个 id 我查不到」。
     if let Some((_, rest)) = msg.split_once("Item with id '")
@@ -1548,6 +1725,12 @@ fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputI
             want: Want::Unresolvable,
         });
     }
+    // 这一句也不给项号：上游否的是 `role` 的值本身，带着它的项都得改。
+    if msg.contains("System messages are not allowed")
+        || (msg.contains("Invalid value: 'system'") && msg.contains("'developer'"))
+    {
+        return Some(InputItemComplaint { at: ItemAt::Anywhere, want: Want::DeveloperRole });
+    }
     let (_, rest) = msg.split_once("Missing required parameter: 'input[")?;
     let (idx, rest) = rest.split_once("].")?;
     let index = idx.parse::<usize>().ok()?;
@@ -1559,6 +1742,38 @@ fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputI
     })
 }
 
+/// 读 `Invalid 'input[N].<字段>': …` 的后半句：`rest` 是项号右边那一截（`id': 'item_…'.
+/// Expected an ID that begins with 'rs'.`），从里面读出上游想要的那件事。
+///
+/// 读不出来就返回 `None`——那句话说的是别的字段、或换了种说法，宁可把 400 原样交回去，也不
+/// 照一个猜出来的判断去改客户端的历史。
+fn invalid_field_want(rest: &str) -> Option<Want> {
+    // `id` 那一族两种病：前缀不对，或长过了上限。
+    if let Some(rest) = rest.strip_prefix("id'") {
+        if let Some(prefix) =
+            rest.split_once("begins with '").and_then(|(_, r)| r.split('\'').next())
+            && !prefix.trim().is_empty()
+        {
+            return Some(Want::IdPrefix(prefix.trim().to_owned()));
+        }
+        return rest
+            .split_once("maximum length ")
+            .and_then(|(_, r)| r.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .map(Want::IdMaxLen);
+    }
+    // 图那一句的字段路径是嵌在项里的（`output[3].image_url`）：认「路径末尾是 image_url」，
+    // 而不去解那个下标——本地判据会把这一项里同样坏的图一起扫掉（见 [`has_broken_image`]）。
+    if let Some((field, tail)) = rest.split_once('\'')
+        && field.ends_with("image_url")
+        && tail.contains("base64")
+    {
+        return Some(Want::BadImage);
+    }
+    None
+}
+
 /// 把一句抱怨落成一条规则：抱怨只说了「第几项」，规则要的是「哪一类项」——项号在下一轮就
 /// 变了（客户端又往历史里加了几项），类型不会。
 ///
@@ -1567,6 +1782,10 @@ fn detect_input_item_complaint(status: StatusCode, body: &[u8]) -> Option<InputI
 /// - 缺字段、而这类项又**丢不起**（见 [`DROP_WHOLE_ITEM`]）：字段补不出来、整项又不能丢，
 ///   这条规则学了也修不动，只会白发一次重试。
 fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<InputItemRule> {
+    // 这一支不看是哪一项：上游否的是 `role` 的值，`input` 里带着它的项都得改。
+    if matches!(complaint.want, Want::DeveloperRole) {
+        return Some(InputItemRule::SystemRole);
+    }
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let input = v.get("input")?.as_array()?;
     let item = match &complaint.at {
@@ -1576,19 +1795,26 @@ fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<Input
         ItemAt::Id(id) => {
             input.iter().find(|it| it.get("id").and_then(|x| x.as_str()) == Some(id.as_str()))?
         }
+        // 上面那一支已经把「没指认哪一项」接走了，别的 want 没有项号就无从下手。
+        ItemAt::Anywhere => return None,
     };
     let item_type = item_type_of(item)?;
     match &complaint.want {
         Want::IdPrefix(prefix) => {
             Some(InputItemRule::IdPrefix { item_type, prefix: prefix.clone() })
         }
+        Want::IdMaxLen(max) => Some(InputItemRule::IdTooLong { item_type, max: *max }),
+        // 本地判据在这一项上都找不出坏图，就不学：那说明上游嫌的是我们认不出的另一种坏法
+        // （见 [`is_broken_image_data_url`] 那段刻意保守的判据），学了也修不动。
+        Want::BadImage => has_broken_image(item).then_some(InputItemRule::BadImage { item_type }),
+        Want::DeveloperRole => Some(InputItemRule::SystemRole),
         Want::Field(field) => DROP_WHOLE_ITEM
             .contains(&item_type.as_str())
             .then(|| InputItemRule::RequiredField { item_type, field: field.clone() }),
         Want::Unresolvable => match &complaint.at {
             ItemAt::Id(id) => Some(InputItemRule::UnknownItem { item_type, id: id.clone() }),
             // 上游没给 id 就没法认那一项，这条规则学不成。
-            ItemAt::Index(_) => None,
+            ItemAt::Index(_) | ItemAt::Anywhere => None,
         },
     }
 }
@@ -1596,8 +1822,9 @@ fn input_item_rule(body: &Bytes, complaint: &InputItemComplaint) -> Option<Input
 /// 按规则把 `input` 里不合要求的那些项修掉，返回改写后的体；一项都没动则返回 `None`——那说明
 /// 这条 400 不是这个病，重发一遍白发一次。
 ///
-/// 两种改法，界线见 [`InputItemRule::drops_whole_item`]：整项丢掉，或只摘掉那个 `id`——后者
-/// 是无损的，那一项的内容一个字不动，上游只是不再拿这个 `id` 去查什么。
+/// 四种改法，界线见 [`InputItemRule::fix_for`]：整项丢掉，或就地改一点——摘掉 `id`、换掉那张
+/// 解不开的图、把 `system` 改成 `developer`。后三种都不动那一项的别处，`id` 那种更是无损的：
+/// 内容一个字不改，上游只是不再拿这个 `id` 去查什么。
 /// **同一条规则把整个 `input` 扫一遍**：上游一次只报第一个坏项，而坏项通常是成片的（同一段
 /// 被压缩过的历史里，那一类项的毛病一模一样），一项一项修就是一项一次上游往返。
 fn repair_input_items(body: &Bytes, rules: &[InputItemRule]) -> Option<Bytes> {
@@ -1606,14 +1833,25 @@ fn repair_input_items(body: &Bytes, rules: &[InputItemRule]) -> Option<Bytes> {
     {
         let input = obj.get_mut("input")?.as_array_mut()?;
         let before = input.len();
-        input.retain(|item| !rules.iter().any(|r| r.violated_by(item) && r.drops_whole_item(item)));
+        input.retain(|item| {
+            !rules.iter().any(|r| r.violated_by(item) && matches!(r.fix_for(item), Fix::DropItem))
+        });
         touched |= input.len() != before;
-        // 留下来的违规项都是「摘掉 `id` 就好」的那种：前缀不对的 `id`、或上游查不到的 `id`
-        // ——两种病的药是同一味。缺字段那类规则不会走到这里（它的 `drops_whole_item` 恒为真）。
+        // 留下来的违规项都是就地改得动的那几种。先把要改的动作收齐再动手：算「撞上没有」要
+        // 借这一项的不可变引用，而改它要可变引用。
         for item in input.iter_mut() {
-            let bad_id = rules.iter().any(|r| r.violated_by(item) && !r.drops_whole_item(item));
-            if bad_id && let Some(o) = item.as_object_mut() {
-                touched |= o.remove("id").is_some();
+            let fixes: Vec<Fix> =
+                rules.iter().filter(|r| r.violated_by(item)).map(|r| r.fix_for(item)).collect();
+            for fix in fixes {
+                touched |= match fix {
+                    // 上一步已经丢掉了，留下来的项撞不上这一支。
+                    Fix::DropItem => false,
+                    Fix::DropId => item.as_object_mut().is_some_and(|o| o.remove("id").is_some()),
+                    Fix::ReplaceImages => replace_broken_images(item),
+                    Fix::DemoteRole => item
+                        .as_object_mut()
+                        .is_some_and(|o| o.insert("role".to_owned(), "developer".into()).is_some()),
+                };
             }
         }
     }
@@ -4802,8 +5040,9 @@ mod tests {
             r#"{"model":"m","store":false,"stream":true,"input":[{"role":"user","content":"hi"}]}"#;
         assert_eq!(norm("responses", raw).body, Bytes::from(raw.to_owned()));
 
-        // 读不出文本的系统消息（只有图片块）：一项都不搬，整条请求交给上游判——把一条系统
-        // 消息悄悄丢掉比 400 糟。
+        // 读不出文本的系统消息（只有图片块）：搬不动，但也不放弃整条请求——就地改成上游
+        // 点名要的 `developer`。早先这里是「一条搬不动就一条也不搬」，代价是这段会话从此
+        // 每轮都 400。
         let v: serde_json::Value = serde_json::from_slice(
             &norm(
                 "responses",
@@ -4814,8 +5053,27 @@ mod tests {
             .body,
         )
         .unwrap();
-        assert_eq!(v["input"].as_array().unwrap().len(), 2, "搬不动就一项都不搬");
-        assert!(v.get("instructions").is_none());
+        assert_eq!(v["input"].as_array().unwrap().len(), 2, "那一项还在，位置也没动");
+        assert_eq!(v["input"][0]["role"], "developer");
+        assert_eq!(v["input"][0]["content"][0]["image_url"], "data:x", "内容一个字不动");
+        assert!(v.get("instructions").is_none(), "什么都没搬走，就不该凭空造一句 instructions");
+
+        // 一条搬得动、一条搬不动：各按各的办法，互不影响。
+        let v: serde_json::Value = serde_json::from_slice(
+            &norm(
+                "responses",
+                r#"{"model":"m","input":[
+                    {"role":"system","content":"be brief"},
+                    {"role":"system","content":[]},
+                    {"role":"user","content":"hi"}]}"#,
+            )
+            .body,
+        )
+        .unwrap();
+        assert_eq!(v["instructions"], "be brief");
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2, "搬走的那条不在了，改了角色的那条还在");
+        assert_eq!(input[0]["role"], "developer");
 
         // `developer` 不碰：上游那句话只否了 system，动一个合法角色是在猜上游的 schema。
         let v: serde_json::Value = serde_json::from_slice(
@@ -5293,7 +5551,7 @@ mod tests {
         assert!(seen.len() > 50, "抖动该是散开的，实际只有 {} 种取值", seen.len());
     }
 
-    /// 上游那三句抱怨都要认出来，「是哪一项」与「它想要什么」都要读准：认不出来，这段会话
+    /// 上游那几句抱怨都要认出来，「是哪一项」与「它想要什么」都要读准：认不出来，这段会话
     /// 从此每一轮都 400/404（客户端下一轮还会把同一段历史发回来）。
     #[test]
     fn input_item_complaints_are_read_off_the_upstream_message() {
@@ -5302,12 +5560,36 @@ mod tests {
         assert!(matches!(c.at, ItemAt::Index(137)));
         assert!(matches!(&c.want, Want::IdPrefix(p) if p == "rs"));
 
+        // `id` 那一族的第二张脸：不说前缀，说长度。
+        let too_long = br#"{"error":{"message":"Invalid 'input[26].id': string too long. Expected a string with maximum length 64, but got a string with length 67 instead.","type":"invalid_request_error"}}"#;
+        let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, too_long).expect("这句也得认");
+        assert!(matches!(c.at, ItemAt::Index(26)));
+        assert!(matches!(c.want, Want::IdMaxLen(64)));
+
+        // 坏图那一句的字段路径是嵌在项里的，认「末尾是 image_url」就够——哪几块坏由本地判据说。
+        let bad_img = br#"{"error":{"message":"Invalid 'input[390].output[3].image_url'. Expected a base64-encoded data URL with an image MIME type (e.g. 'data:image/png;base64,aW1nIGJ5dGVzIGhlcmU='), but got an invalid base64-encoded value.","type":"invalid_request_error"}}"#;
+        let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, bad_img).expect("这句也得认");
+        assert!(matches!(c.at, ItemAt::Index(390)));
+        assert!(matches!(c.want, Want::BadImage));
+
+        // 系统角色那两句都不指认任何一项：它否的是这个值本身。
+        for msg in [
+            br#"{"error":{"message":"Invalid value: 'system'. Value must be 'developer'."}}"#
+                .as_slice(),
+            br#"{"error":{"message":"System messages are not allowed."}}"#.as_slice(),
+        ] {
+            let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, msg).expect("这句也得认");
+            assert!(matches!(c.at, ItemAt::Anywhere));
+            assert!(matches!(c.want, Want::DeveloperRole));
+        }
+
         let missing = br#"{"error":{"message":"Missing required parameter: 'input[218].encrypted_content'.","type":"invalid_request_error"}}"#;
         let c = detect_input_item_complaint(StatusCode::BAD_REQUEST, missing).expect("这句也得认");
         assert!(matches!(c.at, ItemAt::Index(218)));
         assert!(matches!(&c.want, Want::Field(f) if f == "encrypted_content"));
 
-        // 第三句按 id 指认，而且是 404——状态码这一关放不进去，这句就永远认不出来。
+        // 「查不到那一项」那句按 id 指认，而且是 404——状态码这一关放不进去，这句就永远
+        // 认不出来。
         let unknown = br#"{"error":{"message":"Item with id 'rs_resp_chatcmpl-baa3374f-6ad7-9ebc-931b-a14adeae02fe' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input.","type":"invalid_request_error"}}"#;
         let c = detect_input_item_complaint(StatusCode::NOT_FOUND, unknown).expect("这句也得认");
         assert!(
@@ -5322,9 +5604,15 @@ mod tests {
         assert!(detect_input_item_complaint(StatusCode::TOO_MANY_REQUESTS, bad_id).is_none());
         let other = br#"{"error":{"message":"Unsupported parameter: temperature"}}"#;
         assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, other).is_none());
-        // 只说了坏在哪、没说该是什么前缀：读不出要求就不动手。
+        // 只说了坏在哪、没说该是什么前缀（也没说长度上限）：读不出要求就不动手。
         let vague = br#"{"error":{"message":"Invalid 'input[3].id': 'x'."}}"#;
         assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, vague).is_none());
+        // 嫌的是项里别的字段：认不出改法，不猜。
+        let other_field = br#"{"error":{"message":"Invalid 'input[3].call_id': 'x'."}}"#;
+        assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, other_field).is_none());
+        // 嫌图的是别的毛病（不是 base64 解不开）：本地判据管不着，原样交回去。
+        let img_size = br#"{"error":{"message":"Invalid 'input[3].content[0].image_url'. The image is too large."}}"#;
+        assert!(detect_input_item_complaint(StatusCode::BAD_REQUEST, img_size).is_none());
         // 更深的路径不认：按它学出来的规则谁也撞不上，白发一次重试。
         let nested =
             br#"{"error":{"message":"Missing required parameter: 'input[2].content[0].text'."}}"#;
@@ -5385,6 +5673,25 @@ mod tests {
         let c = InputItemComplaint { at: ItemAt::Index(0), want: Want::IdPrefix("msg".to_owned()) };
         assert!(input_item_rule(&shapeless, &c).is_none());
         assert!(input_item_rule(&Bytes::from_static(b"not json"), &c).is_none());
+
+        // 坏图：本地判据在被点名的那一项上找不出坏图就不学——那说明上游嫌的是我们认不出的
+        // 另一种坏法，学了也修不动，白发一次重试。
+        let imgs = Bytes::from(
+            r#"{"input":[
+                {"type":"function_call_output","call_id":"c","output":[
+                    {"type":"input_image","image_url":"data:image/png;base64,QUJD"}]},
+                {"type":"function_call_output","call_id":"d","output":[
+                    {"type":"input_image","image_url":"data:image/png;base64,%"}]}
+            ]}"#
+            .to_owned(),
+        );
+        let c = InputItemComplaint { at: ItemAt::Index(0), want: Want::BadImage };
+        assert!(input_item_rule(&imgs, &c).is_none());
+        let c = InputItemComplaint { at: ItemAt::Index(1), want: Want::BadImage };
+        assert_eq!(
+            input_item_rule(&imgs, &c),
+            Some(InputItemRule::BadImage { item_type: "function_call_output".to_owned() })
+        );
     }
 
     /// 坏 `id` 按类型分两档修：`reasoning` 整项丢（`id` 是它的必填字段），别的只摘掉 `id`——
@@ -5430,6 +5737,159 @@ mod tests {
         // 非 JSON / 没有 input 的体、以及一条规则都没有时，一样不重发。
         assert!(repair_input_items(&Bytes::from_static(b"not json"), &rules).is_none());
         assert!(repair_input_items(&body, &[]).is_none());
+    }
+
+    /// 长过上限的 `id` 与前缀不对的 `id` 是同一味药：能摘的摘掉，`reasoning` 整项丢。
+    #[test]
+    fn ids_that_are_too_long_are_repaired_like_wrongly_prefixed_ones() {
+        let long = "msg_".to_owned() + &"a".repeat(63);
+        let body = Bytes::from(format!(
+            r#"{{"input":[
+                {{"type":"message","id":"{long}","role":"user","content":"hi"}},
+                {{"type":"message","id":"msg_short","role":"user","content":"ok"}},
+                {{"type":"reasoning","id":"{long}","summary":[],"encrypted_content":"gAAAA"}}
+            ]}}"#
+        ));
+        let rules = vec![
+            InputItemRule::IdTooLong { item_type: "message".to_owned(), max: 64 },
+            InputItemRule::IdTooLong { item_type: "reasoning".to_owned(), max: 64 },
+        ];
+        let fixed = repair_input_items(&body, &rules).expect("有超长 id 就该改写");
+        let v: serde_json::Value = serde_json::from_slice(&fixed).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2, "reasoning 那项整项丢（id 是它的必填字段）");
+        assert!(input[0].get("id").is_none(), "消息只摘掉 id");
+        assert_eq!(input[0]["content"], "hi", "内容一个字不动");
+        assert_eq!(input[1]["id"], "msg_short", "没超的那项不动");
+
+        // 正好等于上限不算超（上游说的是 maximum length）。
+        let at_limit = Bytes::from(format!(
+            r#"{{"input":[{{"type":"message","id":"{}","role":"user","content":"hi"}}]}}"#,
+            "a".repeat(64)
+        ));
+        assert!(repair_input_items(&at_limit, &rules).is_none());
+    }
+
+    /// 上游解不开的那张图**只换那一块**：那一项往往是一次工具结果，整项丢掉等于把这一轮的
+    /// 结果变没了，而且不报错。好图与远端图一个都不许动。
+    #[test]
+    fn an_image_the_upstream_cannot_decode_is_replaced_in_place() {
+        let body = Bytes::from(
+            r#"{"input":[
+                {"type":"function_call_output","call_id":"c1","output":[
+                    {"type":"input_text","text":"shot"},
+                    {"type":"input_image","image_url":"data:image/png;base64,QUJDRA=="},
+                    {"type":"input_image","image_url":"data:image/png;base64,"},
+                    {"type":"input_image","image_url":"data:image/png;base64,%%%"}
+                ]},
+                {"type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,Z"},
+                    {"type":"input_image","image_url":"https://example.com/a.png"}
+                ]}
+            ]}"#
+            .to_owned(),
+        );
+        let rules = vec![InputItemRule::BadImage { item_type: "function_call_output".to_owned() }];
+        let fixed = repair_input_items(&body, &rules).expect("有解不开的图就该改写");
+        let v: serde_json::Value = serde_json::from_slice(&fixed).unwrap();
+        let out = v["input"][0]["output"].as_array().unwrap();
+        assert_eq!(out.len(), 4, "块数不变：数组变空是上游的另一个 400");
+        assert_eq!(out[0]["text"], "shot", "别的块一个字不动");
+        assert_eq!(out[1]["image_url"], "data:image/png;base64,QUJDRA==", "好图不许动");
+        assert_eq!(out[2]["type"], "input_text");
+        assert_eq!(out[2]["text"], BROKEN_IMAGE_NOTE);
+        assert_eq!(out[3]["text"], BROKEN_IMAGE_NOTE, "同一项里成片的坏图一起换掉");
+        assert_eq!(v["input"][0]["call_id"], "c1", "工具结果与调用的配对原样留着");
+        // 规则认类型：这一轮没学到「消息里的图」，那一项就不该被动。
+        assert_eq!(v["input"][1]["content"][0]["image_url"], "data:image/png;base64,Z");
+
+        // 学到消息那一类之后，坏图换掉，远端图仍然不动（这条链路对它没有判据）。
+        let rules = vec![InputItemRule::BadImage { item_type: "message".to_owned() }];
+        let v: serde_json::Value =
+            serde_json::from_slice(&repair_input_items(&body, &rules).expect("该改写")).unwrap();
+        let content = v["input"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], BROKEN_IMAGE_NOTE);
+        assert_eq!(content[1]["image_url"], "https://example.com/a.png");
+
+        // 一张坏图都没有时不重发。
+        let ok = Bytes::from(
+            r#"{"input":[{"type":"message","role":"user","content":[
+                {"type":"input_image","image_url":"data:image/png;base64,QUJDRA=="}]}]}"#
+                .to_owned(),
+        );
+        assert!(repair_input_items(&ok, &rules).is_none());
+    }
+
+    /// 本地判据只认**铁定坏**的那几种：合法 base64 一律放过（误伤一张好图是实打实的损失，
+    /// 漏判只是退回「把上游那句 400 原样交回去」）。
+    #[test]
+    fn only_base64_that_no_decoder_could_read_counts_as_broken() {
+        for good in [
+            "data:image/png;base64,QUJDRA==",
+            "data:image/png;base64,QUJD",
+            "data:image/png;base64,QUI=",
+            "data:image/jpeg;base64,QQ==",
+            // 不带补位、URL-safe 字母表、折了行的：都有解码器读得懂。
+            "data:image/png;base64,QUJDRQ",
+            "data:image/png;base64,-_QQ",
+            "data:image/png;base64,QUJD\nRA==",
+            // 不是 data URL / 不是 base64 写法：这条链路没有判据，一概不动。
+            "https://example.com/a.png",
+            "data:image/png,rawbytes",
+            "",
+        ] {
+            assert!(!is_broken_image_data_url(good), "不该判坏: {good}");
+        }
+        for bad in [
+            // 空载荷、字母表外的字符、去掉补位后长度余 1。
+            "data:image/png;base64,",
+            "data:image/png;base64,====",
+            "data:image/png;base64,%%%",
+            "data:image/png;base64,QUJD*",
+            "data:image/png;base64,Q",
+            "data:image/png;base64,QUJDRA==Q",
+            "data:image/png;base64,undefined",
+        ] {
+            assert!(is_broken_image_data_url(bad), "该判坏: {bad}");
+        }
+    }
+
+    /// `role: "system"` 就地改成 `developer`：**不认项类型**（上游那句话没指认哪一项），
+    /// 而别的角色一个都不许动。
+    #[test]
+    fn a_system_role_is_demoted_wherever_it_sits() {
+        let body = Bytes::from(
+            r#"{"input":[
+                {"type":"message","role":"system","content":"be brief"},
+                {"role":"system","content":[{"type":"input_image","image_url":"data:x"}]},
+                {"type":"item_reference","role":"system","id":"x"},
+                {"role":"developer","content":"and precise"},
+                {"role":"user","content":"hi"}
+            ]}"#
+            .to_owned(),
+        );
+        let rules = vec![InputItemRule::SystemRole];
+        let fixed = repair_input_items(&body, &rules).expect("有 system 角色就该改写");
+        let v: serde_json::Value = serde_json::from_slice(&fixed).unwrap();
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 5, "一项都不该丢：改的只是一个角色名");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"], "be brief", "内容一个字不动");
+        assert_eq!(input[1]["role"], "developer", "读不出文本的那条也改得动");
+        assert_eq!(input[2]["role"], "developer", "type 不是 message 的项一样改");
+        assert_eq!(input[2]["type"], "item_reference");
+        assert_eq!(input[3]["role"], "developer");
+        assert_eq!(input[4]["role"], "user", "别的角色不动");
+
+        // 一条都没有时不重发。
+        let ok = Bytes::from(r#"{"input":[{"role":"user","content":"hi"}]}"#.to_owned());
+        assert!(repair_input_items(&ok, &rules).is_none());
+        // 这条规则不看是哪一项，连体都不必解得开就学得下来。
+        let c = InputItemComplaint { at: ItemAt::Anywhere, want: Want::DeveloperRole };
+        assert_eq!(
+            input_item_rule(&Bytes::from_static(b"not json"), &c),
+            Some(InputItemRule::SystemRole)
+        );
     }
 
     /// 缺了密文的 reasoning 项整项丢，**同一遍把成片的都扫掉**：上游一次只报第一个，一项一
