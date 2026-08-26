@@ -35,7 +35,10 @@ const PKCE_MAX_PENDING: usize = 32;
 ///
 /// axum 对 `Bytes` 提取器默认限 2MB，超过的请求进不了 handler 就被 413 拦掉——而带大段
 /// 上下文/附件的合法 Codex 请求很容易超 2MB。放到 64MB 留出余量，真正的大小判决交给上游。
-const PROXY_BODY_LIMIT: usize = 64 * 1024 * 1024;
+///
+/// **解压之后那份也受它约束**（见 `proxy::decode_request_body`）：一个压着发的体解开后
+/// 能突破这条线的话，这个上限就等于没有——同一个数只该有一处。
+pub(crate) const PROXY_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 /// 服务共享状态。
 #[derive(Clone)]

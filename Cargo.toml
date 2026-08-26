@@ -1,6 +1,6 @@
 [package]
 name = "coban"
-version = "0.2.36"
+version = "0.2.37"
 edition = "2024"
 
 [dependencies]
@@ -25,28 +25,50 @@ sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter"] }
-# wreq 取代 reqwest：**逐头指定大小写与头序**（`OrigHeaderMap`）是 hyper/reqwest 给不出的
-# 能力，而 codex CLI 发的头有固定的顺序与大小写形态（`chatgpt-account-id`/`originator`/
-# `session_id` 全小写，标准头首字母大写）。类型同源（wreq 转出 `http` crate 的
-# HeaderMap/StatusCode），故 axum 侧与 proxy 的头处理无需转换层。
+# reqwest：**与 codex 同一个 HTTP 栈、同一个大版本**（codex-rs/http-client/Cargo.toml 锁的是
+# 0.12.28）。这不是「挑一个顺手的客户端」，而是指纹这件事上唯一可靠的做法——同栈同版本，
+# ClientHello、HTTP/2 SETTINGS、头序、连接复用行为天然一致，不必去猜「模仿得像不像」。
 #
-# **版本必须钉死**：`"6.0.0-rc.29"` 这种写法会被解析成任意更高的 `6.0.0-rc.N`
-# （pre-release 的 caret 匹配），冒出 rc.30 就可能突然编不过。
+# **默认 feature 一个都不关**（`default-tls`/`charset`/`http2`/`system-proxy`），codex 也没关：
+# 它的 `TlsBackend` 默认档是 `TransportDefault`，即 reqwest 的 `default-tls` = native-tls
+# （Linux 上是系统 OpenSSL，macOS 上是 Security.framework）。codex 依赖里那个
+# `rustls-tls-native-roots` **不是默认路径**，只有自定义 CA 回退那条路才会 `use_rustls_tls()`
+# （codex-rs/http-client/src/route_aware_client_pool.rs）——照着它开 rustls 反而是对着回退路径
+# 抄。coban 没有那条回退，故不带这个 feature，省掉一整个 ring/rustls 的编译。
 #
-# **`tokio-rt` 必须显式带上**：关掉 default-features 会连运行时一起关掉，报错是
-# 「`TcpConnector` 找不到 / `GaiResolver::new` 不存在」，完全指不到 feature 上。
+# **没有 gzip/brotli/zstd/deflate**，与 codex 逐字对齐：没有解压 feature，reqwest 就不会给
+# 请求补 `accept-encoding`，于是官方客户端一个这样的头都不发，上游也就不压。早先 coban 开满
+# 四个再把头钉成 `gzip, br`，注释写着「与官方客户端逐字节一致」——照源码核过，官方那份压根
+# 不存在，那是一条 100% 出现在每条请求上的差异。代价是**上游若真回了压缩体我们读不懂**，
+# 这个赌与 codex 自己下的是同一个（它也没有解压能力），故留了一句告警把静默失效变成日志里
+# 看得见的一行，见 `proxy::warn_if_compressed`。
+#
+# **不开 `native-tls-alpn`，于是这条路走 HTTP/1.1——这是对的，不是漏配。** codex 同样没开
+# （整个 codex-rs 里搜不到这个 feature），而 ALPN 在 native-tls 下正是被它 gate 的
+# （reqwest 的 connect.rs 里那几处 `#[cfg(feature = "native-tls-alpn")]`），没有它就协商不出
+# h2。实测对照过：官方那套配置打 chatgpt.com 回的是 `HTTP/1.1`，而 coban 换栈之前用 wreq
+# 打同一个地址回的是 `HTTP/2.0`——一条比任何 cipher 顺序都响的协议级差异，现在对上了。
+#
+# 后果之一是**头的大小写与顺序重新变得可见**（HTTP/1.1 是文本协议）。这同样不用另想办法：
+# 同一个 hyper 写出来的就是同一种形态。
 #
 # socks：逐账号代理要支持 `socks5://`/`socks5h://`。**不开这个 feature 不是「不支持」而是
-# 「静默走错路」**：wreq 的 socks 分支整段挂在 `#[cfg(feature = "socks")]` 下，没开时一个
-# socks5 的代理 URI 会掉到 HTTP 代理那条路上，按 CONNECT 隧道去连，最后在连接阶段失败，
-# 报错里还只字不提 socks。
+# 「静默走错路」**：socks 分支整段挂在 `#[cfg(feature = "socks")]` 下，没开时一个 socks5 的
+# 代理 URI 会掉到别的分支上，最后在连接阶段失败，报错里还只字不提 socks。这一项 codex 没有
+# （它没有逐账号代理这回事），是 coban 自己要的。
 #
-# gzip/brotli/zstd/deflate：转发时按官方客户端形态声明 `accept-encoding`，上游
-# （Cloudflare）就真的会压——连几百字节的错误体都压，SSE 也不例外。不开这几个 feature
-# 的话响应体是压缩字节，用量嗅探与账号级错误判定全部拿不到数据。四个必须都开：
-# 声明了哪几种，上游就可能挑其中任意一种。解压只发生在收到字节之后，发给上游的请求
-# 逐字节不变（见 clients::upstream_client）。
-wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "gzip", "brotli", "zstd", "deflate", "socks"] }
+# json/stream/cookies：与 codex 那份逐项对齐。
+reqwest = { version = "0.12.28", features = ["cookies", "json", "socks", "stream"] }
+
+# 解**来访请求体**的 zstd。与上面「不带解压 feature」不冲突：那说的是**响应**方向。
+#
+# codex 会把 responses 的请求体 zstd 压了再发（`codex-rs/http-client/src/request.rs` 的
+# `prepare_encoded_json`，level 3），开关是 feature `enable_request_compression`（Stable、
+# **默认开**）+ ChatGPT 登录态 + `provider.info().is_openai()`，而最后那条只比 provider 的
+# `name` 是不是 `"OpenAI"`——照着官方那份 provider 配置改 base_url 指向 coban、`name` 原样
+# 留着，就会打到这条路上。不解的话请求还能转出去（体原样带着 `content-encoding` 走），但
+# coban 这一层解不开它：指纹、会话键、input_len、用量归因全部落空，且日志上看不出原因。
+zstd = "0.13"
 
 [dev-dependencies]
 # 测试 Axum 路由的实际 HTTP 方法匹配行为。

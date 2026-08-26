@@ -266,7 +266,11 @@ pub fn permanent_refresh_error(msg: &str) -> Option<&'static str> {
 const REFRESH_SCOPES: &str = "openid profile email";
 
 /// 用授权码交换 token。`code` 与 `verifier` 必须来自同一次 [`PkceChallenge`]。
-pub async fn exchange_code(client: &wreq::Client, code: &str, verifier: &str) -> Result<TokenSet> {
+pub async fn exchange_code(
+    client: &reqwest::Client,
+    code: &str,
+    verifier: &str,
+) -> Result<TokenSet> {
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -295,7 +299,7 @@ pub async fn exchange_code(client: &wreq::Client, code: &str, verifier: &str) ->
 /// 不是出站客户端的默认头：刷新与转发在上游看来必须是同一台机器。报默认头的话，一个号的
 /// 转发全都来自机器 A、而它的 token 每小时被机器 B 刷一次——真实客户端不会这样。
 pub async fn refresh_token(
-    client: &wreq::Client,
+    client: &reqwest::Client,
     refresh: &str,
     user_agent: &str,
 ) -> Result<TokenSet> {
@@ -312,7 +316,7 @@ pub async fn refresh_token(
 
 /// 向 token 端点发一次表单 POST 并解析响应。
 async fn post_token(
-    client: &wreq::Client,
+    client: &reqwest::Client,
     form: &[(&str, &str)],
     fallback_refresh: Option<&str>,
     user_agent: &str,

@@ -116,6 +116,22 @@ pub async fn handle(
         return resp;
     }
 
+    // 体可能是压着来的（官方客户端会把 responses 的请求体 zstd 压了再发）。**必须解在
+    // plan_request 之前**：解不开的话下面每一步——翻译、规范化、前缀指纹、会话键、
+    // `input_len`——看到的都是一团二进制，而请求照样能转出去，页面上看不出任何异常。
+    let (body, decoded_body) = match decode_request_body(&headers, body) {
+        Ok(v) => v,
+        Err(msg) => {
+            tracing::info!(
+                path = %path,
+                ua = %ua_of(&headers).unwrap_or_default(),
+                reason = %msg,
+                "rejected an incoming request before forwarding"
+            );
+            return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", msg);
+        }
+    };
+
     // 请求体在重试间要重发多次，规范化/翻译只做一次（见 plan_request）。
     // 工具顺序要不要排，见 normalize_tool_order。默认不排。
     let sort_tools = state
@@ -147,8 +163,8 @@ pub async fn handle(
     // ——后者就是上游 prompt cache 的键（见 prefix_parts）。两件事必须用同一个键：
     // 落点变了而 session_id 没变（或反之），缓存照样丢。
     //
-    // 客户端自报的会话 id 优先——那是真的会话身份；实测三个真实 codex 客户端一个都不发，
-    // 所以绝大多数请求靠的是前缀指纹那条路。
+    // 客户端自报的会话 id 优先——那是真的会话身份。官方客户端每条请求都带（`thread-id`
+    // 那族，见 incoming_session_id），第三方接入方大多不带，那时才落到前缀指纹那条路。
     let incoming_session = incoming_session_id(&headers);
     let session_key = incoming_session
         .as_ref()
@@ -171,6 +187,14 @@ pub async fn handle(
         source: incoming_session.as_ref().map_or("fingerprint", |(name, _)| *name),
         headers: header_dump(&headers).into(),
     };
+
+    // 体已经解开，来访那个 `content-encoding` 就不再成立——留着它上游会拿一段没压过的字节
+    // 去解压，换回一句指不到原因的 400。**放在 header_dump 之后**：那行日志要如实反映客户端
+    // 发了什么，摘早了就看不出这条请求本来是压着来的。
+    let mut headers = headers;
+    if decoded_body {
+        headers.remove(header::CONTENT_ENCODING);
+    }
 
     let started = Instant::now();
     let retry_max = state
@@ -556,7 +580,7 @@ async fn forward_once(
 
     let (up, quota) = loop {
         let req = client
-            .request(wreq::Method::from_bytes(method.as_str().as_bytes())?, &url)
+            .request(reqwest::Method::from_bytes(method.as_str().as_bytes())?, &url)
             .headers(fwd_headers.clone())
             .body(fwd_body.clone());
 
@@ -577,6 +601,7 @@ async fn forward_once(
         };
 
         let status = StatusCode::from_u16(up.status().as_u16())?;
+        warn_if_compressed(up.headers());
         let quota = QuotaSnapshot::from_headers(up.headers());
         // 转发路径不关心停没停：这条请求已经在飞，暂停只影响后面的选号。
         let _ = maybe_pause_on_quota(state, cred, &quota);
@@ -860,7 +885,7 @@ async fn collapse_upstream(
     ua: &UaPair,
     session: &SessionCtx,
     chat: Option<&ChatMode>,
-    up: wreq::Response,
+    up: reqwest::Response,
     quota: QuotaSnapshot,
     started: Instant,
 ) -> Response {
@@ -974,7 +999,7 @@ fn stream_upstream(
     ua: &UaPair,
     session: &SessionCtx,
     chat: Option<&ChatMode>,
-    up: wreq::Response,
+    up: reqwest::Response,
     quota: QuotaSnapshot,
     started: Instant,
     in_flight: InFlightGuard,
@@ -1029,7 +1054,7 @@ fn stream_upstream(
                     // 上游流走完还得补收尾：`[DONE]`，或者（流断在终局事件之前时）一条
                     // 错误事件。少了它，客户端会一直等一个不会来的结束标记。
                     futures_util::stream::once(async move {
-                        Ok::<Bytes, wreq::Error>(tail.lock().flush())
+                        Ok::<Bytes, reqwest::Error>(tail.lock().flush())
                     }),
                 ),
             )
@@ -1062,6 +1087,46 @@ struct ChatMode {
     model: String,
     /// 流式收尾要不要补一条只带 usage 的 chunk（`stream_options.include_usage`）。
     include_usage: bool,
+}
+
+/// 来访请求体的 `content-encoding`：认得的就地解开，认不得的原样放过。回的第二项是
+/// 「真的解开过没有」——调用方据此把那个头从转发头里去掉。
+///
+/// **只认 `zstd`**，因为只有它真会出现：codex 把 responses 的请求体 zstd 压了再发
+/// （`codex-rs/http-client/src/request.rs` 的 `prepare_encoded_json`，level 3），触发条件见
+/// Cargo.toml 里 zstd 那条依赖的注。gzip/br 那些没有哪个接入方会拿来压**请求**体，猜着解
+/// 只是多一处能猜错的地方——原样放过，让上游按它自己的规矩判。`identity` 同理。
+///
+/// **头说了 zstd 而内容不是就返回 Err**，不原样放过：那不是我们该替它转圜的形态，交回一句
+/// 指得到字段的 400，好过送上去换一句 `Store must be set to false` 之类看不出因果的报错。
+///
+/// 解出来的大小与「直接发一个没压的体」受**同一条上限**（[`crate::web::PROXY_BODY_LIMIT`]）：
+/// 压缩比可以是几千比一，不封顶的话那个上限等于没有，一个几十 MB 的构造体就能把进程撑爆。
+/// 故这里边解边数，超了当场停手——而不是解完再看多大。
+fn decode_request_body(headers: &HeaderMap, body: Bytes) -> Result<(Bytes, bool), String> {
+    use std::io::Read;
+
+    let Some(enc) = headers.get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()) else {
+        return Ok((body, false));
+    };
+    if !enc.trim().eq_ignore_ascii_case("zstd") {
+        return Ok((body, false));
+    }
+
+    let limit = crate::web::PROXY_BODY_LIMIT;
+    let mut decoder = zstd::stream::read::Decoder::new(body.as_ref())
+        .map_err(|e| format!("could not start decoding the zstd request body: {e}"))?;
+    // 多读一个字节：读满 limit 不代表超了，读到 limit + 1 才是。
+    let mut plain = Vec::new();
+    decoder
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut plain)
+        .map_err(|e| format!("the request body is not valid zstd despite content-encoding: {e}"))?;
+    if plain.len() > limit {
+        return Err(format!("the decompressed request body exceeds the {limit}-byte limit"));
+    }
+    Ok((Bytes::from(plain), true))
 }
 
 /// 决定这条来访请求怎么送上游：翻线格式（chat），还是钉几个字段（responses）。
@@ -2647,7 +2712,9 @@ fn upstream_url(path: &str, query: Option<&str>) -> String {
 enum UaMode {
     /// 来访客户端报什么就发什么（默认，见 [`store::DEFAULT_UPSTREAM_UA_MODE`]）。
     Passthrough,
-    /// 不像官方 codex CLI 的一律改写成这个号派生的那份。
+    /// 不像官方客户端的一律改写成这个号派生的那份。「像不像」的判据抄自 codex 源码，
+    /// 见 [`config::is_first_party_ua`]——第一方不止 CLI 一个，Codex Desktop 与 VS Code
+    /// 扩展也在里面。
     Auto,
     /// 一律改写，不看来访报的是什么。
     Pin,
@@ -2671,7 +2738,7 @@ impl UaMode {
             // 比报错的 UA 更显眼（见 [`config::CODEX_USER_AGENT`]）。
             (_, None) => true,
             (Self::Passthrough, _) => false,
-            (Self::Auto, Some(ua)) => !ua.starts_with(config::UA_PREFIX),
+            (Self::Auto, Some(ua)) => !config::is_first_party_ua(ua),
             (Self::Pin, _) => true,
         }
     }
@@ -2699,13 +2766,13 @@ fn build_forward_headers(
     token: &str,
     fingerprint: &str,
     ua_mode: UaMode,
-) -> wreq::header::HeaderMap {
+) -> reqwest::header::HeaderMap {
     // 改写 UA 的话，与旧 UA 同源的那族留痕头就**一条都不抄进来**：UA 说 codex CLI、
     // `x-stainless-lang` 说 python SDK，这种自相矛盾比两者都老实报 python 更显眼。
     let rewrite_ua =
         ua_mode.rewrites(incoming.get(header::USER_AGENT).and_then(|v| v.to_str().ok()));
 
-    let mut out = wreq::header::HeaderMap::new();
+    let mut out = reqwest::header::HeaderMap::new();
     for (name, value) in incoming.iter() {
         if config::HOP_BY_HOP_HEADERS.contains(&name.as_str()) {
             continue;
@@ -2716,7 +2783,7 @@ fn build_forward_headers(
         out.insert(name.clone(), value.clone());
     }
 
-    let set = |out: &mut wreq::header::HeaderMap, name: &'static str, v: &str| {
+    let set = |out: &mut reqwest::header::HeaderMap, name: &'static str, v: &str| {
         if let Ok(value) = HeaderValue::from_str(v) {
             out.insert(HeaderName::from_static(name), value);
         }
@@ -2743,28 +2810,48 @@ fn build_forward_headers(
     }
     // 会话 id 按账号 + 会话键派生，见 Credential::session_id 的注。
     set(&mut out, "session_id", &cred.session_id(fingerprint));
-    // 解压 feature 开着，声明什么就可能收到什么压缩形态；这一项要与官方客户端一致。
-    set(&mut out, "accept-encoding", config::ACCEPT_ENCODING);
+    // **这里不补 `accept-encoding`**：官方客户端一个都不发（来访那份已在
+    // [`config::HOP_BY_HOP_HEADERS`] 里掐掉），补一个等于替上游打开压缩，而我们没有解压
+    // 能力。见 `clients::upstream_client`。
     if rewrite_ua {
         set(&mut out, "user-agent", &cred.user_agent());
     }
     out
 }
 
-/// 取来访请求自报的会话 id，**连同是哪个头带来的**。codex CLI 用 `session_id` 头，也有客户端
-/// 写成 `x-session-id`。
+/// 取来访请求自报的会话 id，**连同是哪个头带来的**。
+///
+/// **认哪几个名字以 codex 源码为准**：官方客户端发的是**连字符**的 `thread-id` 与
+/// `session-id`（`codex-rs/codex-api/src/requests/headers.rs` 的 `build_session_headers`，
+/// 每条 responses 请求都带），不是下划线的 `session_id`。早先那句「实测三个真实 codex
+/// 客户端一个都不发会话头」是照下划线那个名字找出来的结论——名字对上之后它们条条都带，
+/// 于是这几个客户端不必再靠前缀指纹认会话（而两段开头一样的对话会算出同一个指纹）。
+/// 下划线那族留着不动：第三方接入方（各类 SDK、翻译层）按自己的习惯发。
+///
+/// **`thread-id` 压过 `session-id`**，理由与元数据里那两项**完全相同**（见
+/// [`session_id_in_turn_metadata`]）：subagent 的请求里 `session-id` 是**父对话**那份，
+/// 拿它当键就把父对话与它派出的每个 subagent 钉成一个会话，几段各有各前缀的对话在上游
+/// 共用一份 prompt cache 互相踢。所以 `session-id` 排在元数据**之后**兜底——元数据里的
+/// `thread_id` 比它更接近「哪一段对话」，而两者同时在场时该赢的是 thread。
 ///
 /// 头名要一并回，是因为排错时「客户端到底带没带会话头」只能靠它回答——键本身看不出来源：
 /// 客户端要是发了个 32 位 hex 当会话 id，跟这边算出来的前缀指纹长得一模一样。
 fn incoming_session_id(headers: &HeaderMap) -> Option<(&'static str, String)> {
-    ["session_id", "x-session-id", "conversation_id"]
-        .iter()
-        .find_map(|n| headers.get(*n).map(|v| (*n, v)))
-        .and_then(|(n, v)| v.to_str().ok().map(|s| (n, s.trim().to_owned())))
-        .filter(|(_, s)| !s.is_empty())
+    // 逐个名字找头一个**真的带了值**的。带了个空值就整体判「没有」的话，排在它后面的
+    // 名字连看都看不到——一个发空 `session_id` 的客户端会把自己的 `thread-id` 挡掉。
+    fn first_of(headers: &HeaderMap, names: &[&'static str]) -> Option<(&'static str, String)> {
+        names.iter().find_map(|n| {
+            let v = headers.get(*n)?.to_str().ok()?.trim();
+            (!v.is_empty()).then(|| (*n, v.to_owned()))
+        })
+    }
+
+    first_of(headers, &["thread-id", "session_id", "x-session-id", "conversation_id"])
         // 独立的会话头没有，再去那份 JSON 元数据里翻。顺序不能反：一个明写出来的头是更直接
         // 的声明，而元数据里那几项是我们**认出来**的。
         .or_else(|| session_id_in_turn_metadata(headers))
+        // 最后才轮到 `session-id`：父对话与 subagent 共用的正是它，见上面那条注。
+        .or_else(|| first_of(headers, &["session-id"]))
 }
 
 /// Codex 的前端（Desktop、VS Code 扩展）把会话身份埋在一份 JSON 元数据头里，
@@ -2828,6 +2915,28 @@ const TURN_METADATA_THREAD: &str = "x-codex-turn-metadata.thread_id";
 const REDACTED_HEADERS: [&str; 5] =
     ["authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"];
 
+/// 上游回了压缩体就吼一声。
+///
+/// 转发这条路上**解压是关着的**（见 `clients::upstream_client`），而它本不该出现压缩响应：
+/// 我们一个 `accept-encoding` 都不发。按 RFC 9110 服务端此时仍可自行决定压
+/// 不压，所以这不是「不可能」而是「不该」——官方客户端同样没有解压能力，真压了它一样瞎，
+/// 而它在生产上跑着，这就是最强的证据。
+///
+/// 真发生了的表现是**静默**的：用量嗅探读不到 `usage`、账号级错误判定认不出文案，页面上
+/// 看着一切正常，只是数字不动。这一句把它变成日志里的一行。
+fn warn_if_compressed(headers: &reqwest::header::HeaderMap) {
+    if let Some(enc) = headers.get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok())
+        && !enc.trim().is_empty()
+        && !enc.trim().eq_ignore_ascii_case("identity")
+    {
+        tracing::warn!(
+            content_encoding = %enc,
+            "upstream returned a compressed body; coban cannot decompress it, so usage sniffing \
+             and account-level error detection are blind for this request"
+        );
+    }
+}
+
 /// 来访请求的**全部**头，逐条 `name=value`。
 ///
 /// 全打是刻意的：会话 id 可能藏在任何一个 [`incoming_session_id`] 没认的头名底下，而那时要
@@ -2877,7 +2986,7 @@ impl UaPair {
     ///
     /// 取转发头而不是「按档位再算一遍」：那等于把 [`build_forward_headers`] 里的判定复制
     /// 一份，两处哪天走岔，页面上显示的就不是真的发出去那份。
-    fn of(incoming: &HeaderMap, forwarded: &wreq::header::HeaderMap) -> Self {
+    fn of(incoming: &HeaderMap, forwarded: &reqwest::header::HeaderMap) -> Self {
         let reported = incoming.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
         let sent = forwarded.get("user-agent").and_then(|v| v.to_str().ok());
         Self {
@@ -2946,10 +3055,11 @@ fn value_shape(v: &serde_json::Value) -> String {
 
 /// 按上游响应构造回给客户端的响应头。
 ///
-/// **`content-length` 与 `content-encoding` 都不能照抄**：上游那个长度是压缩后的字节数，
-/// 而我们这一层已经解压过了（wreq 的解压 feature），照抄会让客户端按一个错的长度截断，
-/// 表现为 SSE 流莫名其妙断在中间。
-fn resp_builder(up: &wreq::Response) -> axum::http::response::Builder {
+/// **`content-length` 与 `content-encoding` 都不能照抄**：这条路上的体经常不是上游那一份
+/// ——流被收拢成 JSON、chat 那条还整个换了线格式，照抄那个长度会让客户端按一个错的字节数
+/// 截断，表现为 SSE 流莫名其妙断在中间。`content-encoding` 同理：我们不解压（见
+/// [`warn_if_compressed`]），但重新拼过的体上带着上游那个编码声明只会更糟。
+fn resp_builder(up: &reqwest::Response) -> axum::http::response::Builder {
     let mut builder = Response::builder().status(up.status().as_u16());
     for (name, value) in up.headers().iter() {
         if matches!(
@@ -2964,7 +3074,7 @@ fn resp_builder(up: &wreq::Response) -> axum::http::response::Builder {
 }
 
 /// 把上游的非流式响应原样交回（同样跳过长度/编码头）。
-fn passthrough(status: StatusCode, headers: &wreq::header::HeaderMap, body: Bytes) -> Response {
+fn passthrough(status: StatusCode, headers: &reqwest::header::HeaderMap, body: Bytes) -> Response {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers.iter() {
         if matches!(
@@ -2989,7 +3099,7 @@ fn passthrough(status: StatusCode, headers: &wreq::header::HeaderMap, body: Byte
 /// 重塑一遍只会把它们丢掉。
 fn error_passthrough(
     status: StatusCode,
-    headers: &wreq::header::HeaderMap,
+    headers: &reqwest::header::HeaderMap,
     bytes: Bytes,
     chat: Option<&ChatMode>,
 ) -> Response {
@@ -3198,7 +3308,7 @@ fn detect_stale_encrypted_content(status: StatusCode, body: &[u8]) -> bool {
 }
 
 /// 从 `retry-after` 头取秒数。
-fn retry_after_secs(headers: &wreq::header::HeaderMap) -> Option<i64> {
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<i64> {
     headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
@@ -3238,7 +3348,7 @@ fn detect_usage_limit(body: &[u8]) -> bool {
 /// 全都取不到才退回固定值——猜一个错的恢复时刻，要么让号提前放出来继续撞墙，要么把它多关
 /// 几个小时。
 fn usage_limit_pause_secs(
-    headers: &wreq::header::HeaderMap,
+    headers: &reqwest::header::HeaderMap,
     body: &[u8],
     quota: &QuotaSnapshot,
 ) -> i64 {
@@ -3255,7 +3365,7 @@ fn usage_limit_pause_secs(
 /// 中间那一级是必须的：额度用尽那种 429（`usage_limit_reached`）**常常不给
 /// `retry-after`**，恢复时刻只写在体里，而固定值默认 60 秒——对一个几小时后才回血的号来说
 /// 太短，它一分钟后就回到候选里，把后面每条请求的换号次数又耗在同一个号上一次。
-fn rate_limit_cooldown(state: &AppState, headers: &wreq::header::HeaderMap, body: &[u8]) -> i64 {
+fn rate_limit_cooldown(state: &AppState, headers: &reqwest::header::HeaderMap, body: &[u8]) -> i64 {
     retry_after_secs(headers).or_else(|| reset_hint_secs(body)).unwrap_or_else(|| {
         state.store.get_setting_i64(store::COOLDOWN_SECS, store::DEFAULT_COOLDOWN_SECS)
     })
@@ -3738,7 +3848,7 @@ pub async fn list_models(
         config::CODEX_VERSION
     );
     let sent = client
-        .request(wreq::Method::GET, url)
+        .request(reqwest::Method::GET, url)
         .headers(synthetic_headers(cred, &token, "application/json"))
         .send();
     let up = tokio::time::timeout(MODEL_LIST_TIMEOUT, sent)
@@ -4086,7 +4196,7 @@ pub async fn probe(state: &AppState, cred: &Credential, model: &str) -> ProbeRep
         Err(e) => return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}")),
     };
     let sent = client
-        .request(wreq::Method::POST, upstream_url(PROBE_PATH, None))
+        .request(reqwest::Method::POST, upstream_url(PROBE_PATH, None))
         .headers(probe_headers(cred, &token))
         .body(probe_body(model))
         .send();
@@ -4302,7 +4412,7 @@ fn synthetic_headers(
     cred: &Credential,
     token: &str,
     accept: &'static str,
-) -> wreq::header::HeaderMap {
+) -> reqwest::header::HeaderMap {
     // 合成请求没有来访会话，指纹留空——它们也不该去蹭真实会话的 prompt cache。
     let mut headers = build_forward_headers(&HeaderMap::new(), cred, token, "", UaMode::Pin);
     headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
@@ -4312,7 +4422,7 @@ fn synthetic_headers(
 /// 探测请求（POST）的出站头：公共头 + `content-type`。
 ///
 /// `stream: true` 的响应是 SSE，官方客户端也是这么声明 `accept` 的。
-fn probe_headers(cred: &Credential, token: &str) -> wreq::header::HeaderMap {
+fn probe_headers(cred: &Credential, token: &str) -> reqwest::header::HeaderMap {
     let mut headers = synthetic_headers(cred, token, "text/event-stream");
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers
@@ -4337,7 +4447,7 @@ fn probe_body(model: &str) -> Bytes {
 }
 
 /// 传输层错误的粗分类，进错误文案的方括号里（前端按这个形状本地化）。
-fn upstream_error_kind(e: &wreq::Error) -> &'static str {
+fn upstream_error_kind(e: &reqwest::Error) -> &'static str {
     if e.is_connect() {
         "connect"
     } else if e.is_timeout() {
@@ -4578,7 +4688,7 @@ fn truncate(s: &str) -> String {
 
 impl QuotaSnapshot {
     /// 从上游响应头里解出额度快照。一项都没有时返回一个空快照（调用点据此不覆盖账本）。
-    pub fn from_headers(h: &wreq::header::HeaderMap) -> Self {
+    pub fn from_headers(h: &reqwest::header::HeaderMap) -> Self {
         let s = |name: &str| {
             h.get(name).and_then(|v| v.to_str().ok()).map(str::trim).map(str::to_owned)
         };
@@ -4708,7 +4818,7 @@ mod tests {
         assert!(!detect_usage_limit(b""));
 
         // 暂停时长按体里的恢复提示走（这里是 5 天多），而不是那个 15 分钟的兜底。
-        let none = wreq::header::HeaderMap::new();
+        let none = reqwest::header::HeaderMap::new();
         let empty = QuotaSnapshot::default();
         assert_eq!(usage_limit_pause_secs(&none, exhausted, &empty), 438_570);
         // 体里什么都没写时退回固定值：猜一个错的恢复时刻，要么提前放出来继续撞墙、
@@ -5737,6 +5847,72 @@ mod tests {
         h
     }
 
+    /// 官方客户端会把 responses 的请求体 zstd 压了再发。解不开的后果是**静默降级**——请求
+    /// 照样转出去，指纹、会话键、`input_len`、用量归因却全部落空，页面上看不出异常。
+    #[test]
+    fn a_zstd_request_body_is_decoded_before_anything_looks_at_it() {
+        let plain = br#"{"model":"gpt-5.1-codex","instructions":"i","input":[{"role":"user","content":"hi"}],"store":false,"stream":true}"#;
+        let packed = Bytes::from(zstd::stream::encode_all(&plain[..], 3).unwrap());
+        assert_ne!(packed.as_ref(), &plain[..], "压过的体不该与原体逐字节相同");
+
+        let (out, decoded) =
+            decode_request_body(&hm(&[("content-encoding", "zstd")]), packed).unwrap();
+        assert!(decoded, "解开了就要说解开了——调用方靠它决定摘不摘那个头");
+        assert_eq!(out.as_ref(), &plain[..]);
+
+        // 解开之后规范化那条路才认得它：算得出前缀指纹，也数得出 input 有几项。
+        let n = normalize_responses_body("responses", out, false);
+        assert!(n.prefix.is_some(), "解开的体该算得出前缀指纹");
+        assert_eq!(n.input_len, 1);
+    }
+
+    /// 只有 zstd 才动，别的编码连头带体一起交给上游判——猜着解只是多一处能猜错的地方。
+    #[test]
+    fn other_content_encodings_are_left_alone() {
+        let body = Bytes::from_static(b"{}");
+        for enc in ["identity", "gzip", "br", "gzip, zstd"] {
+            let (out, decoded) =
+                decode_request_body(&hm(&[("content-encoding", enc)]), body.clone()).unwrap();
+            assert!(!decoded, "{enc:?} 不该被当成 zstd");
+            assert_eq!(out, body, "{enc:?}");
+        }
+        let (out, decoded) = decode_request_body(&HeaderMap::new(), body.clone()).unwrap();
+        assert!(!decoded);
+        assert_eq!(out, body);
+
+        // 大小写与两头的空白不算差别：这个头是客户端拼的。这几个都会走进解码那条路，
+        // 而体不是 zstd，于是报错——报错本身就是「认出来了」的证据。
+        for enc in [" zstd ", "ZSTD"] {
+            assert!(
+                decode_request_body(&hm(&[("content-encoding", enc)]), body.clone()).is_err(),
+                "{enc:?} 该被当成 zstd"
+            );
+        }
+    }
+
+    /// 头说 zstd 而内容不是：交回一句指得到字段的 400，不原样放过。
+    #[test]
+    fn a_body_that_lies_about_being_zstd_is_rejected() {
+        let err = decode_request_body(
+            &hm(&[("content-encoding", "zstd")]),
+            Bytes::from_static(br#"{"not":"zstd"}"#),
+        )
+        .unwrap_err();
+        assert!(err.contains("zstd"), "报错要指到 zstd 上: {err}");
+    }
+
+    /// 压缩比可以是几千比一：解出来那份必须与「直接发一个没压的体」受同一条上限，
+    /// 否则那个上限等于没有，一个几十 KB 的构造体就能把进程撑爆。
+    #[test]
+    fn a_zstd_bomb_is_capped_at_the_plain_body_limit() {
+        let limit = crate::web::PROXY_BODY_LIMIT;
+        let packed =
+            Bytes::from(zstd::stream::encode_all(vec![0u8; limit + 1].as_slice(), 3).unwrap());
+        assert!(packed.len() < 1024 * 1024, "这份构造体本身该很小: {} 字节", packed.len());
+        let err = decode_request_body(&hm(&[("content-encoding", "zstd")]), packed).unwrap_err();
+        assert!(err.contains("limit"), "报错要说清是超了上限: {err}");
+    }
+
     /// 会话头认三个名字，而且**要报出是哪一个**——排错时「客户端到底带没带」全靠它，
     /// 键本身看不出来源。空值与只有空白的值不算带。
     #[test]
@@ -5748,6 +5924,22 @@ mod tests {
         assert_eq!(name(&[("x-session-id", "abc")]), Some("x-session-id"));
         assert_eq!(name(&[("conversation_id", "abc")]), Some("conversation_id"));
         assert_eq!(val(&[("session_id", "  abc  ")]), Some("abc".into()), "两头的空白要去掉");
+
+        // 官方客户端发的是这两个**连字符**名字，每条 responses 请求都带
+        // （codex-rs/codex-api/src/requests/headers.rs 的 build_session_headers）。
+        assert_eq!(name(&[("thread-id", "abc")]), Some("thread-id"));
+        assert_eq!(name(&[("session-id", "abc")]), Some("session-id"));
+
+        // 两个都在时取 `thread-id`：`session-id` 在 subagent 的请求里是**父对话**那份，
+        // 取它就把父与子钉成同一个会话键。
+        assert_eq!(
+            incoming_session_id(&hm(&[("session-id", "parent"), ("thread-id", "mine")])),
+            Some(("thread-id", "mine".to_owned())),
+            "thread-id 才是「哪一段对话」"
+        );
+
+        // 带了个空值的名字不该把排在它后面的名字挡掉。
+        assert_eq!(name(&[("session_id", "   "), ("thread-id", "abc")]), Some("thread-id"));
 
         // 带了个空的等于没带：那时该退回前缀指纹，而不是拿空串当会话键去选号。
         assert_eq!(name(&[("session_id", "   ")]), None);
@@ -5837,6 +6029,17 @@ mod tests {
                 ("x-codex-turn-metadata", meta)
             ])),
             Some(("session_id", "explicit".to_owned()))
+        );
+
+        // `session-id` 是个例外，它排在元数据**之后**：这个头与元数据里的 `session_id` 是同一个
+        // 东西（subagent 里都是父对话那份），而元数据里的 `thread_id` 才是这一段自己的。
+        assert_eq!(
+            incoming_session_id(&hm(&[
+                ("session-id", "01a03429-0df2-7a41-9f8a-a564fa9e97a6"),
+                ("x-codex-turn-metadata", subagent)
+            ])),
+            Some((TURN_METADATA_THREAD, "01a03433-351c-7811-bab1-bd8d96b04167".to_owned())),
+            "元数据里的 thread_id 该压过父子共用的 session-id"
         );
 
         // 解不开、缺项、或者只有 turn_id：一律当没有，退回前缀指纹那条路（它本来就在走）。
@@ -6015,6 +6218,8 @@ mod tests {
     #[test]
     fn ua_modes_decide_whether_the_incoming_ua_survives() {
         let official = format!("{}{} (Mac OS 15.6.1; arm64) unknown", config::UA_PREFIX, "0.150.0");
+        let desktop =
+            "Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26200; x86_64) unknown".to_owned();
         let sdk = "OpenAI/Python 1.108.1";
         for (mode, ua, rewrites) in [
             // 没报 UA：三档都补，一个不带 UA 的客户端最显眼。
@@ -6028,8 +6233,19 @@ mod tests {
             (UaMode::Passthrough, Some(official.as_str()), false),
             (UaMode::Auto, Some(official.as_str()), false),
             (UaMode::Pin, Some(official.as_str()), true),
+            // 官方第一方不止 CLI 一个：Desktop、VS Code 扩展、TUI 在 Auto 档同样放过
+            // （名单抄自 codex 源码，见 config::is_first_party_ua）。
+            (UaMode::Auto, Some(desktop.as_str()), false),
+            (UaMode::Auto, Some("codex_vscode/0.5.0 (Mac OS 26.0.1; arm64) vscode"), false),
+            (UaMode::Auto, Some("codex-tui/0.150.0 (Ubuntu 24.04; x86_64) unknown"), false),
+            // Pin 档不看名单，第一方也照改。
+            (UaMode::Pin, Some(desktop.as_str()), true),
             // 挂个官方前缀的壳不算官方客户端：斜杠是判据的一部分。
             (UaMode::Auto, Some("codex_cli_rs_wrapper/1.0"), true),
+            // 斜杠后面空着也不算——没有哪个官方客户端会报这个形态。
+            (UaMode::Auto, Some("codex_cli_rs/"), true),
+            // 少一个空格就不是 Desktop 那一族了。
+            (UaMode::Auto, Some("CodexDesktop/1.0"), true),
         ] {
             assert_eq!(mode.rewrites(ua), rewrites, "{mode:?} + {ua:?}");
         }
@@ -6060,12 +6276,17 @@ mod tests {
         assert_eq!(passed.get("originator").unwrap(), "codex_desktop");
         assert!(passed.get("user-agent").unwrap().to_str().unwrap().starts_with("Codex Desktop/"));
 
-        // 改写档：UA 换成这个号派生的那份，`originator` 跟着收敛，不留下半份旧身份。
-        for mode in [UaMode::Auto, UaMode::Pin] {
-            let out = build_forward_headers(&desktop, &cred, "t", "fp", mode);
-            assert_eq!(out.get("user-agent").unwrap(), cred.user_agent().as_str());
-            assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR, "{mode:?}");
-        }
+        // Auto 档同样放过：Codex Desktop 在官方那份第一方名单里。收敛它只会把 UA 与
+        // `originator` 改成 CLI，而它的 `x-codex-turn-metadata` 与体里的 `client_metadata`
+        // 照旧说自己是 Desktop——半份身份留在原地，比不收敛更显眼。
+        let auto = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Auto);
+        assert_eq!(auto.get("originator").unwrap(), "codex_desktop");
+        assert!(auto.get("user-agent").unwrap().to_str().unwrap().starts_with("Codex Desktop/"));
+
+        // Pin 档一律改写：UA 换成这个号派生的那份，`originator` 跟着收敛。
+        let pinned = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Pin);
+        assert_eq!(pinned.get("user-agent").unwrap(), cred.user_agent().as_str());
+        assert_eq!(pinned.get("originator").unwrap(), config::ORIGINATOR);
 
         // Auto 档遇上真的官方 CLI：UA 放过，`originator` 也跟着放过——判断只有一个。
         let cli = hm(&[
@@ -7229,7 +7450,7 @@ mod tests {
 
     #[test]
     fn quota_snapshot_reads_codex_rate_limit_headers() {
-        let mut h = wreq::header::HeaderMap::new();
+        let mut h = reqwest::header::HeaderMap::new();
         h.insert(config::RL_PRIMARY_USED_PCT, HeaderValue::from_static("93.5"));
         h.insert(config::RL_SECONDARY_USED_PCT, HeaderValue::from_static("12"));
         h.insert(config::RL_CREDITS_UNLIMITED, HeaderValue::from_static("false"));
@@ -7238,7 +7459,7 @@ mod tests {
         assert_eq!(q.peak_used_pct(), Some(93.5));
         assert_eq!(q.credits_unlimited, Some(false));
         assert!(!q.is_empty());
-        assert!(QuotaSnapshot::from_headers(&wreq::header::HeaderMap::new()).is_empty());
+        assert!(QuotaSnapshot::from_headers(&reqwest::header::HeaderMap::new()).is_empty());
     }
 
     /// Clone 也要计数，否则每个副本析构都减一次，在飞数一路减成负数。

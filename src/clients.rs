@@ -15,20 +15,19 @@ use crate::credentials::Credential;
 
 /// 构造发往上游的 HTTP 客户端。
 ///
-/// `default_headers` 里的 `accept-encoding` **必须显式钉住**：开了解压 feature 后，
-/// 底层会给「没带这个头」的请求补一个它自己的取值（顺序与写法都不是官方客户端会产生的）。
+/// **不设 `default_headers`，也一个 `accept-encoding` 都不发**：官方客户端没开任何解压
+/// feature，reqwest 于是不会给请求补这个头（见 Cargo.toml 里 reqwest 那几行注）。这做不到
+/// 靠在这里写一个空值——得让底层压根没有可声明的编码，也就是那几个 feature 真的不在。
+///
+/// TLS 后端就是 reqwest 的默认档（`default-tls` = native-tls），**刻意不调
+/// `use_rustls_tls()`**：codex 的默认档同样是它（`TlsBackend::TransportDefault`），rustls
+/// 在那边只用于自定义 CA 的回退路径。调了反而是对着回退路径抄。
 ///
 /// `proxy` 为 `Some` 时挂上代理，其余形态与直连那份**逐字节相同**——代理只改走法，不改
 /// 请求本身，否则「配了代理的号」就多出一处与别的号不同的指纹。
-pub fn upstream_client(proxy: Option<&str>) -> Result<wreq::Client> {
-    use axum::http::{HeaderMap, HeaderValue, header::ACCEPT_ENCODING};
-
-    let mut defaults = HeaderMap::new();
-    defaults.insert(ACCEPT_ENCODING, HeaderValue::from_static(config::ACCEPT_ENCODING));
-
-    let builder = wreq::Client::builder()
+pub fn upstream_client(proxy: Option<&str>) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .user_agent(config::CODEX_USER_AGENT.as_str())
-        .default_headers(defaults)
         // 流式响应要逐块转出去，池里的连接闲置太久会被上游/中间设备静默断掉，
         // 下一次复用表现为一个没有响应体的连接错误。90 秒短于常见的 idle 超时。
         .pool_idle_timeout(std::time::Duration::from_secs(90));
@@ -41,11 +40,13 @@ pub fn upstream_client(proxy: Option<&str>) -> Result<wreq::Client> {
             // 校验不过就返回 Err，让 [`ClientPool::for_credential`] 把这个号整体判为
             // 不可用；绝不能建出一个「配置里有代理、实际直连」的客户端。
             check_proxy_url(url)?;
-            builder
-                .proxy(wreq::Proxy::all(url).with_context(|| format!("invalid proxy URL: {url}"))?)
+            builder.proxy(
+                reqwest::Proxy::all(url).with_context(|| format!("invalid proxy URL: {url}"))?,
+            )
         }
-        // 不配代理时**不调用 `.no_proxy()`**：保留默认的环境变量代理探测
-        // （HTTPS_PROXY/ALL_PROXY 等），那是全局兜底，与逐账号代理各管一层。
+        // 不配代理时**不调用 `.no_proxy()`**：保留默认的系统代理探测（环境变量
+        // HTTPS_PROXY/ALL_PROXY，以及 reqwest `system-proxy` 那档的系统设置），那是全局兜底，
+        // 与逐账号代理各管一层。codex 的默认档同样不关它（`ProxyRouting::TransportDefault`）。
         None => builder,
     };
     builder.build().context("failed to build the upstream HTTP client")
@@ -87,13 +88,13 @@ pub fn validate_proxy(raw: &str) -> Result<String> {
         matches!(uri.path(), "" | "/") && uri.query().is_none(),
         "the proxy URL must not have a path or query: {url}"
     );
-    wreq::Proxy::all(&url).with_context(|| format!("invalid proxy URL: {url}"))?;
+    reqwest::Proxy::all(&url).with_context(|| format!("invalid proxy URL: {url}"))?;
     Ok(url)
 }
 
 /// 校验一条代理 URL 会不会被**真正当成代理**，成功时返回解析出的 URI。
 ///
-/// **为什么 `wreq::Proxy::all` 成功还不够**：那一步只要求「能解析成 `Uri`、且 scheme 与
+/// **为什么 `reqwest::Proxy::all` 成功还不够**：那一步只要求「能解析成 `Uri`、且 scheme 与
 /// authority 都在」，它连 scheme 是不是代理协议都不看。真正决定代理生不生效的是库内部的
 /// 环境 URI 解析，它认不出来时**返回 `None` 而不报错**，`build()` 照样成功，于是拿到一个
 /// 「配置里有代理、实际没有代理」的客户端：请求带着真实 IP 直连打上游，日志上完全看不出来。
@@ -134,8 +135,8 @@ fn check_proxy_url(url: &str) -> Result<axum::http::Uri> {
 /// 缓存的理由不是省内存而是**连接复用**：每次现建一个客户端等于每条请求都重新握手，
 /// TLS 指纹倒是没变，但连接建立的时序模式与真实客户端完全不同，且慢得多。
 pub struct ClientPool {
-    direct: wreq::Client,
-    by_proxy: parking_lot::Mutex<HashMap<String, Arc<wreq::Client>>>,
+    direct: reqwest::Client,
+    by_proxy: parking_lot::Mutex<HashMap<String, Arc<reqwest::Client>>>,
 }
 
 impl ClientPool {
@@ -147,7 +148,7 @@ impl ClientPool {
     }
 
     /// 取直连客户端（登录换 token 这类还没有凭证的场景用）。
-    pub fn direct(&self) -> &wreq::Client {
+    pub fn direct(&self) -> &reqwest::Client {
         &self.direct
     }
 
@@ -155,7 +156,7 @@ impl ClientPool {
     ///
     /// **配了代理却建不出客户端时返回 Err，绝不退回直连**——退回直连就是拿真实 IP 去打
     /// 上游，恰恰是配代理要避免的事，而且从日志上看这条请求「成功了」。
-    pub fn for_credential(&self, cred: &Credential) -> Result<Arc<wreq::Client>> {
+    pub fn for_credential(&self, cred: &Credential) -> Result<Arc<reqwest::Client>> {
         let Some(proxy) = cred.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
             return Ok(Arc::new(self.direct.clone()));
         };
@@ -182,6 +183,36 @@ mod tests {
             "socks5h://user:pw@h.example:1080"
         );
         assert_eq!(validate_proxy("  http://h.example:8080  ").unwrap(), "http://h.example:8080");
+    }
+
+    /// 「不发 `accept-encoding`」这件事只有**看字节**才算数：它不是我们写进去的一个值，
+    /// 而是「底层没有可声明的编码」这个状态的副产物，任何人给客户端加回一个解压开关都会让
+    /// 它悄悄冒出来。故这条测试起一个真的监听端口，把请求原文读出来断言。
+    ///
+    /// 同时钉住 UA：没有凭证语境时这条路上的身份就是那份画像。
+    #[tokio::test]
+    async fn the_upstream_client_announces_no_accept_encoding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = upstream_client(None).unwrap();
+        client.get(format!("http://{addr}/whatever")).send().await.unwrap();
+        let req = server.await.unwrap();
+
+        assert!(
+            !req.to_ascii_lowercase().contains("accept-encoding"),
+            "官方客户端一个 accept-encoding 都不发，这条请求里却有:\n{req}"
+        );
+        assert!(req.contains(config::UA_PREFIX), "UA 该是那份画像:\n{req}");
     }
 
     /// 这些全是「`Proxy::all` 会成功、代理却不生效」的形态，必须在入库时就拒掉。

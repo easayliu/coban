@@ -413,8 +413,9 @@ pub const UPSTREAM_UA_MODE: &str = "upstream_ua_mode";
 /// 什么时候该开到 `1`：接入方里有 OpenAI SDK、各种翻译类客户端那一类——它们不发
 /// `originator`，只能拿到补位的 CLI 那份，于是「`originator` 说 codex CLI、UA 说
 /// OpenAI/Python」；走 `/v1/chat/completions` 那条路（体被翻成 Responses 形状）更是必然如此。
-/// 反过来，接入方是 codex CLI 与 Codex Desktop 这类自带完整身份的官方前端时，`0` 才是对的：
-/// 它们的头与体本来就自相一致，收敛反而把体（`client_metadata` 那些）落单。
+/// 反过来，接入方是 codex CLI 与 Codex Desktop 这类自带完整身份的官方前端时，收敛只会把体
+/// （`client_metadata` 那些）落单——但那不必靠这个开关躲：`1` 档按官方那份第一方名单
+/// （见 [`crate::config::is_first_party_ua`]）本来就放它们过去，两档在这类接入方上同解。
 ///
 /// `2` 留给「确定只有翻译类客户端接入」的场景：来访 UA 确实是 `codex_cli_rs/*` 时透传是
 /// 对的——那客户端报的版本号可能比 [`crate::config::CODEX_VERSION`] 这个写死的常量更新，
@@ -1755,11 +1756,11 @@ impl CredentialStore {
 /// 话，token 其实已经轮换，拿同一个再试一次得到的是 `refresh_token_reused`，于是一个健康
 /// 账号被我们自己的重试判成永久失效。
 ///
-/// 故重试条件收窄到「连上游都没连上」——`wreq` 的 connect 类错误。那种情形下上游不可能
+/// 故重试条件收窄到「连上游都没连上」——`reqwest` 的 connect 类错误。那种情形下上游不可能
 /// 处理过这个 token，重试是安全的。收到了任何 HTTP 响应（含 5xx）就不再重试：那说明请求
 /// 确实到达了，重试的收益远小于废掉一个号的代价。
 async fn refresh_with_retry(
-    client: &wreq::Client,
+    client: &reqwest::Client,
     refresh_token: &str,
     user_agent: &str,
 ) -> Result<crate::oauth::TokenSet> {
@@ -1789,10 +1790,10 @@ async fn refresh_with_retry(
 
 /// 这个错误是不是「压根没连上上游」。
 ///
-/// 判据只认 `wreq::Error::is_connect()`：超时（`is_timeout`）**刻意不算**——读超时时请求
+/// 判据只认 `reqwest::Error::is_connect()`：超时（`is_timeout`）**刻意不算**——读超时时请求
 /// 很可能已经被上游处理过了，重试就是拿一个已轮换的 token 去撞 `refresh_token_reused`。
 fn is_connect_error(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<wreq::Error>().is_some_and(wreq::Error::is_connect))
+    e.chain().any(|c| c.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect))
 }
 
 // ---------- 用量 ----------

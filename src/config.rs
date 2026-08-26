@@ -107,9 +107,48 @@ pub const CODEX_VERSION: &str = "0.148.0";
 
 /// 官方客户端 `User-Agent` 的固定前缀（[`ORIGINATOR`] 加一个斜杠）。
 ///
-/// 判「这条来访 UA 像不像官方客户端」用它，见 `proxy::UaMode`。要带上斜杠：少了它，
-/// `codex_cli_rs_wrapper/1.0` 这种也会被当成官方客户端放过去。
+/// 只管**拼**这个号派生的那份（见 [`user_agent`]）。判「来访 UA 像不像官方客户端」不要用它
+/// ——那是 [`is_first_party_ua`] 的事，官方第一方客户端不止 CLI 一个。
 pub const UA_PREFIX: &str = "codex_cli_rs/";
+
+/// 除 [`ORIGINATOR`] 之外，官方认的第一方 `originator` 取值。
+///
+/// **抄的是 codex 源码里那份判据**，不是自己列的：
+/// `codex-rs/login/src/auth/default_client.rs` 的 `is_first_party_originator`
+/// ——`codex_cli_rs` | `codex-tui` | `codex_vscode` | 以 `"Codex "` 开头（Codex Desktop
+/// 那一族，后面还跟着产品名）。
+///
+/// 自己列一份的代价上一版吃过：只认 `codex_cli_rs/` 一个前缀，Codex Desktop 就被判成
+/// 「不像官方客户端」，Auto 档把它的 UA 与 `originator` 收敛成 CLI 那份，而它的
+/// `x-codex-turn-metadata` 与体里的 `client_metadata` 照旧说自己是 Desktop——半份身份留在
+/// 原地，正是 [`UA_REWRITE_STRIPPED_HEADERS`] 那条注在防的那种自相矛盾。
+const FIRST_PARTY_ORIGINATORS: &[&str] = &["codex-tui", "codex_vscode"];
+
+/// Codex Desktop 那一族 `originator` 的前缀（注意带空格），见 [`FIRST_PARTY_ORIGINATORS`]。
+const FIRST_PARTY_ORIGINATOR_PREFIX: &str = "Codex ";
+
+/// 这个 `originator` 是不是官方第一方客户端。判据来源见 [`FIRST_PARTY_ORIGINATORS`]。
+pub fn is_first_party_originator(originator: &str) -> bool {
+    originator == ORIGINATOR
+        || FIRST_PARTY_ORIGINATORS.contains(&originator)
+        || originator.starts_with(FIRST_PARTY_ORIGINATOR_PREFIX)
+}
+
+/// 这条来访 `User-Agent` 像不像官方客户端，见 `proxy::UaMode` 的 Auto 档。
+///
+/// 官方 UA 的拼法是 `{originator}/{版本} ({OS} {版本}; {arch}) {终端}`
+/// （`codex-rs/login/src/auth/default_client.rs` 的 `get_codex_user_agent`，与 [`user_agent`]
+/// 拼的是同一个形状），所以**头一个斜杠之前那段就是 `originator`**，拿它去过官方那份判据。
+///
+/// **斜杠是判据的一部分**：`codex_cli_rs_wrapper/1.0` 这种挂壳的切出来是
+/// `codex_cli_rs_wrapper`，与 `codex_cli_rs` 不是一回事，正好被拒；而斜杠后面必须真有东西，
+/// 一个光秃秃的 `codex_cli_rs/` 不是任何官方客户端会报的形态。
+pub fn is_first_party_ua(ua: &str) -> bool {
+    match ua.split_once('/') {
+        Some((originator, rest)) => !rest.is_empty() && is_first_party_originator(originator),
+        None => false,
+    }
+}
 
 /// 逐号派生 UA 用的「机器画像」表：`(OS 名与版本, arch, 终端)`。
 ///
@@ -177,14 +216,6 @@ pub const UA_REWRITE_STRIPPED_HEADERS: &[&str] = &["openai-organization", "opena
 /// 逐个列等于跟着上游 SDK 的版本追，按前缀一次清干净。
 pub const UA_REWRITE_STRIPPED_PREFIXES: &[&str] = &["x-stainless-"];
 
-/// `Accept-Encoding`：与官方客户端逐字节一致。
-///
-/// **声明了就一定会被压。** 上游（Cloudflare）连几百字节的错误体都压，
-/// `text/event-stream` 也不例外。这个常量与 Cargo.toml 里 wreq 的
-/// gzip/brotli/zstd/deflate 四个 feature **是一套的，动其一必须动其二**——否则响应体
-/// 是读不懂的压缩字节，用量统计、计价、账号级错误判定整片失效。
-pub const ACCEPT_ENCODING: &str = "gzip, br";
-
 // ---------- 上游限流头 ----------
 
 /// 「主」「次」是**这两组头的名字，不是窗口的名字**——别按名字猜窗口长度。
@@ -228,6 +259,8 @@ pub const RL_CREDITS_BALANCE: &str = "x-codex-credits-balance";
 /// - **逐跳类**（`host`/`connection`/`content-length`/`transfer-encoding` 等）：描述的是
 ///   「来访这一跳」的连接，与发往上游那一跳无关。`content-length` 尤其致命——改写过 body
 ///   之后它就是个错的长度，上游按它截断请求体，报错是一句指不到原因的 400。
+///   `accept-encoding` 在这一族里的理由是**官方客户端一个都不发**（见 Cargo.toml 里
+///   reqwest 那几行注）：抄来访那份等于替上游打开压缩，而我们没有解压能力。
 /// - **中间层留痕类**（`x-forwarded-*`/`via`/`forwarded`）：把「这条请求经过了代理」
 ///   直接写在头里，与整个转发形态的目标相反。
 pub const HOP_BY_HOP_HEADERS: &[&str] = &[

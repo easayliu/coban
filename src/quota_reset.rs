@@ -197,7 +197,7 @@ fn finish_query(
 async fn prepare(
     state: &AppState,
     cred: &Credential,
-) -> Result<(std::sync::Arc<wreq::Client>, String)> {
+) -> Result<(std::sync::Arc<reqwest::Client>, String)> {
     let client = state.clients.for_credential(cred)?;
     let token = state.store.valid_access_token(&state.clients, cred).await?;
     Ok((client, token))
@@ -205,14 +205,14 @@ async fn prepare(
 
 /// 发一条 wham 请求并读完响应体。`body` 为 `Some` 时是 POST。
 async fn fetch(
-    client: &wreq::Client,
+    client: &reqwest::Client,
     cred: &Credential,
     token: &str,
     path: &str,
     body: Option<Bytes>,
 ) -> Result<Bytes> {
     let url = format!("{}/{}", config::WHAM_BASE, path.trim_start_matches('/'));
-    let method = if body.is_some() { wreq::Method::POST } else { wreq::Method::GET };
+    let method = if body.is_some() { reqwest::Method::POST } else { reqwest::Method::GET };
     let mut req = client.request(method, &url).headers(wham_headers(cred, token, body.is_some()));
     if let Some(body) = body {
         req = req.body(body);
@@ -249,8 +249,8 @@ async fn fetch(
 ///
 /// UA 取**这个号派生的那份**（[`Credential::user_agent`]），与转发、刷新报的是同一台机器
 /// ——这一族接口跟转发用的是同一个账号身份，报两台机器等于凭空多一处对不上的地方。
-fn wham_headers(cred: &Credential, token: &str, post: bool) -> wreq::header::HeaderMap {
-    let mut out = wreq::header::HeaderMap::new();
+fn wham_headers(cred: &Credential, token: &str, post: bool) -> reqwest::header::HeaderMap {
+    let mut out = reqwest::header::HeaderMap::new();
     let mut set = |name: &'static str, v: &str| {
         if let Ok(value) = HeaderValue::from_str(v) {
             out.insert(HeaderName::from_static(name), value);
@@ -263,7 +263,10 @@ fn wham_headers(cred: &Credential, token: &str, post: bool) -> wreq::header::Hea
     set("originator", config::WHAM_ORIGINATOR);
     set("oai-language", "zh-CN");
     set("accept", "application/json");
-    set("accept-encoding", config::ACCEPT_ENCODING);
+    // **不发 `accept-encoding`**：与转发那条路同一个理由，coban 整个没有解压能力
+    // （见 `clients::upstream_client`）。这一族是桌面端的接口、而桌面端是 Electron，
+    // 真实的 Chromium 一定会发这个头——这里对不上是**明知的**：声明了就会被压，而压了我们
+    // 读不懂，那条路上的响应体是要解析出券张数的。宁可少一个头，不要一段读不懂的字节。
     set("user-agent", &cred.user_agent());
     set("sec-fetch-site", "none");
     set("sec-fetch-mode", "no-cors");
