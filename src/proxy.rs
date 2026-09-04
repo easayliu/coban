@@ -3830,8 +3830,8 @@ struct ModelListResponse {
 /// 不消耗额度（是个 GET，不产生 token），也不写用量流水。
 ///
 /// **`client_version` 决定上游返回什么**：报 [`config::CODEX_VERSION`]。实测报 `0.98.0`
-/// 只回 3 个模型、报 `0.148.0` 回 9 个——上游按客户端版本裁剪，所以那个常量落后的表现是
-/// 「下拉里少一大半」，不只是指纹旧。
+/// 只回 3 个模型、报 `0.148.0` 回 9 个、`gpt-6-astra` 要报 0.153 起的版本才给——上游按
+/// 客户端版本裁剪且不报错，所以那个常量落后的表现是「下拉里少模型」，不只是指纹旧。
 pub async fn list_models(
     state: &AppState,
     cred: &Credential,

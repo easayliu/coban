@@ -96,14 +96,16 @@ pub const ORIGINATOR: &str = "codex_cli_rs";
 /// 官方客户端版本号，随 `User-Agent` 与 `x-codex-*` 一起报给上游。
 ///
 /// 落后不致命——真实用户升级也有先后——但落得太多就成了「一个几个月没升级过的客户端在
-/// 不停发请求」。取最近一次核对过的发行版（`@openai/codex` 0.148.0，与本机
-/// `~/.codex/models_cache.json` 里的 `client_version` 一致）。
+/// 不停发请求」。取最近一次核对过的发行版（`@openai/codex` 0.153.4，npm `latest`，
+/// 2026-09-05 核对）。
 ///
 /// **它还决定上游给出的模型清单**：[`MODELS_PATH`] 要求带 `client_version` 查询参数，
 /// 上游按它裁剪返回哪些模型——实测报 `0.98.0` 只回 3 个（`gpt-5.4`/`gpt-5.4-mini`/
-/// `codex-auto-review`），报 `0.148.0` 才回全部 9 个。所以这个常量落后的表现不只是指纹旧，
-/// 而是**连通性测试的模型下拉里少一大半模型**。
-pub const CODEX_VERSION: &str = "0.148.0";
+/// `codex-auto-review`），报 `0.148.0` 回 9 个，而 `gpt-6-astra` 上线后**只对 0.153 起的
+/// 版本放出**：本机 codex CLI 用 0.153.0 拉到的清单里有它，coban 报 0.148.0 拉到的没有。
+/// 所以这个常量落后的表现不只是指纹旧，而是**连通性测试的下拉与对外 `/v1/models` 都缺
+/// 新模型**，且没有任何报错——上游只是安静地少给几条。官方一上新模型就该回来核这一行。
+pub const CODEX_VERSION: &str = "0.153.4";
 
 /// 官方客户端 `User-Agent` 的固定前缀（[`ORIGINATOR`] 加一个斜杠）。
 ///
