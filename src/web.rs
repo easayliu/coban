@@ -104,7 +104,8 @@ pub async fn run(
     let public = Router::new()
         .route("/auth/state", get(auth::state))
         .route("/auth/login", post(auth::login))
-        .route("/auth/setup", post(auth::setup));
+        .route("/auth/setup", post(auth::setup))
+        .route("/ratio_config", get(ratio_config));
 
     // 需管理鉴权的接口（未设密码时中间件放行）。
     let protected = Router::new()
@@ -1274,6 +1275,22 @@ async fn set_session_lease_secs(
     Json(req): Json<IntReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     set_int_setting(state, store::SESSION_LEASE_SECS, req.value, 0..=86_400).await
+}
+
+// ---------- 给别的网关看的价目表 ----------
+
+/// new-api「同步上游倍率」拉的价目表（`GET /api/ratio_config`）。
+///
+/// **公开、不鉴权**：内容是 OpenAI 公开价目表的转写（见 [`crate::pricing::ratio_config`]），
+/// 不含任何账号或用量信息；而调用方是另一台网关的后台任务，拿不到也不该拿 coban 的管理
+/// 登录态。外层 `success`/`message`/`data` 三个字段是 new-api 全部接口的统一信封，
+/// 它的解析器先看 `success` 再拆 `data`，缺一个都算「无法解析上游返回数据」。
+async fn ratio_config() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "success": true,
+        "message": "",
+        "data": crate::pricing::ratio_config(),
+    }))
 }
 
 // ---------- 杂项 ----------
