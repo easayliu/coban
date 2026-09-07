@@ -71,9 +71,9 @@ pub const REFRESH_LEEWAY_SECS: u64 = 300;
 ///   `crate::proxy::pins_sse_accept` 刻意只钉 `responses` 一条路径；体也不该被钉成
 ///   `stream: true`，而 `normalize_responses_body` 同样只认那一条精确路径。两处的「只此一条」
 ///   合起来正是这条路径能原样通过的原因——改任何一处的判据之前先想清楚这一点。
-/// - `alpha/search`：独立的搜索协议。官方那边它**不带** `openai-beta`/会话头/Responses Lite
-///   那几个头（`sub2api` 的 `stripOpenAIAlphaSearchResponsesHeaders` 抄的就是这条），而 coban
-///   目前会把自己派生的 `session_id` 一起带上去——形态上有出入，实测尚未见它因此被拒。
+/// - `alpha/search`：独立的搜索协议，见 [`ALPHA_SEARCH_PATH`]。官方那边它一个会话头都不发，
+///   所以 coban 在这条路上也不补（见 `crate::proxy::RequestPlane`）——早先是无条件按推理面
+///   补 `session_id`，那是这条路上官方从不发的头。
 ///
 /// **WS 那条路刻意没做**：官方客户端从 0.15x 起对 `chatgpt.com` 走
 /// `wss://chatgpt.com/backend-api/codex/responses`（`codex-rs/core/src/client.rs` 的
@@ -84,6 +84,14 @@ pub const REFRESH_LEEWAY_SECS: u64 = 300;
 /// ——也就是 false。所以这条差距只存在于「coban 与上游之间」这一跳，客户端看不见，
 /// 而补上它要实现整套 WS 帧协议与连接池。
 pub const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
+
+/// 独立搜索端点（`UPSTREAM_BASE` 之后那一段）。
+///
+/// 它**不是 `responses` 的子请求**，而是官方 `SearchClient` 的一套独立协议
+/// （`codex-rs/codex-api/src/endpoint/search.rs`：一个普通的 `execute(POST, …)`，既不钉
+/// `accept`、也不设请求压缩、更不带会话头）。coban 只需要在这条路上**别自己加东西**，
+/// 见 [`crate::proxy`] 的 `RequestPlane`。
+pub const ALPHA_SEARCH_PATH: &str = "alpha/search";
 
 /// 模型清单端点（`UPSTREAM_BASE` 之后那一段）。
 ///

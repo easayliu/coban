@@ -145,7 +145,11 @@ pub async fn handle(
         .store
         .get_setting_i64(store::FILL_BASE_INSTRUCTIONS, store::DEFAULT_FILL_BASE_INSTRUCTIONS)
         != 0;
-    let base = |model: &str| fill_base.then(|| base_instructions_for(&state, model)).flatten();
+    // 客户端声明了 Responses Lite 就一律不补：理由同 [`fill_base_instructions`] 里那道守卫，
+    // 两处判据（头与体）各守一侧。
+    let lite = declares_responses_lite(&headers);
+    let base =
+        |model: &str| (fill_base && !lite).then(|| base_instructions_for(&state, model)).flatten();
     let Normalized { body, collapse, chat, prefix, input_len, hint, client_ids } =
         match plan_request(&path, body, sort_tools, &base) {
             Ok(n) => n,
@@ -548,6 +552,7 @@ async fn forward_once(
         session_key.unwrap_or_default(),
         ua_mode,
         hint,
+        RequestPlane::of(upstream_path),
     );
     // 客户端回带的 turn-state 若已知是别的号铸的，就地摘掉（见 [`TurnStateMemo`]）。
     guard_turn_state_echo(&state.turn_state, &mut fwd_headers, session_key, cred.id);
@@ -619,10 +624,24 @@ async fn forward_once(
     let mut rate_limit_wait = RateLimitWait::from_settings(&state.store);
 
     let (up, quota) = loop {
+        // 官方客户端把 `responses` 的请求体压了再发，见 [`compress_request_body`]。
+        //
+        // **压在循环里面**：`fwd_body` 会在重试之间被改写（摘掉解不开的密文、修 `input` 里的
+        // 坏项、按号收敛身份），每次真的发出去的都得是当下那一份的压缩结果。重试很少，
+        // 多压一次的代价可以忽略。
+        let mut req_headers = fwd_headers.clone();
+        let wire_body = match compress_request_body(upstream_path, &fwd_body, &req_headers) {
+            Some(compressed) => {
+                req_headers
+                    .insert(reqwest::header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+                compressed
+            }
+            None => fwd_body.clone(),
+        };
         let req = client
             .request(reqwest::Method::from_bytes(method.as_str().as_bytes())?, &url)
-            .headers(fwd_headers.clone())
-            .body(fwd_body.clone());
+            .headers(req_headers)
+            .body(wire_body);
 
         let up = match req.send().await {
             Ok(r) => r,
@@ -1400,6 +1419,83 @@ fn decode_request_body(headers: &HeaderMap, body: Bytes) -> Result<(Bytes, bool)
     Ok((Bytes::from(plain), true))
 }
 
+/// 这条请求打在上游的哪一族端点上。**同一族里各条路的形态不一样**，而差别不是我们定的：
+/// 官方客户端对每条路各有一套发法（`codex-rs/codex-api/src/endpoint/` 下一个文件一条路）。
+///
+/// 分出这个类型是因为「哪些头该由 coban 补」只有按路径才回答得了：从前一律按 `responses`
+/// 那条路补（会话 id 一直是无条件补的），于是搜索请求上多了一个官方在那条路上从不发的头。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestPlane {
+    /// `responses`：推理面。SSE、压体、会话头、路由提示，全套都在这条路上。
+    Responses,
+    /// `alpha/search`：独立的搜索协议，见 [`config::ALPHA_SEARCH_PATH`]。
+    AlphaSearch,
+    /// 其余（`models`、`responses/compact` 等）：只走那套共用的身份头。
+    Other,
+}
+
+impl RequestPlane {
+    fn of(upstream_path: &str) -> Self {
+        match upstream_path.trim_start_matches('/') {
+            p if p == config::RESPONSES_PATH => Self::Responses,
+            p if p == config::ALPHA_SEARCH_PATH => Self::AlphaSearch,
+            _ => Self::Other,
+        }
+    }
+
+    /// 这条路上该不该由 coban 补会话类的头（`session_id` 与 `x-codex-routing-hint`）。
+    ///
+    /// **只有推理面该补**。官方的 `SearchClient` 在搜索那条路上一个会话头都不发
+    /// （见 [`config::ALPHA_SEARCH_PATH`]），补上去等于给一条无会话的请求安一个会话身份；
+    /// `models` 那类同理。
+    fn carries_session(self) -> bool {
+        self == Self::Responses
+    }
+}
+
+/// 把请求体压成官方客户端发出去的那个形态：zstd level 3。压不了就回 `None`（原体照发）。
+///
+/// **依据在客户端源码里，且没有大小阈值**：`codex-rs/http-client/src/request.rs` 的
+/// `prepare_encoded_json` 只要 `compression != None` 就整体压一遍，level 写死 3，并挂上
+/// `content-encoding: zstd`。而那个开关（`core/src/client.rs` 的
+/// `responses_request_compression`）是 feature `enable_request_compression`（默认开）+
+/// **ChatGPT 登录态** + `provider.info().is_openai()` 三个条件——coban 这一跳三条全中：它拿着
+/// 订阅 token 打 chatgpt.com。也就是说**每一条**真实的 responses 请求体都是压着到上游的，
+/// 而 coban 从前发的是明文。
+///
+/// coban 早就在解**来访**那一侧的 zstd（见 Cargo.toml 里 zstd 那条依赖的注：客户端把
+/// base_url 指过来时压的就是它），这一步是把同一件事补齐在出站那一侧。
+///
+/// 三种情况不压：
+/// - **不是 `responses` 那条路径**。`responses/compact` 与 `alpha/search` 都走
+///   `execute`/`compact`，两处都没设 `req.compression`（默认 `None`），也就是官方客户端在这两
+///   条路上发的是明文——压了反倒成了独有形态。
+/// - **体是空的**（`models` 那类 GET）：压一段空字节没有意义。
+/// - **头上已经有 `content-encoding`**：那是来访自报的一种我们没解开的编码（只有 zstd 会被
+///   解，见 [`decode_request_body`]）。再套一层 zstd 就是让那个头说谎。
+///
+/// 压缩本身失败（几乎只可能是内存不够）时也回 `None`：宁可发一份明文，不该为一个形态优化
+/// 把请求判死。
+fn compress_request_body(
+    upstream_path: &str,
+    body: &Bytes,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Bytes> {
+    if body.is_empty()
+        || upstream_path.trim_start_matches('/') != config::RESPONSES_PATH
+        || headers.contains_key(reqwest::header::CONTENT_ENCODING)
+    {
+        return None;
+    }
+    match zstd::stream::encode_all(std::io::Cursor::new(body.as_ref()), 3) {
+        Ok(compressed) => Some(Bytes::from(compressed)),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not zstd the request body; sending it as-is");
+            None
+        }
+    }
+}
+
 /// 发往这条上游路径的请求要不要把 `accept` 钉成 `text/event-stream`。
 ///
 /// **`responses` 那条路径一律钉，不看来访报的是什么。**
@@ -1646,6 +1742,51 @@ fn ensure_reasoning_include(obj: &mut serde_json::Map<String, serde_json::Value>
     true
 }
 
+/// 官方那个「这条请求走 Responses Lite」的头。
+const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+
+/// `input` 里那种「工具挂在消息项上」的项类型——Lite 形态独有，见 [`declares_responses_lite`]。
+const ADDITIONAL_TOOLS_ITEM: &str = "additional_tools";
+
+/// 这条请求是不是客户端自己声明的 **Responses Lite**。
+///
+/// Lite 是上游给新模型的一套线形态，**当前上游九个模型里六个都是它**（本机
+/// `~/.codex/models_cache.json`：`gpt-6-astra`、全部 `gpt-5.6-*`、`codex-auto-review` 的
+/// `use_responses_lite` 都是 `true`；`gpt-5.5`/`gpt-5.4-mini`/`gpt-5.3-codex-spark` 不是）。
+/// 客户端按清单里那一项决定走哪套（`codex-rs/core/src/client.rs` 的
+/// `build_responses_request`），两套的差别不小：
+///
+/// ```text
+/// 经典： instructions=<基座提示>  tools=[…]           parallel_tool_calls=<客户端的>
+/// Lite： instructions=""          tools=None          parallel_tool_calls=false
+///        基座提示改成 input 里一条 developer 消息，工具改成 input 里一条 additional_tools 项
+///        另带 x-openai-internal-codex-responses-lite: true
+/// ```
+///
+/// **coban 不做两套之间的转换**，理由是转换的收益归零而风险实在：真实 codex 客户端自己就按
+/// 清单发对了形态，透传即正确；而第三方客户端发的是整份经典形态（顶层 tools、非空
+/// instructions、自己的 parallel_tool_calls），上游照收——把其中**半份**改成 Lite 反而拼出一个
+/// 谁都产生不出来的混合体，正是这份代码一贯在防的那种半透半收。要做就得整份转（含把工具搬进
+/// `input`、把回程那侧的项还原回去），那是另一个功能，且做错的代价是这些模型条条 400。
+///
+/// 认它是为了**别把客户端已经发对的形态改坏**：判据取两处，一处是那个头，一处是体里那条
+/// `additional_tools` 项（没发头但发了 Lite 体的客户端也认得出来）。
+fn declares_responses_lite(headers: &HeaderMap) -> bool {
+    headers
+        .get(RESPONSES_LITE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
+
+/// 体里有没有 Lite 形态独有的那条 `additional_tools` 项，见 [`declares_responses_lite`]。
+fn body_declares_responses_lite(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("input").and_then(|v| v.as_array()).is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some(ADDITIONAL_TOOLS_ITEM))
+    })
+}
+
 /// 客户端一句系统意图都没给时，补上**这个模型的官方基座提示**。回「是否真的补过」。
 ///
 /// 官方客户端的 `instructions` 里装的不是一句人格，而是那个模型的整份基座提示（一万到两万
@@ -1671,6 +1812,13 @@ fn fill_base_instructions(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     base: BaseInstructions<'_>,
 ) -> bool {
+    // 客户端自己发的是 Lite 形态：那条路上 `instructions` **空着才是官方形态**（基座提示改走
+    // `input` 里一条 developer 消息，见 [`declares_responses_lite`]）。往里填一段等于把一份
+    // 已经发对了的请求改成谁都产生不出来的混合体——真实 codex 对 gpt-6-astra 与全部
+    // gpt-5.6-* 走的正是这条路。头那一侧的同一道守卫在 [`handle`] 里。
+    if body_declares_responses_lite(obj) {
+        return false;
+    }
     match obj.get("instructions") {
         None | Some(serde_json::Value::Null) => {}
         Some(serde_json::Value::String(s)) if s.trim().is_empty() => {}
@@ -3484,6 +3632,7 @@ fn build_forward_headers(
     fingerprint: &str,
     ua_mode: UaMode,
     hint: Option<&str>,
+    plane: RequestPlane,
 ) -> reqwest::header::HeaderMap {
     // 改写 UA 的话，与旧 UA 同源的那族留痕头就**一条都不抄进来**：UA 说 codex CLI、
     // `x-stainless-lang` 说 python SDK，这种自相矛盾比两者都老实报 python 更显眼。
@@ -3549,7 +3698,9 @@ fn build_forward_headers(
     // **带了就不动**：真实 codex 报的那份是按它自己那次请求的模型与档位拼的，而 coban 不改
     // 模型名，两边算出来的是同一个值；万一不同（客户端自己拼错、或它报的与体里对不上），
     // 那也是它的声明，替它改写等于把一个能查的矛盾藏起来。
-    if let Some(hint) = hint.filter(|_| !out.contains_key("x-codex-routing-hint")) {
+    if let Some(hint) =
+        hint.filter(|_| plane.carries_session() && !out.contains_key("x-codex-routing-hint"))
+    {
         set(&mut out, "x-codex-routing-hint", hint);
     }
     // **`x-codex-beta-features` 刻意不补**（来访带了就跟着透传，那是上面那个循环干的事）。
@@ -3563,8 +3714,11 @@ fn build_forward_headers(
     // 只出现在 WS 握手那条路上，值是 `responses_websockets=2026-02-06`），所以这里也不补。
     // 早先按第三方实现的做法准备补一个 `responses=experimental`，核对客户端源码后作废。
     //
-    // 会话 id 按账号 + 会话键派生，见 Credential::session_id 的注。
-    set(&mut out, "session_id", &cred.session_id(fingerprint));
+    // 会话 id 按账号 + 会话键派生，见 Credential::session_id 的注。**只在推理面补**，
+    // 理由见 [`RequestPlane::carries_session`]。
+    if plane.carries_session() {
+        set(&mut out, "session_id", &cred.session_id(fingerprint));
+    }
     // **这里不补 `accept-encoding`**：官方客户端一个都不发（来访那份已在
     // [`config::HOP_BY_HOP_HEADERS`] 里掐掉），补一个等于替上游打开压缩，而我们没有解压
     // 能力。见 `clients::upstream_client`。
@@ -5327,7 +5481,17 @@ fn synthetic_headers(
     accept: &'static str,
 ) -> reqwest::header::HeaderMap {
     // 合成请求没有来访会话，指纹留空——它们也不该去蹭真实会话的 prompt cache。
-    let mut headers = build_forward_headers(&HeaderMap::new(), cred, token, "", UaMode::Pin, None);
+    // 合成请求走的是推理面（探测发的是一条真的 `responses`），会话头照旧补——指纹传空串，
+    // 于是它们不会去蹭任何真实会话的 prompt cache。
+    let mut headers = build_forward_headers(
+        &HeaderMap::new(),
+        cred,
+        token,
+        "",
+        UaMode::Pin,
+        None,
+        RequestPlane::Responses,
+    );
     headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
     headers
 }
@@ -7341,7 +7505,15 @@ mod tests {
             ("chatgpt-account-id", "spoofed"),
             ("content-type", "application/json"),
         ]);
-        let out = build_forward_headers(&incoming, &cred, "fresh-token", "fp", UaMode::Auto, None);
+        let out = build_forward_headers(
+            &incoming,
+            &cred,
+            "fresh-token",
+            "fp",
+            UaMode::Auto,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(out.get("authorization").unwrap(), "Bearer fresh-token");
         assert_eq!(out.get("chatgpt-account-id").unwrap(), "acct-9");
         assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR);
@@ -7436,19 +7608,43 @@ mod tests {
         ]);
 
         // 透传档：两个头一起原样过去。
-        let passed = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Passthrough, None);
+        let passed = build_forward_headers(
+            &desktop,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(passed.get("originator").unwrap(), "codex_desktop");
         assert!(passed.get("user-agent").unwrap().to_str().unwrap().starts_with("Codex Desktop/"));
 
         // Auto 档同样放过：Codex Desktop 在官方那份第一方名单里。收敛它只会把 UA 与
         // `originator` 改成 CLI，而它的 `x-codex-turn-metadata` 与体里的 `client_metadata`
         // 照旧说自己是 Desktop——半份身份留在原地，比不收敛更显眼。
-        let auto = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Auto, None);
+        let auto = build_forward_headers(
+            &desktop,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Auto,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(auto.get("originator").unwrap(), "codex_desktop");
         assert!(auto.get("user-agent").unwrap().to_str().unwrap().starts_with("Codex Desktop/"));
 
         // Pin 档一律改写：UA 换成这个号派生的那份，`originator` 跟着收敛。
-        let pinned = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Pin, None);
+        let pinned = build_forward_headers(
+            &desktop,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Pin,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(pinned.get("user-agent").unwrap(), cred.user_agent().as_str());
         assert_eq!(pinned.get("originator").unwrap(), config::ORIGINATOR);
 
@@ -7460,7 +7656,15 @@ mod tests {
             ),
             ("originator", "codex_cli_rs"),
         ]);
-        let out = build_forward_headers(&cli, &cred, "t", "fp", UaMode::Auto, None);
+        let out = build_forward_headers(
+            &cli,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Auto,
+            None,
+            RequestPlane::Responses,
+        );
         assert!(out.get("user-agent").unwrap().to_str().unwrap().contains("0.150.0"));
         assert_eq!(out.get("originator").unwrap(), "codex_cli_rs");
 
@@ -7471,7 +7675,15 @@ mod tests {
             hm(&[("user-agent", "OpenAI/Python 1.108.1"), ("originator", "   ")]),
         ] {
             for mode in [UaMode::Passthrough, UaMode::Auto, UaMode::Pin] {
-                let out = build_forward_headers(&headers, &cred, "t", "fp", mode, None);
+                let out = build_forward_headers(
+                    &headers,
+                    &cred,
+                    "t",
+                    "fp",
+                    mode,
+                    None,
+                    RequestPlane::Responses,
+                );
                 assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR, "{mode:?}");
             }
         }
@@ -7486,12 +7698,21 @@ mod tests {
         // 第三方 SDK：三档都补——它们压根不发这个头，而拿到的 UA/`originator` 已经是 CLI 那份。
         let sdk = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
         for mode in [UaMode::Passthrough, UaMode::Auto, UaMode::Pin] {
-            let out = build_forward_headers(&sdk, &cred, "t", "fp", mode, None);
+            let out =
+                build_forward_headers(&sdk, &cred, "t", "fp", mode, None, RequestPlane::Responses);
             assert_eq!(out.get("version").unwrap(), config::CODEX_VERSION, "{mode:?}");
         }
         // 带了个空值等于没带。
         let blank = hm(&[("user-agent", "OpenAI/Python 1.108.1"), ("version", "  ")]);
-        let out = build_forward_headers(&blank, &cred, "t", "fp", UaMode::Passthrough, None);
+        let out = build_forward_headers(
+            &blank,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(out.get("version").unwrap(), config::CODEX_VERSION);
 
         // 真实客户端报的那份：透传档一个字不改，哪怕它比我们写死的常量旧——它的 UA 里写的
@@ -7504,13 +7725,37 @@ mod tests {
             ("originator", "codex_cli_rs"),
             ("version", "0.150.0"),
         ]);
-        let passed = build_forward_headers(&older, &cred, "t", "fp", UaMode::Passthrough, None);
+        let passed = build_forward_headers(
+            &older,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(passed.get("version").unwrap(), "0.150.0");
         // Auto 档同样放过：它是官方 UA，整份身份都该原样过去。
-        let auto = build_forward_headers(&older, &cred, "t", "fp", UaMode::Auto, None);
+        let auto = build_forward_headers(
+            &older,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Auto,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(auto.get("version").unwrap(), "0.150.0");
         // Pin 档整份收敛：UA 换成派生的那份，`version` 跟着换成同一个版本号。
-        let pinned = build_forward_headers(&older, &cred, "t", "fp", UaMode::Pin, None);
+        let pinned = build_forward_headers(
+            &older,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Pin,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(pinned.get("version").unwrap(), config::CODEX_VERSION);
         assert!(
             pinned.get("user-agent").unwrap().to_str().unwrap().contains(config::CODEX_VERSION),
@@ -7565,16 +7810,32 @@ mod tests {
             "fp",
             UaMode::Passthrough,
             Some("model=gpt-5.6-sol"),
+            RequestPlane::Responses,
         );
         assert_eq!(out.get("x-codex-routing-hint").unwrap(), "model=gpt-5.6-sol");
 
         let own = hm(&[("x-codex-routing-hint", "model=gpt-5.5;tier=flex")]);
-        let out =
-            build_forward_headers(&own, &cred, "t", "fp", UaMode::Passthrough, Some("model=other"));
+        let out = build_forward_headers(
+            &own,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            Some("model=other"),
+            RequestPlane::Responses,
+        );
         assert_eq!(out.get("x-codex-routing-hint").unwrap(), "model=gpt-5.5;tier=flex");
 
         // 算不出提示（体里没有模型）时不凭空造一个。
-        let out = build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough, None);
+        let out = build_forward_headers(
+            &bare,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            None,
+            RequestPlane::Responses,
+        );
         assert!(out.get("x-codex-routing-hint").is_none());
     }
 
@@ -7697,6 +7958,107 @@ mod tests {
         }
     }
 
+    /// 出站体要压成官方那个形态（zstd level 3），且**只压 `responses` 那条路**。
+    #[test]
+    fn only_the_responses_body_goes_out_compressed() {
+        let body = Bytes::from_static(br#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#);
+        let plain = reqwest::header::HeaderMap::new();
+
+        let compressed =
+            compress_request_body(config::RESPONSES_PATH, &body, &plain).expect("该压");
+        assert_ne!(compressed, body);
+        // 压出来的必须解得回去——上游解不开的话，报错是一句指不到原因的 400。
+        let back = zstd::stream::decode_all(std::io::Cursor::new(compressed.as_ref())).unwrap();
+        assert_eq!(back, body.as_ref());
+
+        // 官方在这几条路上发的是明文（compact/search 都没设 `req.compression`），压了反倒
+        // 成了独有形态。
+        for path in [config::ALPHA_SEARCH_PATH, config::MODELS_PATH, "responses/compact"] {
+            assert!(compress_request_body(path, &body, &plain).is_none(), "{path}");
+        }
+        // 空体（GET）不压。
+        assert!(compress_request_body(config::RESPONSES_PATH, &Bytes::new(), &plain).is_none());
+        // 头上已经有一种我们没解开的编码：再套一层就是让那个头说谎。
+        let mut encoded = reqwest::header::HeaderMap::new();
+        encoded.insert(
+            reqwest::header::CONTENT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip"),
+        );
+        assert!(compress_request_body(config::RESPONSES_PATH, &body, &encoded).is_none());
+    }
+
+    /// 会话类的头只在推理面补：官方的 SearchClient 在搜索那条路上一个都不发。
+    #[test]
+    fn the_search_path_gets_no_session_headers_of_our_own() {
+        let cred = ua_cred("acct-9");
+        let bare = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
+
+        let responses = build_forward_headers(
+            &bare,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            Some("model=m"),
+            RequestPlane::of(config::RESPONSES_PATH),
+        );
+        assert!(responses.get("session_id").is_some());
+        assert_eq!(responses.get("x-codex-routing-hint").unwrap(), "model=m");
+
+        let search = build_forward_headers(
+            &bare,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            Some("model=m"),
+            RequestPlane::of(config::ALPHA_SEARCH_PATH),
+        );
+        assert!(search.get("session_id").is_none(), "官方在这条路上不发会话头");
+        assert!(search.get("x-codex-routing-hint").is_none());
+        // 身份那三件照旧——它们挂在 provider 的默认头上，与哪条路无关。
+        assert_eq!(search.get("originator").unwrap(), config::ORIGINATOR);
+        assert_eq!(search.get("version").unwrap(), config::CODEX_VERSION);
+        assert!(search.get("user-agent").is_some());
+
+        assert_eq!(RequestPlane::of("/responses"), RequestPlane::Responses);
+        assert_eq!(RequestPlane::of("responses/compact"), RequestPlane::Other);
+    }
+
+    /// 客户端自己发的是 Responses Lite 形态时，`instructions` 空着才是官方形态——一个字都
+    /// 不许填。当前上游九个模型里六个走这条路（gpt-6-astra、全部 gpt-5.6-*）。
+    #[test]
+    fn a_responses_lite_request_never_gets_its_instructions_filled_in() {
+        let base = |_: &str| Some("官方基座提示".to_owned());
+        let fill = |b: &str| -> serde_json::Value {
+            let n = normalize_responses_body(
+                "responses",
+                Bytes::from(b.to_owned()),
+                false,
+                &base as BaseInstructions<'_>,
+            );
+            serde_json::from_slice(&n.body).unwrap()
+        };
+
+        // 体里那条 `additional_tools` 项是 Lite 独有的形态：认出来就不填。
+        let lite = fill(
+            r#"{"model":"gpt-6-astra","instructions":"","input":[
+                {"type":"additional_tools","role":"developer","tools":[]},
+                {"type":"message","role":"user","content":"hi"}]}"#,
+        );
+        assert_eq!(lite["instructions"], "", "Lite 那条路上它空着才对");
+
+        // 同一个模型、经典形态：照旧补（第三方客户端走的是这条）。
+        let classic = fill(r#"{"model":"gpt-6-astra","input":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(classic["instructions"], "官方基座提示");
+
+        // 头那一侧的判据。
+        assert!(declares_responses_lite(&hm(&[(RESPONSES_LITE_HEADER, "true")])));
+        assert!(declares_responses_lite(&hm(&[(RESPONSES_LITE_HEADER, "True")])));
+        assert!(!declares_responses_lite(&hm(&[(RESPONSES_LITE_HEADER, "false")])));
+        assert!(!declares_responses_lite(&hm(&[("user-agent", "x")])));
+    }
+
     /// 只有事件流才探流头：`responses/compact` 那族回的是一次性 JSON，探它等于白等两秒。
     #[test]
     fn only_an_event_stream_gets_peeked() {
@@ -7750,7 +8112,15 @@ mod tests {
             ),
         ]);
 
-        let mut out = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Passthrough, None);
+        let mut out = build_forward_headers(
+            &incoming,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            None,
+            RequestPlane::Responses,
+        );
         let before = out.clone();
         converge_header_ids(&mut out, &cred);
 
@@ -7787,7 +8157,15 @@ mod tests {
 
         // 第三方客户端一个标识都不发：只补装机 ID，不替它编一段会话结构。
         let bare = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
-        let mut out = build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough, None);
+        let mut out = build_forward_headers(
+            &bare,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            None,
+            RequestPlane::Responses,
+        );
         converge_header_ids(&mut out, &cred);
         assert_eq!(
             out.get("x-codex-installation-id").unwrap(),
@@ -7910,7 +8288,15 @@ mod tests {
             ("content-type", "application/json"),
         ]);
 
-        let rewritten = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Auto, None);
+        let rewritten = build_forward_headers(
+            &incoming,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Auto,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(rewritten.get("user-agent").unwrap(), cred.user_agent().as_str());
         for stripped in ["x-stainless-lang", "x-stainless-runtime-version", "openai-organization"] {
             assert!(rewritten.get(stripped).is_none(), "{stripped} outlived the UA it came with");
@@ -7918,7 +8304,15 @@ mod tests {
         // 清的只是那一族，别的头照旧。
         assert_eq!(rewritten.get("content-type").unwrap(), "application/json");
 
-        let passed = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Passthrough, None);
+        let passed = build_forward_headers(
+            &incoming,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            None,
+            RequestPlane::Responses,
+        );
         assert_eq!(passed.get("user-agent").unwrap(), "OpenAI/Python 1.108.1");
         assert_eq!(passed.get("x-stainless-lang").unwrap(), "python");
     }
@@ -7930,15 +8324,33 @@ mod tests {
         let cred = ua_cred("acct-9");
 
         let sdk = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
-        let rewritten =
-            UaPair::of(&sdk, &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Auto, None));
+        let rewritten = UaPair::of(
+            &sdk,
+            &build_forward_headers(
+                &sdk,
+                &cred,
+                "t",
+                "fp",
+                UaMode::Auto,
+                None,
+                RequestPlane::Responses,
+            ),
+        );
         assert_eq!(rewritten.incoming.as_deref(), Some("OpenAI/Python 1.108.1"));
         assert_eq!(rewritten.upstream.as_deref(), Some(cred.user_agent().as_str()));
 
         // 同一条请求在透传档上：发出去的与来访逐字节相同，第二份留空。
         let passed = UaPair::of(
             &sdk,
-            &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Passthrough, None),
+            &build_forward_headers(
+                &sdk,
+                &cred,
+                "t",
+                "fp",
+                UaMode::Passthrough,
+                None,
+                RequestPlane::Responses,
+            ),
         );
         assert_eq!(passed.incoming.as_deref(), Some("OpenAI/Python 1.108.1"));
         assert_eq!(passed.upstream, None, "没改写就不该留下第二份");
@@ -7947,7 +8359,15 @@ mod tests {
         let bare = HeaderMap::new();
         let filled = UaPair::of(
             &bare,
-            &build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough, None),
+            &build_forward_headers(
+                &bare,
+                &cred,
+                "t",
+                "fp",
+                UaMode::Passthrough,
+                None,
+                RequestPlane::Responses,
+            ),
         );
         assert_eq!(filled.incoming, None);
         assert_eq!(filled.upstream.as_deref(), Some(cred.user_agent().as_str()));
@@ -7957,7 +8377,15 @@ mod tests {
         let huge = hm(&[("user-agent", long.as_str())]);
         let cut = UaPair::of(
             &huge,
-            &build_forward_headers(&huge, &cred, "t", "fp", UaMode::Passthrough, None),
+            &build_forward_headers(
+                &huge,
+                &cred,
+                "t",
+                "fp",
+                UaMode::Passthrough,
+                None,
+                RequestPlane::Responses,
+            ),
         );
         assert_eq!(cut.incoming.as_deref().map(str::len), Some(UA_MAX_LEN));
         assert_eq!(cut.upstream, None, "截断不该把一条透传的长 UA 判成改写过");
@@ -7975,6 +8403,7 @@ mod tests {
             "fp",
             UaMode::Auto,
             None,
+            RequestPlane::Responses,
         );
         let synthetic = probe_headers(&cred, "t");
         assert_eq!(forwarded.get("user-agent").unwrap(), synthetic.get("user-agent").unwrap());
