@@ -8,9 +8,11 @@ import {
 import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
 import { clearPw, setPw } from '@/api/client'
 import {
-  getSettings, setApiKey, setCooldownSecs, setDefaultRpmLimit, setNormalizeToolOrder,
-  setQuotaPausePct, setRateLimitRetryMax, setRateLimitRotate, setRateLimitWaitRetryMax,
-  setRateLimitWaitSecs, setSessionLeaseSecs, setUpstreamUaMode, type Settings,
+  getSettings, setApiKey, setConvergeClientIds, setCooldownSecs, setDefaultRpmLimit,
+  setFillBaseInstructions,
+  setNormalizeToolOrder, setQuotaPausePct, setRateLimitRetryMax, setRateLimitRotate,
+  setRateLimitWaitRetryMax, setRateLimitWaitSecs, setSessionLeaseSecs, setUpstreamUaMode,
+  type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { copyText, extractError } from '@/lib/utils'
@@ -551,6 +553,14 @@ export function LimitsSettingsContent() {
     t('已保存工具顺序设置', 'Tool order setting saved'),
   )
   const uaMode = useSettingMutation(setUpstreamUaMode, t('已保存 UA 设置', 'UA setting saved'))
+  const baseInstructions = useSettingMutation(
+    setFillBaseInstructions,
+    t('已保存基座提示设置', 'Base instructions setting saved'),
+  )
+  const clientIds = useSettingMutation(
+    setConvergeClientIds,
+    t('已保存设备标识设置', 'Device identity setting saved'),
+  )
 
   if (settingsQuery.isPending) {
     return (
@@ -746,6 +756,26 @@ export function LimitsSettingsContent() {
           ]}
           pending={uaMode.isPending}
           onSelect={(mode) => uaMode.mutate(mode)}
+        />
+        <SwitchSetting
+          label={t('客户端没给系统提示时补上官方基座提示', 'Fill in the official base instructions when the client sends none')}
+          description={t(
+            '真实 codex 每条请求的 instructions 里都装着那个模型一两万字符的基座提示，而第三方接入方（OpenAI SDK、各种翻译层）一句系统提示都不发——空着的 instructions 是没有哪个官方前端会产生的形态。开着它就替这类请求补上：补的是上游此刻在模型清单里下发的那一份（按模型各取各的），不是我们编的一段话，取不到就照客户端给的体发出去。客户端自己说过话（含它发的 system/developer 消息，那些会先被搬进 instructions）时一个字都不动，所以对 codex CLI 这类自带完整提示的接入方，这个开关是个空动作。默认关，因为代价是真的：那份提示写满了工具怎么用、沙箱怎么判、补丁怎么打，补上之后模型会按一个编码 agent 的规矩答话，而那类客户端压根没有那些工具；那段文字还会每轮随请求发出去，记的是你自己的输入 token（第一轮之后落进上游的提示缓存）。',
+            'Every real codex request carries that model\u2019s full base prompt \u2014 ten to twenty thousand characters \u2014 in its instructions field, while third-party callers (OpenAI SDKs, translation layers) send no system prompt at all, and empty instructions is a shape no official frontend ever produces. Turn this on to fill it in for those requests: the text comes from what upstream is currently serving in the model manifest, per model, not from something coban made up, and when it cannot be fetched the request goes out exactly as the client sent it. Anything the client said itself \u2014 including system/developer messages, which get promoted into instructions first \u2014 is left untouched, so this is a no-op for callers like the codex CLI that bring their own prompt. Off by default because the cost is real: that prompt is full of how to use tools, how to treat the sandbox and how to write patches, so the model starts answering like a coding agent even though such a client has none of those tools; and the text rides along on every turn, billed as your own input tokens (cached upstream after the first turn).',
+          )}
+          checked={data.fill_base_instructions}
+          pending={baseInstructions.isPending}
+          onToggle={(on) => baseInstructions.mutate(on)}
+        />
+        <SwitchSetting
+          label={t('设备与会话标识按账号收敛', 'Converge device and session identity per account')}
+          description={t(
+            '真实 codex 每条请求都带一整套标识：本机装机 ID（installation）、会话 / 线程 / 窗口 ID，以及把同一族值再抄一遍的 x-codex-turn-metadata 和请求体里的 client_metadata。原样透传的后果是「一个号看着像一屋子机器」——十个人共用一个号，上游就看到同一账号下十个装机 ID 同时在发请求；而 coban 换号时更糟：客户端手里那套标识会原样跟到第二个号上，两个账号共用一个设备指纹，这是真实 codex 永远产生不出来的形态（它一个进程只有一份凭据）。开着它就把整套改写成按该账号派生的值：同一客户端会话在同一个号上恒定（上游看到的仍是一段连续会话），跨号必不同；第三方客户端压根不发装机 ID，那时会补一个。多人共用同一个号时收益最大。默认关的理由不是这件事不值得做，而是改写它有实测过的反作用：另一个同类实现（sub2api）曾把同一套收敛设为默认开，随后连续收到额度缩水报告，并有「退回上一版即恢复」「新号开了收敛就降额」的 A/B 对比，最终退回显式开启。上游按这些标识做什么判定不可观测，所以这里把选择权留给你。',
+            'Every real codex request carries a full set of identifiers: the machine installation ID, session / thread / window IDs, and the same values copied again into x-codex-turn-metadata and the request body\u2019s client_metadata. Passing them through verbatim makes one account look like a room full of machines \u2014 ten people sharing an account means upstream sees ten installation IDs sending requests under it. Failover is worse: the client\u2019s identifiers follow it to the second account, so two accounts share one device fingerprint, a shape real codex can never produce (one process holds one credential). Turn this on to rewrite the whole set into values derived from the selected account: stable for one client session on one account (upstream still sees a continuous session) and never equal across accounts; third-party clients send no installation ID at all, so one is filled in. The gain is largest when several people share an account. It is off by default not because it is not worth doing, but because rewriting these has a measured downside: another implementation of this kind (sub2api) once shipped the same convergence on by default, then took a run of quota-shrinkage reports with A/B evidence \u2014 reverting the release restored it, and enabling convergence on a fresh account cut its allowance \u2014 and ended up making it opt-in again. What upstream infers from these identifiers is not observable, so the choice is left to you.',
+          )}
+          checked={data.converge_client_ids}
+          pending={clientIds.isPending}
+          onToggle={(on) => clientIds.mutate(on)}
         />
       </SettingsGroup>
     </div>

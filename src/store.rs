@@ -397,6 +397,45 @@ pub const NORMALIZE_TOOL_ORDER: &str = "normalize_tool_order";
 /// 工具一分不赚。
 pub const DEFAULT_NORMALIZE_TOOL_ORDER: i64 = 0;
 
+/// 发往上游的那一族「设备/会话身份」标识是否按号收敛（`1` = 开）。
+/// 见 [`crate::proxy`] 的 `IdMode`。
+pub const CONVERGE_CLIENT_IDS: &str = "converge_client_ids";
+/// 同上的默认值。
+///
+/// **默认关（透传）**，与 [`DEFAULT_UPSTREAM_UA_MODE`] 同一个态度：它改的是发出去的请求本身。
+///
+/// 开了之后上游看到的是「一个号一台机器」：`x-codex-installation-id`、会话/线程/窗口标识、
+/// `x-codex-turn-metadata` 与体里的 `client_metadata` 整套改写成这个号派生的那一份，而且**跨号
+/// 必不同**——换号之后同一段会话不会把同一个设备指纹带到第二个号上（那是真实 codex 产生不出来
+/// 的形态：它一个进程只有一份凭据）。多人共用一个号时收益最大：不开的话上游看到同一账号下十几
+/// 个 installation_id 同时在发请求。
+///
+/// **为什么默认关**：改写它有实测过的反作用。sub2api 在 v0.1.175 把同一套收敛设成默认开
+/// （#5553），随后 #5555/#5556/#5582 报的都是额度缩水，且有「退回上一版即恢复」与「新号开了
+/// 收敛就降额」的 A/B，最终退回显式 opt-in（#5610）。上游按这些标识做什么判定不可观测，所以
+/// 这里取保守的一侧。
+pub const DEFAULT_CONVERGE_CLIENT_IDS: i64 = 0;
+
+/// 客户端一句系统意图都没给时，替它补上这个模型的官方基座提示（`1` = 开）。
+/// 见 [`crate::proxy`] 的 `fill_base_instructions`。
+pub const FILL_BASE_INSTRUCTIONS: &str = "fill_base_instructions";
+/// 同上的默认值。
+///
+/// **默认关**，与 [`DEFAULT_UPSTREAM_UA_MODE`] 同一个态度：它改的是**发出去的请求本身**。
+///
+/// 开了之后那类请求（第三方 SDK、各种翻译层——它们一句系统提示都不发）在上游看来才像官方
+/// 客户端：真实的 codex 每条请求的 `instructions` 里都装着那个模型一两万字符的基座提示，
+/// 而空着是没有哪个官方前端会产生的形态。
+///
+/// 代价是模型会按一个**编码 agent** 的规矩答话：那份提示里写满了工具怎么用、沙箱怎么判、
+/// 补丁怎么打，而那类客户端压根没有那些工具。所以这件事只有用户知道该不该做——接入方是
+/// codex CLI 那类自带完整提示的客户端时，这个开关一分不赚（它们的 `instructions` 从来不空，
+/// 补的逻辑对它们是空动作）。
+///
+/// 还有一笔账要算：那段提示每轮都随请求发出去，第一轮之后落进上游的 prompt cache，
+/// 但输入 token 记的是用户自己的额度。
+pub const DEFAULT_FILL_BASE_INSTRUCTIONS: i64 = 0;
+
 /// 发往上游的 `User-Agent` 怎么处理：`0` 原样透传来访客户端那份，`1` 只改写「不像官方
 /// 客户端」的那些，`2` 一律改写。见 [`crate::proxy`] 的 `UaMode`。
 pub const UPSTREAM_UA_MODE: &str = "upstream_ua_mode";

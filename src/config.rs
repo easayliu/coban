@@ -64,6 +64,25 @@ pub const REFRESH_LEEWAY_SECS: u64 = 300;
 /// 这是**订阅（ChatGPT 账号）模式**专用的那条路径，与 API-key 模式的
 /// `https://api.openai.com/v1` 不是一回事：后者按 token 计费、收 `sk-` 开头的 key，
 /// 而 OAuth access_token 打过去会被拒。coban 只做订阅模式。
+///
+/// **这一族路径不止 `responses` 一条**，coban 把来访路径原样拼在 [`UPSTREAM_BASE`] 后面
+/// （见 [`crate::proxy`] 的 `upstream_url`），于是同一族里的其余端点天然就通：
+/// - `responses/compact`：远端压缩历史。上游要的是一次性 JSON 而不是 SSE，所以
+///   `crate::proxy::pins_sse_accept` 刻意只钉 `responses` 一条路径；体也不该被钉成
+///   `stream: true`，而 `normalize_responses_body` 同样只认那一条精确路径。两处的「只此一条」
+///   合起来正是这条路径能原样通过的原因——改任何一处的判据之前先想清楚这一点。
+/// - `alpha/search`：独立的搜索协议。官方那边它**不带** `openai-beta`/会话头/Responses Lite
+///   那几个头（`sub2api` 的 `stripOpenAIAlphaSearchResponsesHeaders` 抄的就是这条），而 coban
+///   目前会把自己派生的 `session_id` 一起带上去——形态上有出入，实测尚未见它因此被拒。
+///
+/// **WS 那条路刻意没做**：官方客户端从 0.15x 起对 `chatgpt.com` 走
+/// `wss://chatgpt.com/backend-api/codex/responses`（`codex-rs/core/src/client.rs` 的
+/// `build_websocket_headers`），HTTP/SSE 只是退路。看着像个形态差距，但**指向 coban 的客户端
+/// 压根不会尝试 WS**：那个开关是 provider 级的
+/// （`codex-rs/model-provider-info/src/lib.rs` 的 `supports_websockets`），只有内建的 `openai`
+/// provider 把它置 true，而 `model_providers.*` 里配出来的 provider 走 `#[serde(default)]`
+/// ——也就是 false。所以这条差距只存在于「coban 与上游之间」这一跳，客户端看不见，
+/// 而补上它要实现整套 WS 帧协议与连接池。
 pub const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
 /// 模型清单端点（`UPSTREAM_BASE` 之后那一段）。
@@ -105,6 +124,18 @@ pub const ORIGINATOR: &str = "codex_cli_rs";
 /// 版本放出**：本机 codex CLI 用 0.153.0 拉到的清单里有它，coban 报 0.148.0 拉到的没有。
 /// 所以这个常量落后的表现不只是指纹旧，而是**连通性测试的下拉与对外 `/v1/models` 都缺
 /// 新模型**，且没有任何报错——上游只是安静地少给几条。官方一上新模型就该回来核这一行。
+///
+/// **它同时是 `version` 请求头的取值**（见 `proxy::build_forward_headers`）。那个头不是
+/// 猜的：官方客户端把它挂在 provider 的默认头上，于是**每一条**打向 chatgpt.com 的请求都带
+/// 着它——`codex-rs/model-provider-info/src/lib.rs` 的 `create_openai_provider`：
+///
+/// ```text
+/// http_headers: Some([("version".to_string(), env!("CARGO_PKG_VERSION").into())]…)
+/// ```
+///
+/// 也就是说它报的正是客户端自己的包版本，与 UA 里那一段同源。coban 这边两处都取这个常量，
+/// 拼出来的身份才自洽——UA 说 0.153.4 而 `version` 说别的（或干脆不带），是没有哪个真实
+/// 客户端会产生的形态。
 pub const CODEX_VERSION: &str = "0.153.4";
 
 /// 官方客户端 `User-Agent` 的固定前缀（[`ORIGINATOR`] 加一个斜杠）。

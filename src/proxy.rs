@@ -138,8 +138,16 @@ pub async fn handle(
         .store
         .get_setting_i64(store::NORMALIZE_TOOL_ORDER, store::DEFAULT_NORMALIZE_TOOL_ORDER)
         != 0;
-    let Normalized { body, collapse, chat, prefix, input_len } =
-        match plan_request(&path, body, sort_tools) {
+    // 客户端没给 `instructions` 时要不要替它补一份，见 [`fill_base_instructions`]。默认关。
+    // 关着时这个闭包恒回 `None`，那一步就是个空动作——也就不会去碰基座提示的缓存，
+    // 更不会为它踢后台补取。
+    let fill_base = state
+        .store
+        .get_setting_i64(store::FILL_BASE_INSTRUCTIONS, store::DEFAULT_FILL_BASE_INSTRUCTIONS)
+        != 0;
+    let base = |model: &str| fill_base.then(|| base_instructions_for(&state, model)).flatten();
+    let Normalized { body, collapse, chat, prefix, input_len, hint, client_ids } =
+        match plan_request(&path, body, sort_tools, &base) {
             Ok(n) => n,
             // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
             //
@@ -270,6 +278,8 @@ pub async fn handle(
             &body,
             collapse,
             chat.as_ref(),
+            hint.as_deref(),
+            client_ids,
             &session,
             started,
             in_flight.clone(),
@@ -507,6 +517,8 @@ async fn forward_once(
     body: &Bytes,
     collapse: bool,
     chat: Option<&ChatMode>,
+    hint: Option<&str>,
+    client_ids: bool,
     session: &SessionCtx,
     started: Instant,
     in_flight: InFlightGuard,
@@ -524,14 +536,30 @@ async fn forward_once(
     let ua_mode = UaMode::from_setting(
         state.store.get_setting_i64(store::UPSTREAM_UA_MODE, store::DEFAULT_UPSTREAM_UA_MODE),
     );
-    let mut fwd_headers =
-        build_forward_headers(headers, cred, &token, session_key.unwrap_or_default(), ua_mode);
+    // 身份标识要不要按号收敛（见 [`IdMode`]）。与 UA 那一档同样是每次转发现读一次：
+    // 一次本地 SQLite 读，而改了该立刻生效。
+    let id_mode = IdMode::from_setting(
+        state.store.get_setting_i64(store::CONVERGE_CLIENT_IDS, store::DEFAULT_CONVERGE_CLIENT_IDS),
+    );
+    let mut fwd_headers = build_forward_headers(
+        headers,
+        cred,
+        &token,
+        session_key.unwrap_or_default(),
+        ua_mode,
+        hint,
+    );
+    // 客户端回带的 turn-state 若已知是别的号铸的，就地摘掉（见 [`TurnStateMemo`]）。
+    guard_turn_state_echo(&state.turn_state, &mut fwd_headers, session_key, cred.id);
+    // 那一族设备/会话标识按号收敛（见 [`IdMode`]）。**排在会话头都定下来之后**：它要改的
+    // 就是那几个头的最终值。
+    if id_mode == IdMode::PerAccount {
+        converge_header_ids(&mut fwd_headers, cred);
+    }
     // 落库要两份：客户端报的，与真的发出去的（见 UaPair）。UA 在这条请求的重试之间不会变
     // ——凭证与档位都定了——所以这里算一次就够。
     let ua = UaPair::of(headers, &fwd_headers);
-    if collapse || chat.is_some() {
-        // 体里的 `stream` 已被我们钉成 true，`accept` 得跟着说 SSE：官方客户端不存在
-        // 「体里要流、头里要 JSON」这种自相矛盾的形态，别让上游去猜。
+    if pins_sse_accept(upstream_path) {
         fwd_headers.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
     }
     if chat.is_some() {
@@ -575,6 +603,18 @@ async fn forward_once(
         fwd_body = fixed;
     }
 
+    // 体里那一族标识跟着头一起收敛：只改头会让上游同时看到两套身份，比不收敛更显眼。
+    //
+    // **必须在这一层做，而不是规范化那一层**：派生值按号变，而这个函数每换一个号就重跑一遍。
+    // 只在规范化时数出体里确实有这些字段（[`Normalized::client_ids`]）才解析，第三方客户端
+    // 那种压根不带 `client_metadata` 的体一次都不解。
+    if id_mode == IdMode::PerAccount
+        && client_ids
+        && let Some(converged) = converge_body_ids(&fwd_body, cred)
+    {
+        fwd_body = converged;
+    }
+
     // 撞 429 之后就地等的额度。关着换号开关时才有额度，见 [`RateLimitWait`]。
     let mut rate_limit_wait = RateLimitWait::from_settings(&state.store);
 
@@ -607,6 +647,12 @@ async fn forward_once(
         let _ = maybe_pause_on_quota(state, cred, &quota);
 
         if status.is_success() {
+            // 上游铸了新的回合状态：记下是哪个号铸的，供之后的跨号回带守卫用
+            // （见 [`TurnStateMemo`]）。它随响应头原样交回客户端（见 [`resp_builder`]），
+            // 所以客户端下一轮回带的必然是这一份。
+            if up.headers().contains_key(TURN_STATE_HEADER) {
+                note_turn_state(&state.turn_state, session_key, cred.id);
+            }
             break (up, quota);
         }
 
@@ -857,14 +903,199 @@ async fn forward_once(
     };
 
     if collapse {
-        return Ok(Outcome::Done(
-            collapse_upstream(state, cred, path, &ua, session, chat, up, quota, started).await,
-        ));
+        return Ok(
+            collapse_upstream(state, cred, path, &ua, session, chat, up, quota, started).await
+        );
     }
 
-    Ok(Outcome::Done(stream_upstream(
-        state, cred, path, &ua, session, chat, up, quota, started, in_flight,
-    )))
+    // 状态码在循环里判过一次（那次是为了分流非 2xx），循环出来只剩 2xx，这里重新取一次给
+    // 落库与响应用。
+    let status = StatusCode::from_u16(up.status().as_u16())?;
+
+    // 流式：先探一眼流头。上游会先回 200 再在流里判这次生成失败，而那一类里有一种
+    // （容量降载）换个号就好——**趁一个字节都还没交给客户端**判出来，是这条路上唯一
+    // 换得动号的时机（见 [`peek_stream_head`]）。
+    let up_headers = up.headers().clone();
+    let mut rest = Box::pin(up.bytes_stream());
+    // **只探 SSE**：`responses/compact` 那族回的是一次性 JSON，里面既没有 `data:` 行也没有
+    // 「开始产出」这回事，探它只会白等到 [`PEEK_MAX_WAIT`] 到点——把一个本来立刻就回的响应
+    // 压两秒。判据取上游自报的 `content-type`，那是「这是不是一条事件流」最直接的证据。
+    let peeked = if is_event_stream(&up_headers) {
+        peek_stream_head(&mut rest).await
+    } else {
+        PeekedHead::Commit(Bytes::new())
+    };
+    match peeked {
+        PeekedHead::Shed(f) => {
+            log_usage(
+                state,
+                cred,
+                path,
+                &ua,
+                session,
+                status.as_u16() as i64,
+                None,
+                &quota,
+                started,
+                None,
+            );
+            tracing::info!(
+                cred_id = cred.id,
+                code = f.code.as_deref().unwrap_or_default(),
+                "upstream shed this request in-stream after a 200; trying the next credential"
+            );
+            Ok(Outcome::TryNext(
+                Reject::Upstream,
+                error_response(StatusCode::BAD_GATEWAY, f.etype(), &f.message),
+            ))
+        }
+        PeekedHead::Broken(e) => {
+            log_usage(
+                state,
+                cred,
+                path,
+                &ua,
+                session,
+                status.as_u16() as i64,
+                None,
+                &quota,
+                started,
+                None,
+            );
+            Ok(Outcome::TryNext(
+                Reject::Upstream,
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    format!("the upstream stream broke before producing anything: {e}"),
+                ),
+            ))
+        }
+        PeekedHead::Commit(head) => Ok(Outcome::Done(stream_upstream(
+            state,
+            cred,
+            path,
+            &ua,
+            session,
+            chat,
+            status,
+            &up_headers,
+            head,
+            rest,
+            quota,
+            started,
+            in_flight,
+        ))),
+    }
+}
+
+/// 上游这条响应是不是事件流。
+///
+/// `content-type` 上还挂着参数（`text/event-stream; charset=utf-8`），所以只看前缀。
+fn is_event_stream(up_headers: &reqwest::header::HeaderMap) -> bool {
+    up_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/event-stream"))
+}
+
+/// 探流头最多攒多少字节。
+///
+/// 攒到这个数还没见到一条「真的开始产出」的事件，也照样提交：那说明上游正在发一堆我们没在
+/// 认的事件，继续攒下去只是替客户端把响应压在手里。头几个事件都是几百字节的量级，64 KB 是
+/// 一道够不上的上限，正常永远走不到。
+const PEEK_MAX_BYTES: usize = 64 * 1024;
+
+/// 探流头最多等多久。
+///
+/// 这是**唯一**的代价所在：一条真实请求的第一个输出事件可能在几秒之后（长推理），而在见到它
+/// 之前这段逻辑压着响应不发。上游降载的判决是在收下请求的那一刻就下的（不需要生成任何东西），
+/// 实测是亚秒级，所以这个上限只要够容下一次往返就行——到点就提交，之后与从前逐字节相同。
+///
+/// 取 2 秒：客户端最坏情况下晚 2 秒收到那条 `response.created`（一条不含正文的事件），而输出
+/// 本身的时序一点没动。换成更大的数就会把「上游卡住了」变成「coban 把响应扣了几十秒」。
+const PEEK_MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// 探流头的三种结果，见 [`peek_stream_head`]。
+enum PeekedHead {
+    /// 上游在流里把这条请求降载了（见 [`capacity_shed`]）：还没交出去任何字节，换号安全。
+    Shed(SseFailure),
+    /// 流在产出任何东西之前就断了。同样一个字节都没交出去，换个号有意义——链路问题不该
+    /// 让客户端拿到一段空流。
+    Broken(String),
+    /// 该提交了：这段前缀连同剩下的流一起交给客户端。
+    Commit(Bytes),
+}
+
+/// 探一眼 SSE 流头：只为回答一个问题——**这一回合到底开始了没有**。
+///
+/// 没开始（上游判了降载、或流直接断了）就还能换号；一旦开始就必须提交，此后换号会把已经交给
+/// 客户端的半截响应与另一个号的输出拼在一起，那比失败更糟。
+///
+/// 判「开始了」的界线见 [`stream_head_settled`]，两道上限见 [`PEEK_MAX_BYTES`] 与
+/// [`PEEK_MAX_WAIT`]。
+async fn peek_stream_head<S>(rest: &mut S) -> PeekedHead
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    use futures_util::StreamExt;
+
+    let deadline = tokio::time::Instant::now() + PEEK_MAX_WAIT;
+    // 攒前缀用 `Vec<u8>` 而不是 `BytesMut`：这个 crate 只经由 axum 用到 `Bytes` 这一个类型，
+    // 为一段几百字节的缓冲多挂一条直接依赖不值。
+    let mut head: Vec<u8> = Vec::new();
+    while head.len() < PEEK_MAX_BYTES {
+        // 到点就提交：等下去只是替客户端把响应压在手里。
+        let Ok(next) = tokio::time::timeout_at(deadline, rest.next()).await else { break };
+        match next {
+            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
+            // 流干净地结束了：一条什么都没产出的空流。**照旧提交**——它可能是上游的一种
+            // 正常收尾（客户端自己判），而在这里改判成「换号」等于凭猜给一个号记一次失败。
+            None => break,
+            Some(Err(e)) => {
+                // 读到一半断了，而且还没提交过任何字节：这一段前缀就此作废，交给上层换号。
+                return PeekedHead::Broken(e.to_string());
+            }
+        }
+        if let Some(f) = sse_failure(&head) {
+            if capacity_shed(&f) {
+                return PeekedHead::Shed(f);
+            }
+            // 别的失败是定局（见 [`capacity_shed`]）：原样交给客户端，别在这里改判。
+            break;
+        }
+        if stream_head_settled(&head) {
+            break;
+        }
+    }
+    PeekedHead::Commit(Bytes::from(head))
+}
+
+/// 这段 SSE 前缀里有没有出现「这一回合真的开始产出了」的事件。
+///
+/// **反过来列**：只有那几个「还什么都没发生」的事件名不算数，其余一律算数。这个方向才是安全
+/// 的——上游新增一种事件名时，误判是「提交得早了一点」（退回从前的行为），而按正面清单列会
+/// 变成「一直等到超时」。
+///
+/// `response.created` 不算数：它只说「请求收下了」，降载那条失败事件正是紧跟着它来的。
+fn stream_head_settled(head: &[u8]) -> bool {
+    /// 这几个事件名之后仍可能来一条失败事件，见上面那条注。
+    const UNSETTLED: &[&str] = &["response.created", "response.queued", "response.in_progress"];
+
+    String::from_utf8_lossy(head).lines().any(|line| {
+        // 事件名有两处可看：`event:` 那行，以及 `data:` 里的 `"type"`。官方上游两处都发，
+        // 但只认一处的话，换一种发法（只发 data 行）就整段判不出来。
+        let name = line
+            .strip_prefix("event:")
+            .map(str::trim)
+            .or_else(|| {
+                let data = line.strip_prefix("data:")?.trim();
+                let rest = data.split_once("\"type\"")?.1.split_once('"')?.1;
+                rest.split_once('"').map(|(name, _)| name)
+            })
+            .unwrap_or_default();
+        !name.is_empty() && !UNSETTLED.contains(&name)
+    })
 }
 
 /// 把上游的 SSE 收拢成一个一次性 JSON 响应。
@@ -877,6 +1108,9 @@ async fn forward_once(
 ///
 /// 终局那个对象**不能原样交出去**：它的 `output` 是空的，正文只在增量事件里
 /// （见 [`fill_missing_output`]）。
+///
+/// 回 [`Outcome`] 而不是 [`Response`]：这条路径读完整段体才动手，那时还一个字节都没交给
+/// 客户端——流内的容量降载（见 [`capacity_shed`]）在这里仍然换得动号。
 #[allow(clippy::too_many_arguments)]
 async fn collapse_upstream(
     state: &AppState,
@@ -888,7 +1122,7 @@ async fn collapse_upstream(
     up: reqwest::Response,
     quota: QuotaSnapshot,
     started: Instant,
-) -> Response {
+) -> Outcome {
     let status = StatusCode::from_u16(up.status().as_u16()).unwrap_or(StatusCode::OK);
     let up_headers = up.headers().clone();
     let bytes = match up.bytes().await {
@@ -906,10 +1140,14 @@ async fn collapse_upstream(
                 started,
                 None,
             );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                format!("failed to read the upstream response body: {e}"),
+            // 体读到一半断了：与连不上同一类（链路问题，不是这个号坏了），换个号有意义。
+            return Outcome::TryNext(
+                Reject::Upstream,
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    format!("failed to read the upstream response body: {e}"),
+                ),
             );
         }
     };
@@ -932,12 +1170,20 @@ async fn collapse_upstream(
     );
 
     // 上游会先回 200 再在流里说这次生成失败；非流式客户端读不到那个事件，得翻成 HTTP 错误。
-    if let Some((etype, message)) = sse_failure(&bytes) {
-        return error_response(
-            StatusCode::BAD_GATEWAY,
-            etype.as_deref().unwrap_or("upstream_error"),
-            message,
-        );
+    //
+    // 这条路径整段体都读完了才走到这里，**一个字节都还没交给客户端**，所以容量降载那一类
+    // 还来得及换个号再试（见 [`capacity_shed`]）。
+    if let Some(f) = sse_failure(&bytes) {
+        let resp = error_response(StatusCode::BAD_GATEWAY, f.etype(), &f.message);
+        if capacity_shed(&f) {
+            tracing::info!(
+                cred_id = cred.id,
+                code = f.code.as_deref().unwrap_or_default(),
+                "upstream shed this request in-stream after a 200; trying the next credential"
+            );
+            return Outcome::TryNext(Reject::Upstream, resp);
+        }
+        return Outcome::Done(resp);
     }
 
     // 两种线格式在这里、也只在这里分道：chat 客户端等的是一个 `chat.completion` 对象，
@@ -947,20 +1193,20 @@ async fn collapse_upstream(
         Some(mode) => match chat::aggregate(&bytes, &mode.model) {
             Ok(b) => b,
             Err((etype, message)) => {
-                return error_response(
+                return Outcome::Done(error_response(
                     StatusCode::BAD_GATEWAY,
                     etype.as_deref().unwrap_or("upstream_error"),
                     message,
-                );
+                ));
             }
         },
         None => {
             let Some(mut resp) = sse_final_response(&bytes) else {
-                return error_response(
+                return Outcome::Done(error_response(
                     StatusCode::BAD_GATEWAY,
                     "upstream_error",
                     "the upstream stream ended without a completed response",
-                );
+                ));
             };
             fill_missing_output(&mut resp, &bytes);
             serde_json::to_vec(&resp).unwrap_or_else(|_| {
@@ -984,27 +1230,39 @@ async fn collapse_upstream(
         }
         builder = builder.header(name.as_str(), value.as_bytes());
     }
-    builder
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap_or_else(|e| internal_error_plain(&e.to_string()))
+    Outcome::Done(
+        builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|e| internal_error_plain(&e.to_string())),
+    )
 }
 
 /// 把上游响应流式转出去，边转边嗅探用量。
+///
+/// 收的不是那个 `Response` 而是**拆开的三件**（状态、头、剩下的流）加一段 `head`：探流头那一步
+/// （见 [`peek_stream_head`]）已经从流里读掉了开头几个 chunk，那几个字节必须原样排在最前面
+/// 交出去，否则客户端收到的是一段从中间开始的 SSE。
 #[allow(clippy::too_many_arguments)]
-fn stream_upstream(
+fn stream_upstream<S>(
     state: &AppState,
     cred: &Credential,
     path: &str,
     ua: &UaPair,
     session: &SessionCtx,
     chat: Option<&ChatMode>,
-    up: reqwest::Response,
+    status: StatusCode,
+    up_headers: &reqwest::header::HeaderMap,
+    head: Bytes,
+    rest: S,
     quota: QuotaSnapshot,
     started: Instant,
     in_flight: InFlightGuard,
-) -> Response {
-    let builder = resp_builder(&up);
+) -> Response
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+{
+    let builder = resp_builder(status, up_headers);
     let sniffer = Arc::new(parking_lot::Mutex::new(UsageSniffer::default()));
 
     // 落库交给一个 Drop guard：流可能因为客户端断开而提前结束，那种情况下也该留下记录，
@@ -1023,20 +1281,24 @@ fn stream_upstream(
         path: path.to_owned(),
         ua: ua.incoming.clone(),
         upstream_ua: ua.upstream.clone(),
-        status: up.status().as_u16() as i64,
+        status: status.as_u16() as i64,
         quota,
         started,
         _in_flight: in_flight,
     };
 
-    let stream = up.bytes_stream().map(move |chunk| {
-        // guard 被 move 进闭包：闭包（连同 guard）随流一起析构，客户端提前断开也照样落库。
-        let _keep = &guard;
-        if let Ok(bytes) = &chunk {
-            sniffer.lock().feed(bytes);
-        }
-        chunk
-    });
+    // 探流头读掉的那一段排在最前面。空前缀也照样穿一次这个 once——多一个空 chunk 对 SSE
+    // 无害，而按「空就不拼」分两条路会让类型两头对不上。
+    let stream = futures_util::stream::once(async move { Ok(head) }).chain(rest).map(
+        move |chunk: reqwest::Result<Bytes>| {
+            // guard 被 move 进闭包：闭包（连同 guard）随流一起析构，客户端提前断开也照样落库。
+            let _keep = &guard;
+            if let Ok(bytes) = &chunk {
+                sniffer.lock().feed(bytes);
+            }
+            chunk
+        },
+    );
 
     // chat 客户端读不懂 Responses 的事件流，得边收边翻（见 [`chat::StreamXlate`]）。
     // **嗅探排在翻译之前**，吃到的仍是上游原始字节——用量、计价、额度那套账因此与线格式
@@ -1079,6 +1341,15 @@ struct Normalized {
     prefix: Option<PrefixParts>,
     /// `input[]` 有几项（解不出体时 0）。给缓存归因用，见 [`cache_reason`]。
     input_len: usize,
+    /// 这条请求的 `x-codex-routing-hint` 取值，见 [`routing_hint`]。来访没带那个头时补它。
+    hint: Option<String>,
+    /// 体里带着那一族「设备/会话身份」字段（`client_metadata` 或 `prompt_cache_key`）。
+    ///
+    /// **在这里记一笔是为了省一次解析**：身份收敛（见 [`IdMode`]）要改的正是这几个字段，
+    /// 而它必须在**每次换号之后**重做一遍（派生值按号变），也就是在转发那一层。那一层手上
+    /// 只有字节，重新解一遍几 MB 的体只为发现「里面压根没有这些字段」是白花的——而规范化
+    /// 这一步本来就已经把体解开了，顺手记一个 bool 是零成本。
+    client_ids: bool,
 }
 
 /// chat 线格式下这次请求的形态：翻请求时定下，翻响应时要用。
@@ -1129,23 +1400,58 @@ fn decode_request_body(headers: &HeaderMap, body: Bytes) -> Result<(Bytes, bool)
     Ok((Bytes::from(plain), true))
 }
 
+/// 发往这条上游路径的请求要不要把 `accept` 钉成 `text/event-stream`。
+///
+/// **`responses` 那条路径一律钉，不看来访报的是什么。**
+///
+/// 早先只在「客户端没要流」（体里的 `stream` 被我们改过）与 chat 翻译这两种情况下钉，理由是
+/// 那两种下头得跟着体改。漏掉的是第三种：客户端自己带了 `stream: true`，却报了个
+/// `application/json` 或 `*/*` 的 `accept`（照 OpenAI 官方 SDK 写的客户端就是这样）——体与头
+/// 照旧自相矛盾，只是这一回矛盾不是我们造的。
+///
+/// 钉死的依据在客户端源码里，不是推断：`codex-rs/codex-api/src/endpoint/responses.rs` 的
+/// `stream_encoded` 在发出前无条件 `req.headers.insert(ACCEPT, "text/event-stream")`。也就是说
+/// 这条路径上**没有**任何一份真实请求报着别的 `accept`。
+///
+/// 只钉这一条路径：`models` 那族回的是 JSON，跟着钉等于替客户端要一个上游不会给的类型。
+fn pins_sse_accept(upstream_path: &str) -> bool {
+    upstream_path.trim_start_matches('/') == config::RESPONSES_PATH
+}
+
+/// 「这个模型的官方基座提示是什么」——由调用方给的一个查询函数，见 [`fill_base_instructions`]。
+///
+/// 做成参数而不是让 [`normalize_responses_body`] 自己去取：那份提示要跑一趟上游才拿得到
+/// （在模型清单里，见 [`base_instructions_for`]），而这个函数是纯的、也是单元测试直接调的那
+/// 一层。测试里传 `&|_| None` 就是「取不到」那一格。
+type BaseInstructions<'a> = &'a dyn Fn(&str) -> Option<String>;
+
 /// 决定这条来访请求怎么送上游：翻线格式（chat），还是钉几个字段（responses）。
 ///
 /// 两条路都在**换号重试之前**只做一次：重试要重发整个请求体，把翻译放进循环里等于每次
 /// 换号都重做一遍，而结果逐字节相同。
-fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized, String> {
+fn plan_request(
+    path: &str,
+    body: Bytes,
+    sort_tools: bool,
+    base: BaseInstructions<'_>,
+) -> Result<Normalized, String> {
     if path.trim_start_matches('/') == chat::PATH {
         let t = chat::translate_request(&body, sort_tools)?;
         return Ok(Normalized {
+            // 翻出来的体打的是 `responses` 端点，路由提示也就该跟着报——那条路上
+            // `service_tier` 不存在（Chat Completions 没有这个字段），只报模型。
+            hint: routing_hint_for(&t.model, None),
             body: t.body,
             // 「客户端没要流」在两种线格式里是同一件事，收拢那段代码也就共用。
             collapse: !t.stream,
             chat: Some(ChatMode { model: t.model, include_usage: t.include_usage }),
             prefix: t.prefix,
             input_len: t.input_len,
+            // chat 翻出来的体是我们自己拼的，那一族字段一个都不带（见 [`chat::translate_request`]）。
+            client_ids: false,
         });
     }
-    Ok(normalize_responses_body(path, body, sort_tools))
+    Ok(normalize_responses_body(path, body, sort_tools, base))
 }
 
 /// 把 `responses` 请求体钉成上游要的样子：`store: false`、`stream: true`。
@@ -1172,12 +1478,33 @@ fn plan_request(path: &str, body: Bytes, sort_tools: bool) -> Result<Normalized,
 /// 就带一个）。
 ///
 /// 解不动的体（非 JSON、非对象）原样放过：判 400 是上游的事，这里不替它拦。
-fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normalized {
+fn normalize_responses_body(
+    path: &str,
+    body: Bytes,
+    sort_tools: bool,
+    base: BaseInstructions<'_>,
+) -> Normalized {
     if path.trim_start_matches('/') != config::RESPONSES_PATH {
-        return Normalized { body, collapse: false, chat: None, prefix: None, input_len: 0 };
+        return Normalized {
+            body,
+            collapse: false,
+            chat: None,
+            prefix: None,
+            input_len: 0,
+            hint: None,
+            client_ids: false,
+        };
     }
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&body) else {
-        return Normalized { body, collapse: false, chat: None, prefix: None, input_len: 0 };
+        return Normalized {
+            body,
+            collapse: false,
+            chat: None,
+            prefix: None,
+            input_len: 0,
+            hint: None,
+            client_ids: false,
+        };
     };
     // 趁体已经解开算指纹：为此再解析一遍是白花的 CPU——真实流量里这个体有几百 KB。
     // **排在算指纹之前**：指纹里就含 tools 及其顺序，反过来的话前缀稳住了而落点还在跟着
@@ -1191,11 +1518,26 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
     let reordered = sort_tools && normalize_tool_order(&mut obj);
     let prefix = prefix_parts(&obj);
     let input_len = obj.get("input").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+    // **这两项刻意排在算指纹之后**，与上面那几步相反。
+    //
+    // 指纹是 coban 自己的会话键（决定落哪个号、报哪个 `session_id`），要的是**稳**。补基座
+    // 提示这件事取决于「那份清单取到了没有」——进程刚起来时取不到、几秒后取到了。把它算进
+    // 指纹，同一段对话就会在这个边界上换一次落点，白丢一次缓存；排在后面则整段对话的键
+    // 自始至终是客户端那份体算出来的。
+    //
+    // 代价是发上去的前缀在那个边界上确实变过一次（上游那侧丢一次 prompt cache），只发生在
+    // 缓存刚热起来的那一刻，且自愈。
+    let ensured_include = ensure_reasoning_include(&mut obj);
+    let filled_instructions = fill_base_instructions(&mut obj, base);
     let yes = Some(&serde_json::Value::Bool(true));
     let no = Some(&serde_json::Value::Bool(false));
     let collapse = obj.get("stream") != yes;
     // 先扫参数、再判快路径：要不要重新序列化取决于**真的丢掉了东西**，而不是某个字段在不在。
     let dropped = drop_unsupported_params(&mut obj);
+    // **排在丢参数之后**：`service_tier: "auto"` 刚被丢掉，路由提示得反映真的发出去的那份体
+    // ——报一个体里已经没有的 `tier=auto` 就是自己造一份对不上的声明。
+    let hint = routing_hint(&obj);
+    let client_ids = obj.contains_key("client_metadata") || obj.contains_key("prompt_cache_key");
     if !collapse
         && obj.get("store") == no
         && !dropped
@@ -1203,17 +1545,142 @@ fn normalize_responses_body(path: &str, body: Bytes, sort_tools: bool) -> Normal
         && !rewrote_input
         && !merged_system
         && !said_json
+        && !ensured_include
+        && !filled_instructions
     {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
-        return Normalized { body, collapse, chat: None, prefix, input_len };
+        return Normalized { body, collapse, chat: None, prefix, input_len, hint, client_ids };
     }
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
     match serde_json::to_vec(&serde_json::Value::Object(obj)) {
-        Ok(v) => Normalized { body: Bytes::from(v), collapse, chat: None, prefix, input_len },
+        Ok(v) => Normalized {
+            body: Bytes::from(v),
+            collapse,
+            chat: None,
+            prefix,
+            input_len,
+            hint,
+            client_ids,
+        },
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
-        Err(_) => Normalized { body, collapse, chat: None, prefix, input_len },
+        Err(_) => Normalized { body, collapse, chat: None, prefix, input_len, hint, client_ids },
     }
+}
+
+/// 这条请求的 `x-codex-routing-hint` 取值：`model=<slug>`，带了服务档位则再加 `;tier=<tier>`。
+///
+/// **官方客户端每条打向 codex 后端的请求都带它**——`codex-rs/core/src/client.rs` 的
+/// `build_routing_hint_header`：只要这条请求走的是 ChatGPT 那套鉴权（`uses_codex_backend`），
+/// 就按上面那个形状拼一个出来，没有任何开关。所以「不带」是个非官方形态，而第三方客户端
+/// 一个都不发它。
+///
+/// 值取自**真的要发出去的那份体**，不是来访体：模型名与 `service_tier` 都可能已经被这一层
+/// 动过（`service_tier: "auto"` 会被丢掉，见 [`drop_unsupported_params`]），照来访那份拼就会
+/// 报一个与体对不上的声明——那比不报更糟。
+///
+/// 拼不出合法头值时回 `None`（模型名带了分隔符或非 ASCII 那种）：这个头是我们替客户端造的，
+/// 造不干净就不造，别把一条本来能过的请求变成一个 400。
+fn routing_hint(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let str_of = |k: &str| obj.get(k).and_then(|v| v.as_str());
+    routing_hint_for(str_of("model")?, str_of("service_tier"))
+}
+
+/// 按模型名与服务档位拼 `x-codex-routing-hint`，见 [`routing_hint`]。
+///
+/// 两条线格式共用它：`responses` 那条从体里取两个字段，chat 那条只有模型名
+/// （Chat Completions 没有 `service_tier`）。
+fn routing_hint_for(model: &str, tier: Option<&str>) -> Option<String> {
+    /// 这一段能不能原样放进头值里。
+    ///
+    /// 模型名与档位在官方那边都是 ASCII slug。`;` 与 `=` 是这个头自己的分隔符，混进去会把
+    /// 一个声明拆成两个；非 ASCII 与控制字符更是直接拼不出合法头值。
+    fn clean(s: Option<&str>) -> Option<&str> {
+        let s = s?.trim();
+        let ok = !s.is_empty()
+            && s.len() <= 128
+            && s.chars().all(|c| c.is_ascii_graphic() && c != ';' && c != '=' && c != ',');
+        ok.then_some(s)
+    }
+    let model = clean(Some(model))?;
+    Some(match clean(tier) {
+        Some(tier) => format!("model={model};tier={tier}"),
+        None => format!("model={model}"),
+    })
+}
+
+/// 回程要带加密推理时 `include` 里的那一项。
+pub const INCLUDE_ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
+
+/// 补上 `include: ["reasoning.encrypted_content"]`。回「是否真的补过」。
+///
+/// **官方客户端每条请求都带它，且不看有没有开推理**——`codex-rs/core/src/client.rs` 的
+/// `build_responses_request` 里就一句 `let include = vec!["reasoning.encrypted_content"]`，
+/// 没有任何分支。所以「不带」这件事本身就是个非官方形态。
+///
+/// 它管的是**回程**：这条路径 `store` 被钉成 `false`，会话不在上游，模型这一轮的思考过程只能
+/// 靠客户端把那段密文原样带回来才接得上（见 [`strip_encrypted_reasoning`]）。第三方客户端大多
+/// 不带这一项，于是每一轮的推理都是从头开始——补上之后，那类**会把上一轮 `output` 原样接回
+/// `input`** 的客户端立刻就享受到连续的推理上下文；不接回的客户端也没有损失，只是响应里多几
+/// 段它不看的字段。
+///
+/// 加法式、幂等：已经有那一项就一个字不动。`include` 是别的形状（非数组）时不碰——那不是我们
+/// 该替它决定的东西，交给上游判。
+fn ensure_reasoning_include(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    match obj.get("include") {
+        Some(serde_json::Value::Array(items)) => {
+            if items.iter().any(|v| v.as_str() == Some(INCLUDE_ENCRYPTED_REASONING)) {
+                return false;
+            }
+        }
+        None | Some(serde_json::Value::Null) => {
+            obj.insert("include".to_owned(), serde_json::json!([INCLUDE_ENCRYPTED_REASONING]));
+            return true;
+        }
+        Some(_) => return false,
+    }
+    // 数组在那儿、里面没有那一项：追加。（上面那次不可变借用到这里已经结束。）
+    if let Some(serde_json::Value::Array(items)) = obj.get_mut("include") {
+        items.push(serde_json::Value::String(INCLUDE_ENCRYPTED_REASONING.to_owned()));
+    }
+    true
+}
+
+/// 客户端一句系统意图都没给时，补上**这个模型的官方基座提示**。回「是否真的补过」。
+///
+/// 官方客户端的 `instructions` 里装的不是一句人格，而是那个模型的整份基座提示（一万到两万
+/// 字符）。它也不是编译期写死在客户端里的：`codex-rs/protocol/src/openai_models.rs` 的
+/// `get_model_instructions` 取的是**模型清单里那一项**（`model_messages.instructions_template`，
+/// `instructions_variables` 缺省时按字面量用），而那份清单正是 coban 已经在取的东西
+/// （见 [`list_models`]）。所以这里补的是上游此刻真的在下发的那一份，不是我们编的
+/// ——取不到就不补（见 [`base_instructions_for`]）。
+///
+/// **只在客户端一个字都没给时补**。判据严格到 `null` 与全空白也算「没给」，但 `instructions`
+/// 是别的形状（数组、对象）时一律不碰：那时替它换掉就是把客户端的东西弄丢了。
+///
+/// **排在 [`merge_system_messages`] 之后**（见 [`normalize_responses_body`] 里的调用顺序），
+/// 于是「客户端发了 system/developer 消息」的那一类天然不会被碰——那几句刚被搬进
+/// `instructions`，这里看到的就是非空。真正落到这一支的只有「连系统意图都没表达过」的请求。
+///
+/// 代价说清楚：补上去之后，模型会按一个**编码 agent** 的规矩答（那份提示里写满了工具怎么用、
+/// 沙箱怎么处理、补丁怎么打），而客户端可能压根没有那些工具。所以它由
+/// [`store::FILL_BASE_INSTRUCTIONS`] 管，且**默认关**——与 coban 对「改写发出去的请求」一贯的
+/// 态度一致（同 [`store::DEFAULT_UPSTREAM_UA_MODE`]）：要不要这么做取决于接入方是什么，
+/// 那件事只有用户知道。
+fn fill_base_instructions(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base: BaseInstructions<'_>,
+) -> bool {
+    match obj.get("instructions") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => {}
+        // 已经有话（或是个我们不认的形状）：一个字都不动。
+        Some(_) => return false,
+    }
+    let Some(model) = obj.get("model").and_then(|v| v.as_str()) else { return false };
+    let Some(text) = base(model).filter(|t| !t.trim().is_empty()) else { return false };
+    obj.insert("instructions".to_owned(), serde_json::Value::String(text));
+    true
 }
 
 /// `input` 给的是一段裸文本时，包成上游要的那一条用户消息。回「是否真的改过」。
@@ -1491,6 +1958,73 @@ fn note_stale_reasoning(memo: &StaleReasoningMemo, session_key: Option<&str>, cr
         memo.pop_front();
     }
     memo.push_back((key.to_owned(), cred_id));
+}
+
+/// 上游那个「回合状态」头的名字。
+///
+/// 它是**上游铸的一个不透明 blob**：官方客户端从 `/responses` 的 SSE 与
+/// `/responses/compact` 的响应头里捞出来（`codex-rs/codex-api/src/sse/responses.rs` 与
+/// `endpoint/compact.rs` 各捞一次），在同一回合后续的请求里原样回带
+/// （`core/src/client.rs` 的 `build_responses_headers`）。上游拿它做回合内的粘性路由。
+const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+
+/// 「**这个会话**手里那个 turn-state 是**哪个号**铸的」的记忆：`(会话键, 凭证 id)` 的有界集合。
+///
+/// 为什么需要它：那个 blob 是上游在「某个号 + 那次出站身份」下铸出来的，而 coban 天生会换号
+/// （粘性落点那个号一旦停用/冷却/额度暂停/RPM 打满，同一段会话就落到下一个号上）。客户端手里
+/// 攥着的还是上一个号那份，下一轮照样原样回带——于是发出去的是「A 号铸的回合状态 + B 号的
+/// 凭据」，一种**真实 codex 永远产生不出来**的组合：它一个进程只有一份凭据，回合状态与账号
+/// 天生同源。
+///
+/// 处置是**只摘不补**：认出这种跨号回带就把那个头摘掉再发，让上游按一次新回合处理。反过来
+/// 替客户端补一个我们手里的 blob 是不行的——那是上游的内部状态，谁铸的谁认。
+///
+/// 同 [`StaleReasoningMemo`]，只活在进程内存里：重启后忘掉，最多让一轮回带蒙对/蒙错一次，
+/// 而落库要为一个纯粹的形态修正摊上一张表与一轮清理。
+pub type TurnStateMemo = Arc<parking_lot::Mutex<std::collections::VecDeque<(String, i64)>>>;
+
+/// 记忆体的上限，理由同 [`STALE_REASONING_MEMO_MAX`]：会话有生有灭，只能靠先进先出顶住。
+const TURN_STATE_MEMO_MAX: usize = 512;
+
+/// 记下「这个会话手里那份 turn-state 是这个号铸的」。
+///
+/// 同一个会话只留最新那条：换号之后新号会铸一份新的交给客户端，旧的从此不该再被认作有效。
+fn note_turn_state(memo: &TurnStateMemo, session_key: Option<&str>, cred_id: i64) {
+    let Some(key) = session_key.filter(|k| !k.is_empty()) else { return };
+    let mut memo = memo.lock();
+    if let Some(slot) = memo.iter_mut().find(|(k, _)| k == key) {
+        slot.1 = cred_id;
+        return;
+    }
+    while memo.len() >= TURN_STATE_MEMO_MAX {
+        memo.pop_front();
+    }
+    memo.push_back((key.to_owned(), cred_id));
+}
+
+/// 出站守卫：客户端回带的 turn-state 若已知是别的号铸的就摘掉，见 [`TurnStateMemo`]。
+///
+/// 没有会话键、或这个会话还没见过任何 turn-state 时**不动**：那时无从判断谁铸的，而摘掉一个
+/// 其实同源的 blob 会白丢一次回合内的粘性路由。
+fn guard_turn_state_echo(
+    memo: &TurnStateMemo,
+    out: &mut reqwest::header::HeaderMap,
+    session_key: Option<&str>,
+    cred_id: i64,
+) {
+    if !out.contains_key(TURN_STATE_HEADER) {
+        return;
+    }
+    let Some(key) = session_key.filter(|k| !k.is_empty()) else { return };
+    let minted_by = memo.lock().iter().find(|(k, _)| k == key).map(|(_, id)| *id);
+    if let Some(other) = minted_by.filter(|id| *id != cred_id) {
+        out.remove(TURN_STATE_HEADER);
+        tracing::debug!(
+            cred_id,
+            minted_by = other,
+            "dropped a turn-state minted by another credential; upstream would see a              combination no real codex client can produce"
+        );
+    }
 }
 
 /// 一条请求最多为 `input` 里的坏项修几遍。
@@ -2699,15 +3233,198 @@ fn upstream_url(path: &str, query: Option<&str>) -> String {
     }
 }
 
+/// 发往上游的那一族「设备/会话身份」标识怎么处理。与 [`UaMode`] 是同一件事的两半：那个管
+/// 「这是什么客户端」，这个管「这是哪台机器上的哪段会话」。
+///
+/// 官方客户端每条请求都带一整套：`x-codex-installation-id`（本机一个 UUID，落在
+/// `~/.codex/installation_id`）、`session-id`/`thread-id`/`x-client-request-id`、
+/// `x-codex-window-id`（形态是 `<thread_id>:<窗口号>`），以及把同一族值再抄一遍的
+/// `x-codex-turn-metadata` 与体里的 `client_metadata`
+/// （`codex-rs/core/src/responses_metadata.rs` 的 `client_metadata()` / `compatibility_headers()`）。
+///
+/// 透传这一整套的后果是**一个号看着像一屋子机器**：十个人共用一个号，上游就看到同一账号下
+/// 十个 installation_id 同时在发请求——真实用户是「一个账号几台机器」，不是几十台。而 coban
+/// 换号时更糟：客户端手里那一套标识会**原样跟到第二个号上**，于是两个账号共用一个设备指纹，
+/// 这是真实 codex 永远产生不出来的形态（它一个进程只有一份凭据）。
+///
+/// **默认仍是透传**，理由不是这件事不值得做，而是**改写它有实测过的反作用**：sub2api 在
+/// v0.1.175 把同一套收敛设成了默认开（他们的 #5553），随后 #5555/#5556/#5582 报的都是额度
+/// 缩水，且有「退回上一版即恢复」与「新账号开了收敛就降额」的 A/B；他们最终把它退回显式
+/// opt-in（#5610）。上游按这些标识做什么判定是不可观测的，所以这里取同样保守的一侧：
+/// 要不要收敛由用户按自己的接入形态决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdMode {
+    /// 客户端报什么就发什么（默认，见 [`store::DEFAULT_CONVERGE_CLIENT_IDS`]）。
+    Passthrough,
+    /// 按号收敛：整套标识改写成这个号派生的那一份，见 [`Credential::derived_id`]。
+    PerAccount,
+}
+
+impl IdMode {
+    fn from_setting(v: i64) -> Self {
+        // 库里存了个越界的值时退回默认档，同 [`UaMode::from_setting`]。
+        if v == 1 { Self::PerAccount } else { Self::Passthrough }
+    }
+}
+
+/// 头里那一族身份标识：`(头名, 派生种类)`。
+///
+/// **`session_id`（下划线）不在这张表里**：那个头是 coban 自己按「账号 + 会话键」派生的
+/// （见 [`Credential::session_id`] 与 [`build_forward_headers`]），本来就已经是收敛过的值，
+/// 再过一遍只会把它变成另一个同样合法但与 [`cache_reason`] 那套归因对不上的值。
+///
+/// `x-client-request-id` 的种类是 **thread** 而不是自成一类：官方客户端把 thread_id 原样填进
+/// 这个头（`codex-rs/codex-api/src/endpoint/responses.rs`），种类分开就会让两处派生出两个值，
+/// 凭空造出一个「这两项本该相等却不等」的矛盾。
+const HEADER_IDS: &[(&str, &str)] = &[
+    ("x-codex-installation-id", "installation"),
+    ("session-id", "session"),
+    ("thread-id", "thread"),
+    ("x-client-request-id", "thread"),
+    ("x-codex-window-id", "window"),
+    ("x-codex-parent-thread-id", "thread"),
+];
+
+/// JSON 载体（`x-codex-turn-metadata` 与体里的 `client_metadata`）里那一族身份字段：
+/// `(字段名, 派生种类)`。
+///
+/// 两个载体共用一张表，因为它们装的是同一族值——官方客户端就是把同一组标识往三处各抄一遍
+/// （头、`x-codex-turn-metadata`、`client_metadata`）。分两张表的代价是三处会漂移，而
+/// 「头说 A、体说 B」比不收敛更显眼。
+///
+/// `turn_id` 那三项照样收：它们每轮都变，派生之后仍然每轮都变（原值变，派生值就变），
+/// 只是跨号不再关联。
+const JSON_IDS: &[(&str, &str)] = &[
+    ("installation_id", "installation"),
+    ("x-codex-installation-id", "installation"),
+    ("session_id", "session"),
+    ("thread_id", "thread"),
+    ("parent_thread_id", "thread"),
+    ("x-client-request-id", "thread"),
+    ("turn_id", "turn"),
+    ("parent_turn_id", "turn"),
+    ("root_turn_id", "turn"),
+    ("window_id", "window"),
+    ("x-codex-window-id", "window"),
+];
+
+/// 按种类把客户端报的一个标识派生成这个号的那一份。
+///
+/// `window` 那一类要特殊处理：它的形态是 `<thread_id>:<窗口号>`（实测样例见
+/// [`session_id_in_turn_metadata`] 那条注）。整串当原值派生会把这个结构抹平，变成一个没有
+/// 后缀的裸 UUID——官方客户端产生不出来的形状。所以拆开：前半按 **thread** 派生（于是它与
+/// `thread_id` 那一项仍然对得上，正如官方那边是拿 thread_id 拼出来的），后缀原样保留。
+fn derive_client_id(cred: &Credential, kind: &str, original: &str) -> String {
+    if kind == "window"
+        && let Some((thread, suffix)) = original.split_once(':')
+        && !thread.is_empty()
+    {
+        return format!("{}:{}", cred.derived_id("thread", thread), suffix);
+    }
+    cred.derived_id(kind, original)
+}
+
+/// 把头里那一族身份标识改写成这个号派生的那一份，见 [`IdMode`]。
+///
+/// **`x-codex-installation-id` 缺席时会补一个**（其余项只改不补）：官方客户端每条请求都带它，
+/// 而第三方客户端一个都不发——缺这一项本身就是个非官方形态。其余项（会话/线程/窗口）不补：
+/// 那几个描述的是「客户端那边的哪一段对话」，凭空造一份等于替一个压根没有会话概念的客户端
+/// 编一段会话结构出来，而它下一条请求又会换一个，反倒更乱。
+fn converge_header_ids(out: &mut reqwest::header::HeaderMap, cred: &Credential) {
+    for (name, kind) in HEADER_IDS {
+        let original = out.get(*name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let next = match original.as_deref().map(str::trim) {
+            Some(v) if !v.is_empty() => derive_client_id(cred, kind, v),
+            // 设备标识是「这个号在哪台机器上」，与客户端报什么无关，缺了就补上。
+            _ if *kind == "installation" => cred.derived_id("installation", ""),
+            _ => continue,
+        };
+        if let Ok(value) = HeaderValue::from_str(&next) {
+            out.insert(HeaderName::from_static(name), value);
+        }
+    }
+    // 那份 JSON 元数据里抄着同一族值，跟着一起改——只改头不改它，等于让上游同时看到两套
+    // 身份，比不收敛更显眼。
+    if let Some(raw) =
+        out.get(TURN_METADATA_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned)
+        && let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&raw)
+        && converge_json_ids(&mut meta, cred)
+        && let Ok(rebuilt) = serde_json::to_string(&meta)
+        && let Ok(value) = HeaderValue::from_str(&rebuilt)
+    {
+        out.insert(HeaderName::from_static(TURN_METADATA_HEADER), value);
+    }
+}
+
+/// 把一个 JSON 对象里那一族身份字段改写成这个号派生的那一份。回「是否真的改过」。
+///
+/// 只认对象，且**只改字符串值**：形状不对的就地放过，判它是上游的事。嵌在里面的那个
+/// `x-codex-turn-metadata`（`client_metadata` 里它是一段 JSON **字符串**）会递归进去改——
+/// 官方客户端就是这么套的，漏掉它就等于把一套没改过的身份留在体里。
+fn converge_json_ids(v: &mut serde_json::Value, cred: &Credential) -> bool {
+    let Some(obj) = v.as_object_mut() else { return false };
+    let mut changed = false;
+    for (field, kind) in JSON_IDS {
+        if let Some(serde_json::Value::String(original)) = obj.get(*field) {
+            let original = original.trim();
+            if original.is_empty() {
+                continue;
+            }
+            let next = derive_client_id(cred, kind, original);
+            obj.insert((*field).to_owned(), serde_json::Value::String(next));
+            changed = true;
+        }
+    }
+    // 内嵌那一层：值是一段 JSON 字符串，解开改完再原样塞回去。
+    if let Some(serde_json::Value::String(raw)) = obj.get(TURN_METADATA_HEADER)
+        && let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(raw)
+        && converge_json_ids(&mut inner, cred)
+        && let Ok(rebuilt) = serde_json::to_string(&inner)
+    {
+        obj.insert(TURN_METADATA_HEADER.to_owned(), serde_json::Value::String(rebuilt));
+        changed = true;
+    }
+    changed
+}
+
+/// 把请求体里那一族身份字段改写成这个号派生的那一份；没改动则回 `None`（那时不重新序列化）。
+///
+/// 动两处：
+/// - `client_metadata`：官方客户端把整套标识往这里抄一遍，见 [`JSON_IDS`]；
+/// - `prompt_cache_key`：官方客户端拿会话身份当它的值。**这条路径上它其实不生效**（上游认的
+///   是 `session_id` 头，见 [`cache_reason`] 那条注），但留着一个没改过的原值就等于在体里留了
+///   半份没收敛的身份——形态上要么整份收敛、要么整份透传。
+///
+/// 只在 [`Normalized::client_ids`] 说体里确实有这些字段时才被调用，所以这里的解析不是白花的。
+fn converge_body_ids(body: &Bytes, cred: &Credential) -> Option<Bytes> {
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice::<serde_json::Value>(body)
+    else {
+        return None;
+    };
+    let mut changed = false;
+    if let Some(meta) = obj.get_mut("client_metadata") {
+        changed |= converge_json_ids(meta, cred);
+    }
+    if let Some(serde_json::Value::String(key)) = obj.get("prompt_cache_key") {
+        let key = key.trim();
+        if !key.is_empty() {
+            let next = derive_client_id(cred, "prompt-cache", key);
+            obj.insert("prompt_cache_key".to_owned(), serde_json::Value::String(next));
+            changed = true;
+        }
+    }
+    changed.then(|| serde_json::to_vec(&serde_json::Value::Object(obj)).ok().map(Bytes::from))?
+}
+
 /// 发往上游的 `User-Agent` 怎么处理。三档与库里 [`store::UPSTREAM_UA_MODE`] 一一对应。
 ///
 /// **入站不按 UA 拦人**：门是接入 key 在把（见 [`client_authorized`]），而 UA 是客户端
 /// 一行配置就能改的东西，拦不住任何有意绕的人。这个开关管的是**出站形态**——上游看到的
 /// 是不是一个自相一致的客户端。
 ///
-/// 它**同时管 `originator`**（见 [`build_forward_headers`]）：那两个头说的是同一件事
-/// （「谁在发」），分开处理就会拼出「UA 说 Codex Desktop、`originator` 说 codex_cli_rs」这种
-/// 谁都产生不出来的组合。要么整份透传，要么整份收敛。
+/// 它**同时管 `originator` 与 `version`**（见 [`build_forward_headers`]）：这三个头说的是同一
+/// 件事（「谁在发」），分开处理就会拼出「UA 说 Codex Desktop、`originator` 说 codex_cli_rs」
+/// 这种谁都产生不出来的组合。要么整份透传，要么整份收敛。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UaMode {
     /// 来访客户端报什么就发什么（默认，见 [`store::DEFAULT_UPSTREAM_UA_MODE`]）。
@@ -2766,6 +3483,7 @@ fn build_forward_headers(
     token: &str,
     fingerprint: &str,
     ua_mode: UaMode,
+    hint: Option<&str>,
 ) -> reqwest::header::HeaderMap {
     // 改写 UA 的话，与旧 UA 同源的那族留痕头就**一条都不抄进来**：UA 说 codex CLI、
     // `x-stainless-lang` 说 python SDK，这种自相矛盾比两者都老实报 python 更显眼。
@@ -2808,6 +3526,43 @@ fn build_forward_headers(
     if !keeps_originator {
         set(&mut out, "originator", config::ORIGINATOR);
     }
+    // `version` 与那两个头归**同一个判断**，理由一样：三个头说的都是「谁在发」。官方客户端
+    // 把它挂在 provider 的默认头上，每条请求都带（见 [`config::CODEX_VERSION`] 的注），所以
+    // 「来访没带」是要补的——第三方 SDK 一个都不发它，而它们拿到的 UA/`originator` 已经是
+    // CLI 那份，缺这一个就成了半份身份。
+    //
+    // **透传档不碰客户端自报的版本号**，哪怕它比 [`config::CODEX_VERSION`] 旧：那客户端的 UA
+    // 里写的也是那个旧版本，只把 `version` 拔高等于拼出「UA 说 0.140、version 说 0.153」这种
+    // 谁都产生不出来的组合——与 `originator` 半透半收是同一种病。要统一就整份收敛（`1`/`2`
+    // 档，见 [`UaMode`]）。
+    let keeps_version = !rewrite_ua
+        && incoming
+            .get("version")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.trim().is_empty());
+    if !keeps_version {
+        set(&mut out, "version", config::CODEX_VERSION);
+    }
+    // `x-codex-routing-hint`：来访没带就补一个（见 [`routing_hint`]）。官方客户端每条请求都
+    // 带它，而第三方客户端一个都不发。
+    //
+    // **带了就不动**：真实 codex 报的那份是按它自己那次请求的模型与档位拼的，而 coban 不改
+    // 模型名，两边算出来的是同一个值；万一不同（客户端自己拼错、或它报的与体里对不上），
+    // 那也是它的声明，替它改写等于把一个能查的矛盾藏起来。
+    if let Some(hint) = hint.filter(|_| !out.contains_key("x-codex-routing-hint")) {
+        set(&mut out, "x-codex-routing-hint", hint);
+    }
+    // **`x-codex-beta-features` 刻意不补**（来访带了就跟着透传，那是上面那个循环干的事）。
+    //
+    // 它不是身份的一部分，而是「这个客户端开了哪几个 beta」：官方那边它来自会话配置
+    // （`codex-rs/core/src/client.rs` 的 `beta_features_header`，一个 `Option<String>`，
+    // `build_responses_headers` 只在非空时才插这个头），所以**没开 beta 的真实客户端压根不发
+    // 它**——「不带」正是最常见的官方形态，替客户端补一个反而是替它开一个它没要的功能。
+    //
+    // 同理 `openai-beta`：0.153.4 的 HTTP `/responses` 路径一个都不发（`OPENAI_BETA_HEADER`
+    // 只出现在 WS 握手那条路上，值是 `responses_websockets=2026-02-06`），所以这里也不补。
+    // 早先按第三方实现的做法准备补一个 `responses=experimental`，核对客户端源码后作废。
+    //
     // 会话 id 按账号 + 会话键派生，见 Credential::session_id 的注。
     set(&mut out, "session_id", &cred.session_id(fingerprint));
     // **这里不补 `accept-encoding`**：官方客户端一个都不发（来访那份已在
@@ -3059,9 +3814,12 @@ fn value_shape(v: &serde_json::Value) -> String {
 /// ——流被收拢成 JSON、chat 那条还整个换了线格式，照抄那个长度会让客户端按一个错的字节数
 /// 截断，表现为 SSE 流莫名其妙断在中间。`content-encoding` 同理：我们不解压（见
 /// [`warn_if_compressed`]），但重新拼过的体上带着上游那个编码声明只会更糟。
-fn resp_builder(up: &reqwest::Response) -> axum::http::response::Builder {
-    let mut builder = Response::builder().status(up.status().as_u16());
-    for (name, value) in up.headers().iter() {
+fn resp_builder(
+    status: StatusCode,
+    up_headers: &reqwest::header::HeaderMap,
+) -> axum::http::response::Builder {
+    let mut builder = Response::builder().status(status);
+    for (name, value) in up_headers.iter() {
         if matches!(
             name.as_str(),
             "content-length" | "content-encoding" | "transfer-encoding" | "connection"
@@ -3784,10 +4542,14 @@ impl Drop for InFlightGuard {
 /// 超时就退回内置兜底清单（见前端），比让下拉框一直转圈有用。
 const MODEL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// 上游模型清单里的一项（只留界面要用的那几个字段）。
+/// 上游模型清单里的一项（只留界面要用的那几个字段，外加基座提示）。
 ///
-/// 上游还回 `instructions_template`（每个模型几 KB 的基座提示）、reasoning 档位等一大堆
-/// 东西，**刻意不透传**：那会把一个几 KB 的响应变成几百 KB，而下拉框只需要名字。
+/// 上游还回 reasoning 档位、上下文窗口、各种开关等一大堆东西，**刻意不透传**：那会把一个
+/// 几 KB 的响应变成几百 KB，而下拉框只需要名字。
+///
+/// 基座提示（`model_messages.instructions_template`，每个模型一两万字符）是个例外：它要解出来
+/// 进缓存（见 [`fill_base_instructions`]），但**同样不出现在对外的响应里**——那个字段挂着
+/// `skip_serializing`，网页拿到的形状与从前逐字节相同。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct UpstreamModel {
     /// 传给上游的模型名（`model` 字段填的就是它）。
@@ -3813,6 +4575,54 @@ pub struct UpstreamModel {
     /// 上游给的排序权重，小者靠前（codex 的选择器就按它排）。
     #[serde(default)]
     pub priority: Option<i64>,
+    /// 这个模型的基座提示等一族「客户端该说什么」的模板，见 [`ModelMessages`]。
+    ///
+    /// **不出现在对外的响应里**（`skip_serializing`）：它一项就有一两万字符，而网页只要名字。
+    #[serde(default, skip_serializing)]
+    pub model_messages: Option<ModelMessages>,
+}
+
+/// 模型清单里那一项的 `model_messages`（只解基座提示要用的那两个字段）。
+///
+/// 字段名与语义抄 `codex-rs/protocol/src/openai_models.rs` 的 `ModelMessages`。那边还有
+/// approvals/permissions/multi_agent 等一族「客户端自己怎么用」的模板，与发给上游的请求
+/// 无关，不解。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ModelMessages {
+    /// 基座提示本体。`instructions_variables` 缺省时它就是字面量。
+    #[serde(default)]
+    pub instructions_template: Option<String>,
+    /// 模板里 `{{ personality }}` 那个占位符的几种取值。整个缺省（实测九个模型全是 `null`）
+    /// 时按字面量用模板，见 [`ModelMessages::base_instructions`]。
+    #[serde(default)]
+    pub instructions_variables: Option<InstructionsVariables>,
+}
+
+/// `{{ personality }}` 的几种取值，见 [`ModelMessages`]。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct InstructionsVariables {
+    #[serde(default)]
+    pub personality_default: Option<String>,
+}
+
+impl ModelMessages {
+    /// 渲染出这个模型的基座提示，也就是官方客户端会填进 `instructions` 的那段文字。
+    ///
+    /// 渲染规则抄 `openai_models.rs` 的 `get_model_instructions(/*personality*/ None)`：
+    /// - `instructions_variables` 缺省 → 模板按**字面量**用（当前上游九个模型都走这一支）；
+    /// - 在场 → 把 `{{ personality }}` 换成默认那一档的文字（缺了就换成空串，同官方
+    ///   `get_personality_message` 对 `None` 的处置）。
+    ///
+    /// coban 不带人格档（那是客户端的一个本地设置，我们这一跳没有它），所以恒取默认档。
+    fn base_instructions(&self) -> Option<String> {
+        const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+        let template = self.instructions_template.as_deref()?;
+        let Some(vars) = self.instructions_variables.as_ref() else {
+            return Some(template.to_owned());
+        };
+        let personality = vars.personality_default.as_deref().unwrap_or_default();
+        Some(template.replace(PERSONALITY_PLACEHOLDER, personality))
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -3884,6 +4694,10 @@ pub async fn list_models(
         client_version = config::CODEX_VERSION,
         "fetched the upstream model list"
     );
+    // 顺手把这份清单里的基座提示记进缓存。**放在这一处**是因为它是所有取清单动作的必经之路
+    // （网页的下拉、对外的 `/v1/models`、转发路径那次后台补取都从这里过），记在别处就会出现
+    // 「清单取到了而提示没记上」的组合。
+    note_base_instructions(state, &models);
     Ok(models)
 }
 
@@ -3903,6 +4717,105 @@ const MODEL_LIST_MAX_CREDS: usize = 3;
 
 /// `/v1/models` 的清单缓存：取到的时刻 + 模型 slug 列表。
 pub type ModelListCache = Arc<parking_lot::Mutex<Option<(Instant, Vec<String>)>>>;
+
+/// 每个模型的官方基座提示，见 [`fill_base_instructions`]。
+///
+/// 只活在进程内存里（同 [`StaleReasoningMemo`] 那几份记忆）：它是上游此刻在下发的东西，
+/// 落库等于把一份会过期的副本钉住，而重取只是一次几百 KB 的 GET。
+pub type BaseInstructionsCache = Arc<parking_lot::Mutex<BaseInstructionsCached>>;
+
+/// [`BaseInstructionsCache`] 里装的东西。
+#[derive(Default)]
+pub struct BaseInstructionsCached {
+    /// 模型 slug → 那个模型的基座提示。
+    by_model: std::collections::HashMap<String, String>,
+    /// 最近一次**尝试**取清单的时刻。成功与否都记：失败也要压住重试频率，否则一个取不到
+    /// 清单的部署会为每条请求各发一次后台补取。
+    tried: Option<Instant>,
+    /// 有没有一次后台补取正在跑。
+    fetching: bool,
+}
+
+/// 基座提示多久重取一次。
+///
+/// 比 [`MODEL_LIST_CACHE_TTL`] 松得多：那份是人在下拉框前等着、要「刚上新的模型马上出现」，
+/// 而这份是发给上游的一段文字——上游改提示的频率是版本级的，一小时一次足够跟上，而每次重取
+/// 要拉一份几百 KB 的清单。
+const BASE_INSTRUCTIONS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 取不到时至少隔多久再试。
+///
+/// 「取不到」有两种：清单拉不下来（没号、全在冷却、上游挂了），以及清单拉到了但里面没有这个
+/// 模型（客户端报了个上游不认的 slug）。后一种永远不会因为重取而改变，所以这条节流不能只
+/// 管失败——它管的是**每一次没能答上来**，否则那类客户端会让 coban 每条请求都发一次补取。
+const BASE_INSTRUCTIONS_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 把一份刚取到的清单里的基座提示记进缓存。
+///
+/// **一份都没解出来时不动缓存**：那多半是上游改了字段名（或这个号看到的清单被裁到没有
+/// `model_messages`），此时把上一份好的清掉等于让这个功能静默失效；留着旧的至少还对。
+fn note_base_instructions(state: &AppState, models: &[UpstreamModel]) {
+    let fresh: std::collections::HashMap<String, String> = models
+        .iter()
+        .filter_map(|m| {
+            let text = m.model_messages.as_ref()?.base_instructions()?;
+            (!text.trim().is_empty()).then(|| (m.slug.clone(), text))
+        })
+        .collect();
+    if fresh.is_empty() {
+        tracing::debug!(
+            count = models.len(),
+            "the upstream model list carried no base instructions; keeping the cached ones"
+        );
+        return;
+    }
+    let mut cache = state.base_instructions.lock();
+    // 整份换掉而不是合并：上游下线的模型不该留在缓存里。
+    cache.by_model = fresh;
+    cache.tried = Some(Instant::now());
+}
+
+/// 这个模型此刻的基座提示，取不到就回 `None`（那时 [`fill_base_instructions`] 什么都不做）。
+///
+/// **不在这条路径上等上游**：客户端正等着这条请求，为补一段提示先去拉一份几百 KB 的清单，
+/// 等于给每个「清单还没热」的会话加一次上游往返。取不到就照客户端给的体发出去（与这个开关
+/// 关着时的行为逐字节相同），同时踢一次后台补取——下一条请求就有了。
+fn base_instructions_for(state: &AppState, model: &str) -> Option<String> {
+    let (hit, stale) = {
+        let cache = state.base_instructions.lock();
+        let stale = cache.tried.is_none_or(|t| t.elapsed() >= BASE_INSTRUCTIONS_TTL);
+        (cache.by_model.get(model).cloned(), stale)
+    };
+    if hit.is_none() || stale {
+        kick_base_instructions_refresh(state);
+    }
+    hit
+}
+
+/// 踢一次后台补取。已经有一次在跑、或刚试过（见 [`BASE_INSTRUCTIONS_RETRY`]）就不踢。
+fn kick_base_instructions_refresh(state: &AppState) {
+    {
+        let mut cache = state.base_instructions.lock();
+        if cache.fetching || cache.tried.is_some_and(|t| t.elapsed() < BASE_INSTRUCTIONS_RETRY) {
+            return;
+        }
+        cache.fetching = true;
+        // 现在就记上「试过了」：补取要跑好几秒，期间进来的请求不该各踢一次。
+        cache.tried = Some(Instant::now());
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        // 走取清单那条路（含换号），拿到之后 [`list_models`] 自己会把提示记进缓存。
+        // 这里丢掉 slug 那份返回值：调用它只为那个副作用。
+        if let Err(e) = fetch_model_slugs(&state).await {
+            tracing::debug!(
+                error = %format!("{:#}", e.inner()),
+                "could not fetch the base instructions; requests keep the client's own instructions"
+            );
+        }
+        state.base_instructions.lock().fetching = false;
+    });
+}
 
 /// 这条请求是不是「OpenAI 兼容客户端在问有哪些模型」。判据见 [`openai_model_list`] 的注。
 fn wants_openai_model_list(path: &str, method: &Method, uri: &Uri) -> bool {
@@ -4414,7 +5327,7 @@ fn synthetic_headers(
     accept: &'static str,
 ) -> reqwest::header::HeaderMap {
     // 合成请求没有来访会话，指纹留空——它们也不该去蹭真实会话的 prompt cache。
-    let mut headers = build_forward_headers(&HeaderMap::new(), cred, token, "", UaMode::Pin);
+    let mut headers = build_forward_headers(&HeaderMap::new(), cred, token, "", UaMode::Pin, None);
     headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
     headers
 }
@@ -4527,8 +5440,10 @@ fn probe_report(
             status: status.as_u16(),
             latency_ms,
             model: sniffer.model.clone(),
-            error_type: failure.as_ref().and_then(|(t, _)| t.clone()),
-            error: failure.map(|(_, m)| truncate(&m)),
+            // 探测报告里报的是「哪一类失败」：`type` 缺席时那个 `code` 就是唯一的线索
+            // （见 [`SseFailure::etype`]）。
+            error_type: failure.as_ref().map(|f| f.etype().to_owned()),
+            error: failure.map(|f| truncate(&f.message)),
             quota,
             retry_after_secs,
         };
@@ -4559,11 +5474,59 @@ fn parse_upstream_error(bytes: &[u8]) -> (Option<String>, String) {
     (etype, message.unwrap_or(raw))
 }
 
-/// 在一段 SSE 里找失败事件，返回 (`error.type`, `error.message`)。
+/// 这条流内失败是不是「上游把这条请求降载了」——也就是换个号可能就好的那一类。
+///
+/// **判据抄的是客户端源码，不是自己列的**：`codex-rs/codex-api/src/sse/responses.rs` 的
+/// `is_server_overloaded_error` 只认两个 code：
+///
+/// ```text
+/// error.code == "server_is_overloaded" || error.code == "slow_down"
+/// ```
+///
+/// 官方客户端把它们映射成 `ApiError::ServerOverloaded`（可重试的一类），其余 code 各有归属：
+/// `context_length_exceeded`/`insufficient_quota`/`cyber_policy`/`invalid_prompt` 等是**定局**
+/// （换号一样失败，重发只是白花一次额度），`rate_limit_exceeded` 那一类带退避时长。
+///
+/// coban 这里**只对这两个 code 换号**，别的一律照旧原样交回客户端：
+/// - 定局那几类换号是纯浪费，而且会把一条本该指得到原因的错误（「你的输入超过上下文窗口」）
+///   变成一串「每个号都失败了」；
+/// - `rate_limit_exceeded` 这一类看着像该换号，但它是**流内**的：上游已经收下并开始处理了这
+///   条请求，与 HTTP 429 那条路（凭证当场被排掉 + 打冷却，见 [`rate_limit_cooldown`]）不是
+///   一回事。要在这里也接上那套处置，得先拿到真实样本确认它长什么样——凭猜写一套账号级
+///   处置，代价是可能把好号打上冷却。
+///
+/// 为什么这一类值得单独接：上游在容量紧张时按客户端身份分优先级降载，被降载的请求拿到的是
+/// **HTTP 200 + 流内 `server_is_overloaded`**。不认它，客户端就收到一个「成功」的空回复；
+/// 认了它就能换个号再试一次，而这正是把一堆号挂在 coban 后面的意义。
+fn capacity_shed(f: &SseFailure) -> bool {
+    matches!(f.code.as_deref(), Some("server_is_overloaded" | "slow_down"))
+}
+
+/// 流里那条失败事件说了什么，见 [`sse_failure`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SseFailure {
+    /// `error.type`；上游在这一族事件里经常只给 `code`，那时这里是 `None`。
+    etype: Option<String>,
+    /// `error.code`。**判「换个号会不会好」只看它**，见 [`capacity_shed`]。
+    code: Option<String>,
+    message: String,
+}
+
+impl SseFailure {
+    /// 交回客户端时用的错误类型名：`type` 优先，只有 `code` 时用它。
+    ///
+    /// 两者都缺就退回一个笼统的名字——这一族事件的形状由上游说了算，缺字段不该让这条路径
+    /// 拿不出一个能交出去的错误。
+    fn etype(&self) -> &str {
+        self.etype.as_deref().or(self.code.as_deref()).unwrap_or("upstream_error")
+    }
+}
+
+/// 在一段 SSE 里找失败事件。
 ///
 /// 上游会先回 200 再在流里说这次生成失败（`response.failed` / `error` 事件）。只看状态码
 /// 会把这种情形报成「通过」，而它恰恰是模型不可用时最常见的形状之一。
-fn sse_failure(bytes: &[u8]) -> Option<(Option<String>, String)> {
+fn sse_failure(bytes: &[u8]) -> Option<SseFailure> {
     let text = String::from_utf8_lossy(bytes);
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data:") else { continue };
@@ -4583,7 +5546,7 @@ fn sse_failure(bytes: &[u8]) -> Option<(Option<String>, String)> {
         let message = s("/message")
             .or_else(|| err.as_str().map(str::to_owned))
             .unwrap_or_else(|| err.to_string());
-        return Some((s("/type").or_else(|| s("/code")), message));
+        return Some(SseFailure { etype: s("/type"), code: s("/code"), message });
     }
     None
 }
@@ -4723,6 +5686,15 @@ impl QuotaSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「取不到基座提示」那一格，见 [`BaseInstructions`]。
+    ///
+    /// 绝大多数测试都该走它：那是这个开关关着（默认）时的行为，也是缓存还没热时的行为，
+    /// 而这两种情况下规范化的结果必须与从前逐字节相同。补的那一支单独测（见
+    /// `filling_the_base_instructions_*`）。
+    fn no_base(_model: &str) -> Option<String> {
+        None
+    }
 
     /// 探测体的三个硬要求（`instructions`/`store:false`/`stream:true`）不能被顺手改掉：
     /// 少任何一个，订阅模式那条路径都会直接 400/422，而报出来的是「模型不可用」。
@@ -4894,9 +5866,11 @@ mod tests {
             "event: response.failed\n",
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n",
         );
-        let (etype, msg) = sse_failure(sse.as_bytes()).expect("the failure event is found");
-        assert_eq!(etype.as_deref(), Some("server_error"));
-        assert_eq!(msg, "boom");
+        let f = sse_failure(sse.as_bytes()).expect("the failure event is found");
+        assert_eq!(f.code.as_deref(), Some("server_error"));
+        assert_eq!(f.etype(), "server_error", "只给了 code 时它就是那个类型名");
+        assert_eq!(f.message, "boom");
+        assert!(!capacity_shed(&f), "server_error 不是容量降载，换号只是白花一次");
 
         // `"error": null` 是成功事件里的常见字段，不能被当成失败。
         let ok_sse = concat!(
@@ -4960,7 +5934,170 @@ mod tests {
     }
 
     fn norm(path: &str, b: &str) -> Normalized {
-        normalize_responses_body(path, Bytes::from(b.to_owned()), false)
+        normalize_responses_body(path, Bytes::from(b.to_owned()), false, &no_base)
+    }
+
+    /// `include: ["reasoning.encrypted_content"]` 是官方客户端每条请求都带的东西，补法必须是
+    /// 加法式的：没有就加、有了不动、里面有别的项一并留着。
+    #[test]
+    fn the_encrypted_reasoning_include_is_added_without_clobbering() {
+        let v = |b: &str| -> serde_json::Value {
+            serde_json::from_slice(&norm("responses", b).body).unwrap()
+        };
+
+        // 压根没有这个字段（第三方客户端天天在发的形状）。
+        let out = v(r#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(out["include"], serde_json::json!([INCLUDE_ENCRYPTED_REASONING]));
+
+        // `null` 与空数组都当「没有」处置。
+        assert_eq!(
+            v(r#"{"model":"m","include":null}"#)["include"],
+            serde_json::json!([INCLUDE_ENCRYPTED_REASONING])
+        );
+        assert_eq!(
+            v(r#"{"model":"m","include":[]}"#)["include"],
+            serde_json::json!([INCLUDE_ENCRYPTED_REASONING])
+        );
+
+        // 客户端另外要了别的东西：那几项一个不许丢。
+        assert_eq!(
+            v(r#"{"model":"m","include":["message.output_text.logprobs"]}"#)["include"],
+            serde_json::json!(["message.output_text.logprobs", INCLUDE_ENCRYPTED_REASONING])
+        );
+
+        // 已经有了：一个字都不动，也不重复追加（快路径就靠这个成立，见
+        // `an_already_sorted_tool_list_is_left_byte_for_byte_alone`）。
+        let mut once = serde_json::Map::new();
+        once.insert("include".into(), serde_json::json!([INCLUDE_ENCRYPTED_REASONING]));
+        assert!(!ensure_reasoning_include(&mut once));
+
+        // 是别的形状：不碰，判 400 是上游的事。
+        let mut weird = serde_json::Map::new();
+        weird.insert("include".into(), serde_json::json!("reasoning.encrypted_content"));
+        assert!(!ensure_reasoning_include(&mut weird));
+        assert_eq!(weird["include"], "reasoning.encrypted_content");
+    }
+
+    /// 补基座提示：只在客户端一个字都没给时补，且只补取得到的那一份。
+    #[test]
+    fn filling_the_base_instructions_only_covers_the_silent_clients() {
+        let base = |model: &str| (model == "gpt-6-astra").then(|| "官方基座提示".to_owned());
+        let fill = |b: &str| -> serde_json::Value {
+            let n = normalize_responses_body(
+                "responses",
+                Bytes::from(b.to_owned()),
+                false,
+                &base as BaseInstructions<'_>,
+            );
+            serde_json::from_slice(&n.body).unwrap()
+        };
+
+        // 字段压根没有：补。
+        assert_eq!(fill(r#"{"model":"gpt-6-astra"}"#)["instructions"], "官方基座提示");
+        // `null` 与全空白也算「没给」。
+        assert_eq!(
+            fill(r#"{"model":"gpt-6-astra","instructions":null}"#)["instructions"],
+            "官方基座提示"
+        );
+        assert_eq!(
+            fill(r#"{"model":"gpt-6-astra","instructions":"   "}"#)["instructions"],
+            "官方基座提示"
+        );
+
+        // 客户端说过话：一个字都不动（codex CLI 与所有带系统提示的接入方走的正是这条路）。
+        assert_eq!(
+            fill(r#"{"model":"gpt-6-astra","instructions":"你是我的翻译器"}"#)["instructions"],
+            "你是我的翻译器"
+        );
+
+        // 这个模型的提示取不到（清单还没热、或客户端报了个上游不认的 slug）：不补，
+        // 照客户端给的体发出去。
+        assert!(fill(r#"{"model":"unknown-model"}"#).get("instructions").is_none());
+
+        // 体里连模型都没有：无从查，也不补。
+        assert!(fill(r#"{"input":[]}"#).get("instructions").is_none());
+
+        // 形状不认（数组）：不碰——替它换掉就是把客户端的东西弄丢了。
+        let mut weird = serde_json::Map::new();
+        weird.insert("model".into(), serde_json::json!("gpt-6-astra"));
+        weird.insert("instructions".into(), serde_json::json!(["a"]));
+        assert!(!fill_base_instructions(&mut weird, &base));
+        assert_eq!(weird["instructions"], serde_json::json!(["a"]));
+    }
+
+    /// **补与不补必须算出同一个会话键**：那份提示取决于「清单热了没有」，把它算进指纹的话，
+    /// 同一段对话会在缓存热起来的那一刻换一次落点，白丢一次缓存。
+    #[test]
+    fn the_session_key_does_not_depend_on_whether_the_base_instructions_are_warm() {
+        let body = r#"{"model":"gpt-6-astra","input":[{"role":"user","content":"hi"}]}"#;
+        let base = |_: &str| Some("官方基座提示".to_owned());
+
+        let cold = norm("responses", body);
+        let warm = normalize_responses_body(
+            "responses",
+            Bytes::from(body.to_owned()),
+            false,
+            &base as BaseInstructions<'_>,
+        );
+        assert_eq!(
+            cold.prefix.as_ref().map(|p| p.key.clone()),
+            warm.prefix.as_ref().map(|p| p.key.clone())
+        );
+        // 而发出去的体确实不同——指纹不变不是因为这一步没生效。
+        assert_ne!(cold.body, warm.body);
+    }
+
+    /// 基座提示的渲染规则抄的是官方那份 `get_model_instructions(None)`。
+    #[test]
+    fn the_base_instructions_render_like_the_official_client() {
+        let literal = ModelMessages {
+            instructions_template: Some("You are Codex, {{ personality }}done".into()),
+            instructions_variables: None,
+        };
+        // 变量整个缺省（实测上游九个模型全是这样）：模板按字面量用，占位符**不**替换。
+        assert_eq!(literal.base_instructions().unwrap(), "You are Codex, {{ personality }}done");
+
+        // 变量在场：换成默认那一档。
+        let with_vars = ModelMessages {
+            instructions_template: Some("You are Codex, {{ personality }}done".into()),
+            instructions_variables: Some(InstructionsVariables {
+                personality_default: Some("pragmatic. ".into()),
+            }),
+        };
+        assert_eq!(with_vars.base_instructions().unwrap(), "You are Codex, pragmatic. done");
+
+        // 变量在场但缺默认档：换成空串（同官方对 `None` 的处置）。
+        let empty_default = ModelMessages {
+            instructions_template: Some("A{{ personality }}B".into()),
+            instructions_variables: Some(InstructionsVariables { personality_default: None }),
+        };
+        assert_eq!(empty_default.base_instructions().unwrap(), "AB");
+
+        // 压根没有模板：没有可补的东西。
+        let none = ModelMessages { instructions_template: None, instructions_variables: None };
+        assert!(none.base_instructions().is_none());
+    }
+
+    /// 那一两万字符的基座提示**不许出现在对外的响应里**：网页只要名字，而模型清单接口会把
+    /// 这个结构原样序列化出去。
+    #[test]
+    fn the_model_list_response_never_carries_the_base_instructions() {
+        let model = UpstreamModel {
+            slug: "gpt-6-astra".into(),
+            display_name: None,
+            description: None,
+            visibility: None,
+            supported_in_api: None,
+            priority: None,
+            model_messages: Some(ModelMessages {
+                instructions_template: Some("一大段基座提示".into()),
+                instructions_variables: None,
+            }),
+        };
+        let json = serde_json::to_string(&model).unwrap();
+        assert!(!json.contains("一大段基座提示"), "{json}");
+        assert!(!json.contains("model_messages"), "{json}");
+        assert!(json.contains("gpt-6-astra"));
     }
 
     /// `store`/`stream` 的三种来法都要落到上游要的值，且别的字段一个不动。
@@ -5072,15 +6209,15 @@ mod tests {
     fn body_rewrite_only_touches_responses_and_valid_json() {
         // 别的端点（如 models）不碰。
         let raw = Bytes::from_static(br#"{"store":true}"#);
-        assert_eq!(normalize_responses_body("models", raw.clone(), false).body, raw);
+        assert_eq!(normalize_responses_body("models", raw.clone(), false, &no_base).body, raw);
         // 前导斜杠仍要认出是 responses。
-        let out = normalize_responses_body("/responses", raw.clone(), false).body;
+        let out = normalize_responses_body("/responses", raw.clone(), false, &no_base).body;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["store"], false);
         assert_eq!(v["stream"], true);
         // 解不动的体原样放过，不在这里替上游拦。
         let junk = Bytes::from_static(b"not json");
-        assert_eq!(normalize_responses_body("responses", junk.clone(), false).body, junk);
+        assert_eq!(normalize_responses_body("responses", junk.clone(), false, &no_base).body, junk);
     }
 
     /// 收拢流靠的是终局事件里那个 `response` 对象；增量事件与裸的同名字符串都不能骗过它。
@@ -5181,7 +6318,7 @@ mod tests {
         );
         // 两种路径写法（`/v1/chat/completions` 与根上的 `/chat/completions`）都要认出来。
         for path in ["chat/completions", "/chat/completions"] {
-            let n = plan_request(path, chat_body.clone(), false).expect("translates");
+            let n = plan_request(path, chat_body.clone(), false, &no_base).expect("translates");
             assert!(n.chat.is_some(), "{path} 应走 chat 翻译");
             assert!(!n.collapse, "客户端要了流就照流回");
             let v: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
@@ -5193,15 +6330,19 @@ mod tests {
             "chat/completions",
             Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#),
             false,
+            &no_base,
         )
         .unwrap();
         assert!(n.collapse);
 
         // responses 那条不受影响，也不会被当成 chat。
-        let n = plan_request("responses", Bytes::from_static(br#"{"model":"m"}"#), false).unwrap();
+        let n = plan_request("responses", Bytes::from_static(br#"{"model":"m"}"#), false, &no_base)
+            .unwrap();
         assert!(n.chat.is_none());
         // 形状错误在这一层就拒，不送去上游换一句指不到原因的 400。
-        assert!(plan_request("chat/completions", Bytes::from_static(b"{}"), false).is_err());
+        assert!(
+            plan_request("chat/completions", Bytes::from_static(b"{}"), false, &no_base).is_err()
+        );
     }
 
     /// 只有「OpenAI 兼容客户端问模型」那一种请求才接管，codex CLI 那条必须放过去。
@@ -5489,28 +6630,33 @@ mod tests {
         };
 
         // 不开时原样放过：这是默认行为，别把「没开」也给排了。
-        let off = plan_request("responses", Bytes::from_static(shuffled), false).unwrap();
+        let off = plan_request("responses", Bytes::from_static(shuffled), false, &no_base).unwrap();
         assert_eq!(names(&off), vec!["write", "apply_patch", "web_search"]);
 
         // 开了之后按排序键（名字，没名字则 type）走一遍字典序。
-        let on = plan_request("responses", Bytes::from_static(shuffled), true).unwrap();
+        let on = plan_request("responses", Bytes::from_static(shuffled), true, &no_base).unwrap();
         assert_eq!(names(&on), vec!["apply_patch", "web_search", "write"]);
 
         // **排过的那份与本来就有序的那份要算出同一个指纹**——这才是排序的目的：前缀稳了，
         // 落点也不能再跟着客户端那个乱序换。
-        let already = plan_request("responses", Bytes::from_static(sorted), true).unwrap();
+        let already =
+            plan_request("responses", Bytes::from_static(sorted), true, &no_base).unwrap();
         assert_eq!(key(&on), key(&already));
         assert_ne!(key(&off), key(&on), "不排的那份指纹本来就该不一样");
     }
 
     /// 已经有序时不许重新序列化：那会把整个 body 的 key 顺序改掉（见 Cargo.toml 里
     /// preserve_order 的注），而排序在这种输入上本该是个空动作。
+    ///
+    /// 体里那个 `include` 不是凑数的：官方客户端每条请求都带它（见
+    /// [`ensure_reasoning_include`]），而这条快路径正是为真实 codex 流量存在的——那种体有
+    /// 几百 KB，重新序列化一遍既费 CPU 又会改掉字段顺序。
     #[test]
     fn an_already_sorted_tool_list_is_left_byte_for_byte_alone() {
         let raw = Bytes::from_static(
-            br#"{"model":"m","store":false,"stream":true,"instructions":"i","tools":[{"name":"a","type":"function"},{"name":"b","type":"function"}],"input":[{"role":"user","content":"hi"}]}"#,
+            br#"{"model":"m","store":false,"stream":true,"instructions":"i","tools":[{"name":"a","type":"function"},{"name":"b","type":"function"}],"input":[{"role":"user","content":"hi"}],"include":["reasoning.encrypted_content"]}"#,
         );
-        let n = normalize_responses_body("responses", raw.clone(), true);
+        let n = normalize_responses_body("responses", raw.clone(), true, &no_base);
         assert_eq!(n.body, raw, "有序的输入该一个字节都不动");
     }
 
@@ -5525,6 +6671,7 @@ mod tests {
                      "input":[{"role":"user","content":"hi"}]}"#,
             ),
             true,
+            &no_base,
         )
         .unwrap();
         let other = plan_request(
@@ -5535,6 +6682,7 @@ mod tests {
                      "input":[{"role":"user","content":"hi"}]}"#,
             ),
             true,
+            &no_base,
         )
         .unwrap();
         assert_eq!(key(&one), key(&other), "server_label 撞了也得排得出确定的次序");
@@ -5612,10 +6760,13 @@ mod tests {
         // 别的档一个字都不动：这道口子只对 json_object 存在，别的档补一句是往人家的提示词
         // 里塞私货。json_schema 那档尤其——它的形状由 schema 说了算。
         let untouched = r#"{"model":"m","store":false,"stream":true,"text":{"format":{"type":"json_schema",
-                "name":"r","schema":{"type":"object"}}},"input":[{"role":"user","content":"hi"}]}"#;
+                "name":"r","schema":{"type":"object"}}},"input":[{"role":"user","content":"hi"}],
+                "include":["reasoning.encrypted_content"]}"#;
         assert_eq!(norm("responses", untouched).body, Bytes::from(untouched.to_owned()));
-        let plain =
-            r#"{"model":"m","store":false,"stream":true,"input":[{"role":"user","content":"hi"}]}"#;
+        let plain = concat!(
+            r#"{"model":"m","store":false,"stream":true,"input":[{"role":"user","content":"hi"}],"#,
+            r#""include":["reasoning.encrypted_content"]}"#
+        );
         assert_eq!(
             norm("responses", plain).body,
             Bytes::from(plain.to_owned()),
@@ -5677,8 +6828,10 @@ mod tests {
         assert_eq!(v["input"].as_array().unwrap().len(), 1);
 
         // 一条系统消息都没有：一个字节都不该改（codex CLI 走的正是这条路，这段对它是空动作）。
-        let raw =
-            r#"{"model":"m","store":false,"stream":true,"input":[{"role":"user","content":"hi"}]}"#;
+        let raw = concat!(
+            r#"{"model":"m","store":false,"stream":true,"input":[{"role":"user","content":"hi"}],"#,
+            r#""include":["reasoning.encrypted_content"]}"#
+        );
         assert_eq!(norm("responses", raw).body, Bytes::from(raw.to_owned()));
 
         // 读不出文本的系统消息（只有图片块）：搬不动，但也不放弃整条请求——就地改成上游
@@ -5735,9 +6888,13 @@ mod tests {
     /// 而订阅这条路径只认列表，原样转上去就是一句 `Input must be a list`。
     #[test]
     fn a_bare_string_input_is_wrapped_into_the_list_upstream_wants() {
-        let n =
-            plan_request("responses", Bytes::from_static(br#"{"model":"m","input":"hi"}"#), false)
-                .unwrap();
+        let n = plan_request(
+            "responses",
+            Bytes::from_static(br#"{"model":"m","input":"hi"}"#),
+            false,
+            &no_base,
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&n.body).unwrap();
         assert_eq!(v["input"][0]["role"], "user");
         assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
@@ -5755,6 +6912,7 @@ mod tests {
             "chat/completions",
             Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#),
             false,
+            &no_base,
         )
         .unwrap();
         let c: serde_json::Value = serde_json::from_slice(&via_chat.body).unwrap();
@@ -5764,14 +6922,15 @@ mod tests {
         let untouched = plan_request(
             "responses",
             Bytes::from_static(
-                br#"{"model":"m","store":false,"stream":true,"input":{"role":"user"}}"#,
+                br#"{"model":"m","store":false,"stream":true,"input":{"role":"user"},"include":["reasoning.encrypted_content"]}"#,
             ),
             false,
+            &no_base,
         )
         .unwrap();
         assert_eq!(
             &untouched.body[..],
-            br#"{"model":"m","store":false,"stream":true,"input":{"role":"user"}}"#
+            br#"{"model":"m","store":false,"stream":true,"input":{"role":"user"},"include":["reasoning.encrypted_content"]}"#
         );
     }
 
@@ -5782,6 +6941,7 @@ mod tests {
             "responses",
             Bytes::from_static(br#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#),
             false,
+            &no_base,
         )
         .unwrap();
         assert_eq!(one.input_len, 1);
@@ -5793,13 +6953,14 @@ mod tests {
                      {"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}"#,
             ),
             false,
+            &no_base,
         )
         .unwrap();
         // system 进 instructions，不算一项输入；剩下三条才是。
         assert_eq!(grown.input_len, 3);
 
         // 解不出体（`models` 那类无体请求）时是 0，不是崩。
-        assert_eq!(plan_request("models", Bytes::new(), false).unwrap().input_len, 0);
+        assert_eq!(plan_request("models", Bytes::new(), false, &no_base).unwrap().input_len, 0);
     }
 
     /// 两种线格式都要拿到指纹，且**同一段对话在 chat 那条路上长大时也不能变**。
@@ -5811,6 +6972,7 @@ mod tests {
                 br#"{"model":"m","instructions":"i","input":[{"role":"user","content":"hi"}]}"#,
             ),
             false,
+            &no_base,
         )
         .unwrap();
         assert!(key(&n).is_some());
@@ -5821,6 +6983,7 @@ mod tests {
                 br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}"#,
             ),
             false,
+            &no_base,
         )
         .unwrap();
         let turn2 = plan_request(
@@ -5830,6 +6993,7 @@ mod tests {
                      {"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}"#,
             ),
             false,
+            &no_base,
         )
         .unwrap();
         assert!(key(&turn1).is_some());
@@ -5861,7 +7025,7 @@ mod tests {
         assert_eq!(out.as_ref(), &plain[..]);
 
         // 解开之后规范化那条路才认得它：算得出前缀指纹，也数得出 input 有几项。
-        let n = normalize_responses_body("responses", out, false);
+        let n = normalize_responses_body("responses", out, false, &no_base);
         assert!(n.prefix.is_some(), "解开的体该算得出前缀指纹");
         assert_eq!(n.input_len, 1);
     }
@@ -6177,7 +7341,7 @@ mod tests {
             ("chatgpt-account-id", "spoofed"),
             ("content-type", "application/json"),
         ]);
-        let out = build_forward_headers(&incoming, &cred, "fresh-token", "fp", UaMode::Auto);
+        let out = build_forward_headers(&incoming, &cred, "fresh-token", "fp", UaMode::Auto, None);
         assert_eq!(out.get("authorization").unwrap(), "Bearer fresh-token");
         assert_eq!(out.get("chatgpt-account-id").unwrap(), "acct-9");
         assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR);
@@ -6272,19 +7436,19 @@ mod tests {
         ]);
 
         // 透传档：两个头一起原样过去。
-        let passed = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Passthrough);
+        let passed = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Passthrough, None);
         assert_eq!(passed.get("originator").unwrap(), "codex_desktop");
         assert!(passed.get("user-agent").unwrap().to_str().unwrap().starts_with("Codex Desktop/"));
 
         // Auto 档同样放过：Codex Desktop 在官方那份第一方名单里。收敛它只会把 UA 与
         // `originator` 改成 CLI，而它的 `x-codex-turn-metadata` 与体里的 `client_metadata`
         // 照旧说自己是 Desktop——半份身份留在原地，比不收敛更显眼。
-        let auto = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Auto);
+        let auto = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Auto, None);
         assert_eq!(auto.get("originator").unwrap(), "codex_desktop");
         assert!(auto.get("user-agent").unwrap().to_str().unwrap().starts_with("Codex Desktop/"));
 
         // Pin 档一律改写：UA 换成这个号派生的那份，`originator` 跟着收敛。
-        let pinned = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Pin);
+        let pinned = build_forward_headers(&desktop, &cred, "t", "fp", UaMode::Pin, None);
         assert_eq!(pinned.get("user-agent").unwrap(), cred.user_agent().as_str());
         assert_eq!(pinned.get("originator").unwrap(), config::ORIGINATOR);
 
@@ -6296,7 +7460,7 @@ mod tests {
             ),
             ("originator", "codex_cli_rs"),
         ]);
-        let out = build_forward_headers(&cli, &cred, "t", "fp", UaMode::Auto);
+        let out = build_forward_headers(&cli, &cred, "t", "fp", UaMode::Auto, None);
         assert!(out.get("user-agent").unwrap().to_str().unwrap().contains("0.150.0"));
         assert_eq!(out.get("originator").unwrap(), "codex_cli_rs");
 
@@ -6307,10 +7471,430 @@ mod tests {
             hm(&[("user-agent", "OpenAI/Python 1.108.1"), ("originator", "   ")]),
         ] {
             for mode in [UaMode::Passthrough, UaMode::Auto, UaMode::Pin] {
-                let out = build_forward_headers(&headers, &cred, "t", "fp", mode);
+                let out = build_forward_headers(&headers, &cred, "t", "fp", mode, None);
                 assert_eq!(out.get("originator").unwrap(), config::ORIGINATOR, "{mode:?}");
             }
         }
+    }
+
+    /// `version` 与 UA/`originator` 归同一个判断：官方客户端每条请求都带它（挂在 provider 的
+    /// 默认头上），所以来访没带就得补；透传档不动客户端自报的那份，改写档整份收敛。
+    #[test]
+    fn the_version_header_follows_the_same_decision_as_the_ua() {
+        let cred = ua_cred("acct-9");
+
+        // 第三方 SDK：三档都补——它们压根不发这个头，而拿到的 UA/`originator` 已经是 CLI 那份。
+        let sdk = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
+        for mode in [UaMode::Passthrough, UaMode::Auto, UaMode::Pin] {
+            let out = build_forward_headers(&sdk, &cred, "t", "fp", mode, None);
+            assert_eq!(out.get("version").unwrap(), config::CODEX_VERSION, "{mode:?}");
+        }
+        // 带了个空值等于没带。
+        let blank = hm(&[("user-agent", "OpenAI/Python 1.108.1"), ("version", "  ")]);
+        let out = build_forward_headers(&blank, &cred, "t", "fp", UaMode::Passthrough, None);
+        assert_eq!(out.get("version").unwrap(), config::CODEX_VERSION);
+
+        // 真实客户端报的那份：透传档一个字不改，哪怕它比我们写死的常量旧——它的 UA 里写的
+        // 也是那个旧版本，只把 `version` 拔高就成了没人产生得出的组合。
+        let older = hm(&[
+            (
+                "user-agent",
+                format!("{}0.150.0 (Mac OS 15.6.1; arm64) unknown", config::UA_PREFIX).as_str(),
+            ),
+            ("originator", "codex_cli_rs"),
+            ("version", "0.150.0"),
+        ]);
+        let passed = build_forward_headers(&older, &cred, "t", "fp", UaMode::Passthrough, None);
+        assert_eq!(passed.get("version").unwrap(), "0.150.0");
+        // Auto 档同样放过：它是官方 UA，整份身份都该原样过去。
+        let auto = build_forward_headers(&older, &cred, "t", "fp", UaMode::Auto, None);
+        assert_eq!(auto.get("version").unwrap(), "0.150.0");
+        // Pin 档整份收敛：UA 换成派生的那份，`version` 跟着换成同一个版本号。
+        let pinned = build_forward_headers(&older, &cred, "t", "fp", UaMode::Pin, None);
+        assert_eq!(pinned.get("version").unwrap(), config::CODEX_VERSION);
+        assert!(
+            pinned.get("user-agent").unwrap().to_str().unwrap().contains(config::CODEX_VERSION),
+            "UA 与 version 必须同源"
+        );
+    }
+
+    /// `accept` 只在 `responses` 那条路径上钉死。`models` 那族回的是 JSON。
+    #[test]
+    fn only_the_responses_path_pins_the_sse_accept() {
+        assert!(pins_sse_accept(config::RESPONSES_PATH));
+        assert!(pins_sse_accept("/responses"));
+        assert!(!pins_sse_accept(config::MODELS_PATH));
+        assert!(!pins_sse_accept("responses/compact"));
+    }
+
+    /// `x-codex-routing-hint`：官方客户端每条请求都带，形状是 `model=…[;tier=…]`。
+    #[test]
+    fn the_routing_hint_reports_the_model_and_the_tier_that_really_go_out() {
+        let hint = |b: &str| norm("responses", b).hint;
+
+        assert_eq!(hint(r#"{"model":"gpt-5.6-sol"}"#).as_deref(), Some("model=gpt-5.6-sol"));
+        assert_eq!(
+            hint(r#"{"model":"gpt-5.6-sol","service_tier":"priority"}"#).as_deref(),
+            Some("model=gpt-5.6-sol;tier=priority")
+        );
+        // `service_tier: "auto"` 会被 [`drop_unsupported_params`] 丢掉，提示里也就不该有它
+        // ——报一个体里已经没有的档位就是自己造一份对不上的声明。
+        assert_eq!(
+            hint(r#"{"model":"gpt-5.6-sol","service_tier":"auto"}"#).as_deref(),
+            Some("model=gpt-5.6-sol")
+        );
+        // 拼不出合法头值的一律不报：造不干净就不造。
+        assert!(hint(r#"{"model":""}"#).is_none());
+        assert!(hint(r#"{"model":"a;b=c"}"#).is_none());
+        assert!(hint(r#"{"model":"模型"}"#).is_none());
+        assert!(hint(r#"{"input":[]}"#).is_none());
+        // 档位本身不合法时只报模型，而不是整条不报。
+        assert_eq!(hint(r#"{"model":"m","service_tier":"a=b"}"#).as_deref(), Some("model=m"));
+    }
+
+    /// 来访带了这个头就不动它；没带才补。
+    #[test]
+    fn the_routing_hint_header_is_only_filled_in_when_the_caller_sent_none() {
+        let cred = ua_cred("acct-9");
+
+        let bare = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
+        let out = build_forward_headers(
+            &bare,
+            &cred,
+            "t",
+            "fp",
+            UaMode::Passthrough,
+            Some("model=gpt-5.6-sol"),
+        );
+        assert_eq!(out.get("x-codex-routing-hint").unwrap(), "model=gpt-5.6-sol");
+
+        let own = hm(&[("x-codex-routing-hint", "model=gpt-5.5;tier=flex")]);
+        let out =
+            build_forward_headers(&own, &cred, "t", "fp", UaMode::Passthrough, Some("model=other"));
+        assert_eq!(out.get("x-codex-routing-hint").unwrap(), "model=gpt-5.5;tier=flex");
+
+        // 算不出提示（体里没有模型）时不凭空造一个。
+        let out = build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough, None);
+        assert!(out.get("x-codex-routing-hint").is_none());
+    }
+
+    /// 流内失败的分流：只有容量降载那两个 code 换号，别的都是定局。
+    #[test]
+    fn only_capacity_shedding_is_worth_another_credential() {
+        let failed = |code: &str| {
+            let error = serde_json::json!({ "code": code, "message": "m" });
+            let event =
+                serde_json::json!({ "type": "response.failed", "response": { "error": error } });
+            let sse = format!("event: response.failed\ndata: {event}\n");
+            sse_failure(sse.as_bytes()).expect("失败事件在那儿")
+        };
+
+        for code in ["server_is_overloaded", "slow_down"] {
+            assert!(capacity_shed(&failed(code)), "{code} 该换号");
+        }
+        // 定局那几类（换号一样失败，重发只是白花一次额度），与「流内 429」那一类。
+        for code in [
+            "context_length_exceeded",
+            "insufficient_quota",
+            "cyber_policy",
+            "invalid_prompt",
+            "rate_limit_exceeded",
+            "server_error",
+        ] {
+            assert!(!capacity_shed(&failed(code)), "{code} 不该换号");
+        }
+    }
+
+    /// 探流头的界线：`response.created` 不算「开始了」——降载那条失败事件正是紧跟着它来的。
+    #[test]
+    fn the_stream_head_is_not_settled_by_a_created_event() {
+        let created = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"error\":null}}\n\n",
+        );
+        assert!(!stream_head_settled(created.as_bytes()));
+        assert!(!stream_head_settled(b""));
+        // 真的开始产出了：提交。
+        for settled in [
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\"}\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\"}\n",
+        ] {
+            assert!(stream_head_settled(settled.as_bytes()), "{settled}");
+        }
+        // 只发 data 行（不发 event 行）的服务端也要认得出来。
+        let data_only = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+        );
+        assert!(stream_head_settled(data_only.as_bytes()));
+        let created_only = "data: {\"type\":\"response.created\"}\n";
+        assert!(!stream_head_settled(created_only.as_bytes()));
+    }
+
+    /// 探流头那一步的三种落点，拿一段假流走一遍。
+    ///
+    /// 这段逻辑是这条路上唯一「还来得及换号」的时机，而它同时握着「什么时候必须提交」——
+    /// 两边都错不起：提交早了就换不动号，提交晚了就是把客户端的响应扣在手里。
+    #[tokio::test]
+    async fn peeking_the_stream_head_tells_shedding_apart_from_a_real_turn() {
+        // `+ 'static`：攒出来的是自有的 `Vec`，与入参那几个借用无关——不写的话
+        // （2024 版的 `impl Trait` 默认捕获在场的全部生命周期）返回的流会被判成借着入参。
+        fn chunks(
+            parts: &[&str],
+        ) -> impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin + 'static {
+            futures_util::stream::iter(
+                parts.iter().map(|p| Ok(Bytes::from(p.to_string()))).collect::<Vec<_>>(),
+            )
+        }
+        let failed = |code: &str| {
+            let event = serde_json::json!({
+                "type": "response.failed",
+                "response": { "error": { "code": code, "message": "at capacity" } },
+            });
+            format!("event: response.failed\ndata: {event}\n\n")
+        };
+        let created = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        let delta = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        );
+
+        // 降载：`response.created` 之后才来那条失败事件——正是它要求 created 不算「开始了」。
+        let shed = failed("server_is_overloaded");
+        let mut stream = chunks(&[created, &shed]);
+        match peek_stream_head(&mut stream).await {
+            PeekedHead::Shed(f) => assert_eq!(f.code.as_deref(), Some("server_is_overloaded")),
+            _ => panic!("降载没被探出来"),
+        }
+
+        // 真的开始产出了：提交，且**读掉的那几个字节一个都不能少**——它们要排在剩下的流前面
+        // 交给客户端。
+        let mut stream = chunks(&[created, delta, "event: response.completed\ndata: {}\n\n"]);
+        match peek_stream_head(&mut stream).await {
+            PeekedHead::Commit(head) => {
+                let head = String::from_utf8(head.to_vec()).unwrap();
+                assert!(head.starts_with(created), "{head}");
+                assert!(head.contains("output_text.delta"), "{head}");
+            }
+            _ => panic!("该提交"),
+        }
+
+        // 定局那一类失败（不是容量问题）：照旧提交，原样交给客户端去看那条事件。
+        let fatal = failed("context_length_exceeded");
+        let mut stream = chunks(&[&fatal]);
+        match peek_stream_head(&mut stream).await {
+            PeekedHead::Commit(head) => {
+                assert!(String::from_utf8_lossy(&head).contains("context_length_exceeded"))
+            }
+            _ => panic!("定局的失败不该换号"),
+        }
+
+        // 流干净地结束、什么都没产出：照旧提交（一段空流），不凭猜给这个号记一次失败。
+        let mut stream = chunks(&[]);
+        match peek_stream_head(&mut stream).await {
+            PeekedHead::Commit(head) => assert!(head.is_empty()),
+            _ => panic!("空流该原样提交"),
+        }
+    }
+
+    /// 只有事件流才探流头：`responses/compact` 那族回的是一次性 JSON，探它等于白等两秒。
+    #[test]
+    fn only_an_event_stream_gets_peeked() {
+        let ct = |v: &'static str| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static(v));
+            h
+        };
+        assert!(is_event_stream(&ct("text/event-stream")));
+        assert!(is_event_stream(&ct("text/event-stream; charset=utf-8")));
+        assert!(!is_event_stream(&ct("application/json")));
+        assert!(!is_event_stream(&reqwest::header::HeaderMap::new()));
+    }
+
+    /// 身份收敛：同号同值恒等、跨号必不同、跨种类必不同，而 `window_id` 的 `:n` 形状要保住。
+    #[test]
+    fn converged_ids_are_stable_per_account_and_never_shared_across_accounts() {
+        let a = ua_cred("acct-a");
+        let b = ua_cred("acct-b");
+
+        assert_eq!(derive_client_id(&a, "session", "s1"), derive_client_id(&a, "session", "s1"));
+        assert_ne!(derive_client_id(&a, "session", "s1"), derive_client_id(&b, "session", "s1"));
+        assert_ne!(derive_client_id(&a, "session", "s1"), derive_client_id(&a, "thread", "s1"));
+        assert_ne!(derive_client_id(&a, "session", "s1"), derive_client_id(&a, "session", "s2"));
+
+        // 派生出来的要长得像客户端生成的那种 UUID v4。
+        let id = derive_client_id(&a, "session", "s1");
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+        assert_eq!(&id[14..15], "4", "版本位");
+
+        // `window_id` 是 `<thread_id>:<窗口号>`：前半按 thread 派生（于是与 thread_id 那一项
+        // 仍然对得上），后缀原样保留。
+        let window = derive_client_id(&a, "window", "t1:0");
+        assert_eq!(window, format!("{}:0", derive_client_id(&a, "thread", "t1")));
+    }
+
+    /// 头那一层的收敛：整套改写，装机 ID 缺席时补一个，而 coban 自己派生的 `session_id` 不动。
+    #[test]
+    fn converging_the_headers_rewrites_the_whole_set() {
+        let cred = ua_cred("acct-9");
+        let incoming = hm(&[
+            ("x-codex-installation-id", "50497c31-b373-4be9-abde-fce6dead1eb1"),
+            ("session-id", "01a03429-0000-0000-0000-0000000097a6"),
+            ("thread-id", "01a03433-0000-0000-0000-000000004167"),
+            ("x-client-request-id", "01a03433-0000-0000-0000-000000004167"),
+            ("x-codex-window-id", "01a03433-0000-0000-0000-000000004167:0"),
+            (
+                "x-codex-turn-metadata",
+                r#"{"installation_id":"50497c31-b373-4be9-abde-fce6dead1eb1","session_id":"01a03429-0000-0000-0000-0000000097a6","thread_id":"01a03433-0000-0000-0000-000000004167","turn_id":"01a03440-0000-0000-0000-000000000001","window_id":"01a03433-0000-0000-0000-000000004167:0","sandbox":"workspace-write"}"#,
+            ),
+        ]);
+
+        let mut out = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Passthrough, None);
+        let before = out.clone();
+        converge_header_ids(&mut out, &cred);
+
+        for name in [
+            "x-codex-installation-id",
+            "session-id",
+            "thread-id",
+            "x-client-request-id",
+            "x-codex-window-id",
+        ] {
+            assert_ne!(out.get(name), before.get(name), "{name} 没被收敛");
+        }
+        // 官方那边这两项相等（`x-client-request-id` 填的就是 thread_id），收敛之后必须还相等。
+        assert_eq!(out.get("thread-id"), out.get("x-client-request-id"));
+        // 窗口 ID 仍是「线程 ID + 后缀」那个形状。
+        assert_eq!(
+            out.get("x-codex-window-id").unwrap().to_str().unwrap(),
+            format!("{}:0", out.get("thread-id").unwrap().to_str().unwrap())
+        );
+        // `session_id`（下划线）是 coban 自己按账号 + 会话键派生的，不该再过一遍。
+        assert_eq!(out.get("session_id"), before.get("session_id"));
+
+        // 元数据里那份抄本跟着一起改，而与身份无关的字段一个不动。
+        let meta: serde_json::Value =
+            serde_json::from_str(out.get("x-codex-turn-metadata").unwrap().to_str().unwrap())
+                .unwrap();
+        assert_eq!(meta["sandbox"], "workspace-write");
+        assert_eq!(
+            meta["installation_id"],
+            out.get("x-codex-installation-id").unwrap().to_str().unwrap()
+        );
+        assert_eq!(meta["thread_id"], out.get("thread-id").unwrap().to_str().unwrap());
+        assert_ne!(meta["turn_id"], "01a03440-0000-0000-0000-000000000001");
+
+        // 第三方客户端一个标识都不发：只补装机 ID，不替它编一段会话结构。
+        let bare = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
+        let mut out = build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough, None);
+        converge_header_ids(&mut out, &cred);
+        assert_eq!(
+            out.get("x-codex-installation-id").unwrap(),
+            cred.derived_id("installation", "").as_str()
+        );
+        for name in ["session-id", "thread-id", "x-codex-window-id"] {
+            assert!(out.get(name).is_none(), "{name} 是凭空造出来的");
+        }
+    }
+
+    /// 体那一层的收敛：`client_metadata`（含内嵌那份元数据）与 `prompt_cache_key` 都要改，
+    /// 而两个载体里的同一项必须算出同一个值。
+    #[test]
+    fn converging_the_body_keeps_the_two_carriers_telling_the_same_story() {
+        let cred = ua_cred("acct-9");
+        // 体照官方那份形态拼（`client_metadata` 里那个 `x-codex-turn-metadata` 是一段 JSON
+        // **字符串**，见 `responses_metadata.rs` 的 `client_metadata()`）。用 `json!` 拼而不是
+        // 写死一段字面量：那一层嵌套的转义手写起来极易出错，而这个体正是本测试的判据。
+        let inner = serde_json::json!({
+            "thread_id": "01a03433-0000-0000-0000-000000004167",
+            "sandbox": "workspace-write",
+        })
+        .to_string();
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "m",
+                "prompt_cache_key": "01a03429-0000-0000-0000-0000000097a6",
+                "client_metadata": {
+                    "x-codex-installation-id": "50497c31-b373-4be9-abde-fce6dead1eb1",
+                    "session_id": "01a03429-0000-0000-0000-0000000097a6",
+                    "thread_id": "01a03433-0000-0000-0000-000000004167",
+                    "x-codex-turn-metadata": inner,
+                },
+                "input": [],
+            }))
+            .unwrap(),
+        );
+
+        let out = converge_body_ids(&body, &cred).expect("体里有那一族字段");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(
+            v["client_metadata"]["session_id"],
+            cred.derived_id("session", "01a03429-0000-0000-0000-0000000097a6")
+        );
+        assert_eq!(
+            v["client_metadata"]["thread_id"],
+            cred.derived_id("thread", "01a03433-0000-0000-0000-000000004167")
+        );
+        assert_eq!(
+            v["client_metadata"]["x-codex-installation-id"],
+            cred.derived_id("installation", "50497c31-b373-4be9-abde-fce6dead1eb1")
+        );
+        assert_ne!(v["prompt_cache_key"], "01a03429-0000-0000-0000-0000000097a6");
+        // 与身份无关的字段一个不动。
+        assert_eq!(v["model"], "m");
+
+        // 内嵌那份元数据（一段 JSON 字符串）也要改，且与外层同一项算出同一个值。
+        let inner: serde_json::Value =
+            serde_json::from_str(v["client_metadata"]["x-codex-turn-metadata"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(inner["thread_id"], v["client_metadata"]["thread_id"]);
+        assert_eq!(inner["sandbox"], "workspace-write");
+
+        // 那一族字段一个都没有：不重新序列化（体可能有几 MB）。
+        assert!(converge_body_ids(&Bytes::from_static(br#"{"model":"m"}"#), &cred).is_none());
+    }
+
+    /// 跨号回带的 turn-state 要摘掉：那个 blob 是上游在某个号下铸的，换号之后原样回带就是
+    /// 「A 号铸的回合状态 + B 号的凭据」——真实 codex 产生不出来的组合。
+    #[test]
+    fn a_turn_state_minted_by_another_credential_is_dropped() {
+        let memo: TurnStateMemo = Arc::default();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let set = |h: &mut reqwest::header::HeaderMap| {
+            h.insert(
+                reqwest::header::HeaderName::from_static("x-codex-turn-state"),
+                reqwest::header::HeaderValue::from_static("blob"),
+            );
+        };
+
+        // 还没见过任何 turn-state：不动（无从判断谁铸的）。
+        set(&mut headers);
+        guard_turn_state_echo(&memo, &mut headers, Some("sess"), 7);
+        assert!(headers.contains_key("x-codex-turn-state"));
+
+        // 7 号铸的，7 号自己回带：留着。
+        note_turn_state(&memo, Some("sess"), 7);
+        guard_turn_state_echo(&memo, &mut headers, Some("sess"), 7);
+        assert!(headers.contains_key("x-codex-turn-state"));
+
+        // 换到 9 号：摘掉。
+        guard_turn_state_echo(&memo, &mut headers, Some("sess"), 9);
+        assert!(!headers.contains_key("x-codex-turn-state"));
+
+        // 9 号铸了一份新的之后，这个会话的记录该指向 9——同一个会话只留最新那条。
+        set(&mut headers);
+        note_turn_state(&memo, Some("sess"), 9);
+        guard_turn_state_echo(&memo, &mut headers, Some("sess"), 9);
+        assert!(headers.contains_key("x-codex-turn-state"));
+        assert_eq!(memo.lock().len(), 1, "同一个会话不该攒出两条记录");
+
+        // 没有会话键：记不了，也不该摘。
+        note_turn_state(&memo, None, 9);
+        guard_turn_state_echo(&memo, &mut headers, None, 42);
+        assert!(headers.contains_key("x-codex-turn-state"));
+        assert_eq!(memo.lock().len(), 1);
     }
 
     /// 改写 UA 的那条路必须把 SDK 留痕头一起清掉，透传那条路必须一个都不动——留一半就是
@@ -6326,7 +7910,7 @@ mod tests {
             ("content-type", "application/json"),
         ]);
 
-        let rewritten = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Auto);
+        let rewritten = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Auto, None);
         assert_eq!(rewritten.get("user-agent").unwrap(), cred.user_agent().as_str());
         for stripped in ["x-stainless-lang", "x-stainless-runtime-version", "openai-organization"] {
             assert!(rewritten.get(stripped).is_none(), "{stripped} outlived the UA it came with");
@@ -6334,7 +7918,7 @@ mod tests {
         // 清的只是那一族，别的头照旧。
         assert_eq!(rewritten.get("content-type").unwrap(), "application/json");
 
-        let passed = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Passthrough);
+        let passed = build_forward_headers(&incoming, &cred, "t", "fp", UaMode::Passthrough, None);
         assert_eq!(passed.get("user-agent").unwrap(), "OpenAI/Python 1.108.1");
         assert_eq!(passed.get("x-stainless-lang").unwrap(), "python");
     }
@@ -6347,28 +7931,34 @@ mod tests {
 
         let sdk = hm(&[("user-agent", "OpenAI/Python 1.108.1")]);
         let rewritten =
-            UaPair::of(&sdk, &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Auto));
+            UaPair::of(&sdk, &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Auto, None));
         assert_eq!(rewritten.incoming.as_deref(), Some("OpenAI/Python 1.108.1"));
         assert_eq!(rewritten.upstream.as_deref(), Some(cred.user_agent().as_str()));
 
         // 同一条请求在透传档上：发出去的与来访逐字节相同，第二份留空。
-        let passed =
-            UaPair::of(&sdk, &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Passthrough));
+        let passed = UaPair::of(
+            &sdk,
+            &build_forward_headers(&sdk, &cred, "t", "fp", UaMode::Passthrough, None),
+        );
         assert_eq!(passed.incoming.as_deref(), Some("OpenAI/Python 1.108.1"));
         assert_eq!(passed.upstream, None, "没改写就不该留下第二份");
 
         // 来访压根没报 UA：第一份空着（那就是事实），第二份是补上去的那份。
         let bare = HeaderMap::new();
-        let filled =
-            UaPair::of(&bare, &build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough));
+        let filled = UaPair::of(
+            &bare,
+            &build_forward_headers(&bare, &cred, "t", "fp", UaMode::Passthrough, None),
+        );
         assert_eq!(filled.incoming, None);
         assert_eq!(filled.upstream.as_deref(), Some(cred.user_agent().as_str()));
 
         // 超长 UA 入库前截断，两份用同一把尺子。
         let long = "x".repeat(UA_MAX_LEN + 50);
         let huge = hm(&[("user-agent", long.as_str())]);
-        let cut =
-            UaPair::of(&huge, &build_forward_headers(&huge, &cred, "t", "fp", UaMode::Passthrough));
+        let cut = UaPair::of(
+            &huge,
+            &build_forward_headers(&huge, &cred, "t", "fp", UaMode::Passthrough, None),
+        );
         assert_eq!(cut.incoming.as_deref().map(str::len), Some(UA_MAX_LEN));
         assert_eq!(cut.upstream, None, "截断不该把一条透传的长 UA 判成改写过");
     }
@@ -6384,6 +7974,7 @@ mod tests {
             "t",
             "fp",
             UaMode::Auto,
+            None,
         );
         let synthetic = probe_headers(&cred, "t");
         assert_eq!(forwarded.get("user-agent").unwrap(), synthetic.get("user-agent").unwrap());

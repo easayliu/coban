@@ -91,6 +91,36 @@ impl Credential {
         uuid_from_bytes(bytes)
     }
 
+    /// 该凭证对上游呈现的**设备/会话族标识**：`sha256(account_id ⊕ 种类 ⊕ 客户端原值)` 派生的
+    /// UUID v4 形态串。见 `crate::proxy::IdMode`。
+    ///
+    /// 与 [`Self::session_id`] 是同一个思路的推广，只是那一个的「客户端原值」是会话指纹。
+    /// 三条性质是这个函数存在的全部理由：
+    /// - **同一个号 + 同一个原值恒等**：客户端的一段会话在上游看来仍是一段连续的会话，
+    ///   而不是每轮换一个身份；
+    /// - **跨号必不同**：换号（failover）之后同一段会话不会把同一组标识带到第二个号上——
+    ///   那是真实 codex 产生不出来的形态，它一个进程只有一份凭据；
+    /// - **同号内跨种类必不同**：`session` 与 `thread` 即便原值相同也派生出两个值，
+    ///   否则会凭空造出「这两个标识恰好一样」的巧合。
+    ///
+    /// `original` 为空（如设备标识：一个号就该是一台机器，与客户端报什么无关）时退化为
+    /// 仅按账号 + 种类派生。
+    pub fn derived_id(&self, kind: &str, original: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.account_id.as_bytes());
+        hasher.update([0u8]); // 分隔符，避免拼接歧义（同 session_id）
+        hasher.update(kind.as_bytes());
+        if !original.is_empty() {
+            hasher.update([0u8]);
+            hasher.update(original.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        uuid_from_bytes(bytes)
+    }
+
     /// 该凭证对上游呈现的 `User-Agent`：按 `account_id` 从 [`config::UA_PROFILES`] 里
     /// 挑一份「机器画像」拼出来。
     ///

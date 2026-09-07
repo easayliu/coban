@@ -36,6 +36,19 @@ export interface Settings {
    * 改写的目标值是**按账号派生**的，一个号一台稳定的机器，不是全池共用一条 UA。
    */
   upstream_ua_mode: number
+  /**
+   * 客户端一句系统意图都没给时，是否替它补上这个模型的官方基座提示。
+   *
+   * 默认关：补上去之后模型会按一个编码 agent 的规矩答话，而那类客户端可能压根没有那些工具。
+   */
+  fill_base_instructions: boolean
+  /**
+   * 发往上游的那一族设备/会话标识（installation / session / thread / window 及
+   * turn-metadata、client_metadata 里那份抄本）是否按号收敛。
+   *
+   * 默认关：上游按这些标识做什么判定不可观测，而改写它在别的实现上有实测过的反作用。
+   */
+  converge_client_ids: boolean
   /** 管理密码是否已设置。未设置时管理接口是完全敞开的。 */
   admin_configured: boolean
   version: string
@@ -106,5 +119,15 @@ export async function setNormalizeToolOrder(on: boolean): Promise<Settings> {
 /** 0 透传 / 1 只改写不像官方客户端的 / 2 一律改写。 */
 export async function setUpstreamUaMode(mode: number): Promise<Settings> {
   const { data } = await api.post('/settings/upstream-ua-mode', { value: mode })
+  return data
+}
+
+export async function setFillBaseInstructions(on: boolean): Promise<Settings> {
+  const { data } = await api.post('/settings/fill-base-instructions', { value: on ? 1 : 0 })
+  return data
+}
+
+export async function setConvergeClientIds(on: boolean): Promise<Settings> {
+  const { data } = await api.post('/settings/converge-client-ids', { value: on ? 1 : 0 })
   return data
 }

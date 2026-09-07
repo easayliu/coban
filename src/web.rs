@@ -65,6 +65,10 @@ pub struct AppState {
     /// `/v1/models` 的清单缓存。取一次要跑一趟上游，而有一类客户端每开个会话就问一遍
     /// （见 [`crate::proxy::ModelListCache`]）。
     pub models_cache: proxy::ModelListCache,
+    /// 每个模型的官方基座提示，见 [`crate::proxy::BaseInstructionsCache`]。
+    pub base_instructions: proxy::BaseInstructionsCache,
+    /// 「这个会话手里那个 turn-state 是哪个号铸的」的记忆，见 [`crate::proxy::TurnStateMemo`]。
+    pub turn_state: proxy::TurnStateMemo,
     /// 「这个会话捎来的加密推理在这个号上解不开」的记忆，见 [`crate::proxy::StaleReasoningMemo`]。
     pub stale_reasoning: proxy::StaleReasoningMemo,
     /// 「这个会话捎来的 `input` 项不合上游要求」的记忆，见 [`crate::proxy::InputRuleMemo`]。
@@ -93,6 +97,8 @@ pub async fn run(
         admin_env: admin_password.map(Arc::new),
         in_flight: Arc::default(),
         models_cache: Arc::default(),
+        base_instructions: Arc::default(),
+        turn_state: Arc::default(),
         stale_reasoning: Arc::default(),
         input_rules: Arc::default(),
         schema_keywords: Arc::default(),
@@ -146,6 +152,8 @@ pub async fn run(
         .route("/settings/session-lease-secs", post(set_session_lease_secs))
         .route("/settings/normalize-tool-order", post(set_normalize_tool_order))
         .route("/settings/upstream-ua-mode", post(set_upstream_ua_mode))
+        .route("/settings/fill-base-instructions", post(set_fill_base_instructions))
+        .route("/settings/converge-client-ids", post(set_converge_client_ids))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
@@ -1110,6 +1118,10 @@ struct SettingsResp {
     normalize_tool_order: bool,
     /// 发往上游的 UA 怎么处理（0 透传 / 1 只改写不像官方客户端的 / 2 一律改写）。
     upstream_ua_mode: i64,
+    /// 客户端没给 `instructions` 时，是否替它补上这个模型的官方基座提示。
+    fill_base_instructions: bool,
+    /// 发往上游的那一族设备/会话标识是否按号收敛。
+    converge_client_ids: bool,
     /// 管理鉴权是否已开启（前端据此决定要不要显示「导出」这类高危操作）。
     admin_configured: bool,
     version: &'static str,
@@ -1145,6 +1157,12 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
             != 0,
         upstream_ua_mode: s
             .get_setting_i64(store::UPSTREAM_UA_MODE, store::DEFAULT_UPSTREAM_UA_MODE),
+        fill_base_instructions: s
+            .get_setting_i64(store::FILL_BASE_INSTRUCTIONS, store::DEFAULT_FILL_BASE_INSTRUCTIONS)
+            != 0,
+        converge_client_ids: s
+            .get_setting_i64(store::CONVERGE_CLIENT_IDS, store::DEFAULT_CONVERGE_CLIENT_IDS)
+            != 0,
         admin_configured: auth::admin_configured(&state),
         version: env!("CARGO_PKG_VERSION"),
     })
@@ -1256,6 +1274,23 @@ async fn set_normalize_tool_order(
     Json(req): Json<IntReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     set_int_setting(state, store::NORMALIZE_TOOL_ORDER, req.value, 0..=1).await
+}
+
+/// 客户端一句系统意图都没给时，要不要替它补上这个模型的官方基座提示
+/// （见 `proxy::fill_base_instructions`）。
+async fn set_fill_base_instructions(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::FILL_BASE_INSTRUCTIONS, req.value, 0..=1).await
+}
+
+/// 发往上游的那一族设备/会话标识要不要按号收敛（见 `proxy::IdMode`）。
+async fn set_converge_client_ids(
+    State(state): State<AppState>,
+    Json(req): Json<IntReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    set_int_setting(state, store::CONVERGE_CLIENT_IDS, req.value, 0..=1).await
 }
 
 /// 发往上游的 `User-Agent` 怎么处理（见 `proxy::UaMode`）。
@@ -1397,6 +1432,8 @@ mod tests {
             admin_env: None,
             in_flight: Arc::default(),
             models_cache: Arc::default(),
+            base_instructions: Arc::default(),
+            turn_state: Arc::default(),
             stale_reasoning: Arc::default(),
             input_rules: Arc::default(),
             schema_keywords: Arc::default(),
@@ -1428,6 +1465,8 @@ mod tests {
             admin_env: None,
             in_flight: Arc::default(),
             models_cache: Arc::default(),
+            base_instructions: Arc::default(),
+            turn_state: Arc::default(),
             stale_reasoning: Arc::default(),
             input_rules: Arc::default(),
             schema_keywords: Arc::default(),

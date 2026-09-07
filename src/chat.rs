@@ -130,6 +130,10 @@ pub fn translate_request(raw: &[u8], sort_tools: bool) -> Result<Translated, Str
     // `stream` 只收 `true`（非流式被拒）。客户端要非流式时由 [`aggregate`] 聚合。
     out.insert("store".into(), Value::Bool(false));
     out.insert("stream".into(), Value::Bool(true));
+    // 官方客户端每条请求都带这一项，且不看有没有开推理（见
+    // [`crate::proxy::ensure_reasoning_include`]）。这条路上它只影响形态：Chat Completions
+    // 那头没有安放加密推理的地方，回程那几段由 [`translate_event`] 一路丢掉。
+    out.insert("include".into(), json!([crate::proxy::INCLUDE_ENCRYPTED_REASONING]));
 
     // **排在算指纹之前**：指纹里就含 tools 及其顺序，反过来的话前缀稳住了而落点还在跟着
     // 客户端那个乱序变——两件事必须用同一份顺序。
