@@ -19,6 +19,11 @@ const COLS: &str = "id, label, email, plan_type, account_id, id_token, access_to
                     refresh_token, expires_at, priority, disabled, rpm_limit, ban_reason, \
                     resume_at, proxy, created_at, updated_at";
 
+/// `credential_stats` 表的列清单。理由同 [`COLS`]，读它的两条查询（单个号与全池）共用。
+const STATS_COLS: &str = "cred_id, last_used_at, cost_total_usd, request_total, snapshot_ts, \
+                          quota_raw, input_tokens_total, cached_tokens_total, \
+                          output_tokens_total, reset_credits_raw";
+
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
     conn: Mutex<Connection>,
@@ -490,6 +495,15 @@ pub const RPM_WINDOW_SECS: u64 = 60;
 /// 早被裁掉的历史、再收到一条无声变短的曲线。
 pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 
+/// 删流水时一个事务最多删多少行。
+///
+/// **这个数控制的是「那把全局 `conn` 锁最长被占多久」**，不是吞吐。删一个账号要连带删掉它
+/// 的流水，而那可能是三十天里的几十万行、还要维护三条索引；一条 `DELETE` 全删掉的话，整个
+/// 过程里转发路径的选号、落库、刷 token 全都堵在这把锁上——而它们是在异步线程上同步等锁，
+/// 于是几个并发请求就能把 runtime 的 worker 占满，表现为「删一个账号，所有操作都卡住」。
+/// 分批之后每批之间锁是松开的，转发照常穿插进来。
+const DELETE_CHUNK_ROWS: i64 = 2_000;
+
 /// 算出该账号实际生效的 RPM 上限。
 ///
 /// 三态：`> 0` 用它自己的；`0` 跟随全局默认；`< 0` 明确不限（**能顶掉全局默认**，
@@ -756,6 +770,20 @@ pub struct CredentialStats {
     pub secondary_window: Option<WindowUsage>,
 }
 
+/// 一个号的两个额度窗口，没被上游报告的那个是 `None`（见 [`CredentialStore::stats_of`]）。
+type Windows = (Option<WindowUsage>, Option<WindowUsage>);
+
+/// 全池账本的合计（见 [`CredentialStore::pool_totals`]）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolTotals {
+    pub cost_total_usd: f64,
+    pub request_total: i64,
+    /// 全池终身累计的输入 token（**已含命中缓存那部分**）。
+    pub input_tokens_total: i64,
+    /// 其中命中缓存的部分——是上一项的子集，不是另一笔。
+    pub cached_tokens_total: i64,
+}
+
 // ---------- 打开与建表 ----------
 
 impl CredentialStore {
@@ -783,6 +811,11 @@ impl CredentialStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // 页缓存放到 8 MB（负数是 KiB 单位），临时表留在内存里。整个库通常也就几十 MB，
+        // 这一下基本等于把热页常驻——账号列表那几条聚合每刷新一次都要扫一段流水索引，
+        // 缓存不够时它们每次都得回文件重读同样的页。
+        conn.pragma_update(None, "cache_size", -8_000)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         init_schema(&conn)?;
         Ok(Self::with_conn(conn))
     }
@@ -1062,6 +1095,31 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
     })
 }
 
+/// 账本一行 → (cred_id, 统计)。两个窗口这里留空，由 [`CredentialStore::window_usage_many`]
+/// 统一填——它们不在这张表里，是按窗口起点现算的。
+fn row_to_stats(row: &Row) -> rusqlite::Result<(i64, CredentialStats)> {
+    // 解不出来就当没有：一条坏掉的快照 JSON 不该让整个账号列表接口 500。
+    let quota = row.get::<_, Option<String>>(5)?.and_then(|raw| serde_json::from_str(&raw).ok());
+    let reset_credits =
+        row.get::<_, Option<String>>(9)?.and_then(|raw| serde_json::from_str(&raw).ok());
+    Ok((
+        row.get(0)?,
+        CredentialStats {
+            last_used_at: row.get(1)?,
+            cost_total_usd: row.get(2)?,
+            request_total: row.get(3)?,
+            snapshot_ts: row.get(4)?,
+            quota,
+            input_tokens_total: row.get(6)?,
+            cached_tokens_total: row.get(7)?,
+            output_tokens_total: row.get(8)?,
+            reset_credits,
+            primary_window: None,
+            secondary_window: None,
+        },
+    ))
+}
+
 // ---------- 凭证 CRUD ----------
 
 impl CredentialStore {
@@ -1181,14 +1239,60 @@ impl CredentialStore {
     /// 连带删掉账本与流水：不删的话，id 复用时新账号会凭空继承一段历史用量。
     /// （`credentials.id` 是 AUTOINCREMENT，正常不复用，但导入/迁移过的库不保证。）
     pub fn delete(&self, id: i64) -> Result<bool> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        let n = tx.execute("DELETE FROM credentials WHERE id = ?1", params![id])?;
-        tx.execute("DELETE FROM credential_stats WHERE cred_id = ?1", params![id])?;
-        tx.execute("DELETE FROM usage_logs WHERE cred_id = ?1", params![id])?;
-        tx.commit()?;
-        self.leases.forget_cred(id);
-        Ok(n > 0)
+        self.delete_many(&[id]).map(|n| n > 0)
+    }
+
+    /// 删除若干条，返回真的删掉几条。
+    ///
+    /// **分两段，中间松开锁**：
+    ///
+    /// 1. 账号行与账本在一个事务里删掉——这两张表每个号各一行，快，而且做完之后界面上
+    ///    这个号就已经消失、转发也不会再选中它；
+    /// 2. 流水分批删（见 [`DELETE_CHUNK_ROWS`]）。这部分是大头，一个号攒三十天可以是几十万
+    ///    行，整块删要把那把全局 `conn` 锁占上好几秒，而转发路径的每一步都要拿同一把锁。
+    ///
+    /// 中途崩了会留下一批没有账号的孤儿流水，由 [`Self::prune_usage_logs`] 顺手清掉——
+    /// 它们既不出现在任何统计里（所有查询都按现存的 cred_id 走），也不会被新号继承。
+    pub fn delete_many(&self, ids: &[i64]) -> Result<usize> {
+        let deleted = {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            let mut n = 0;
+            {
+                let mut del_cred = tx.prepare("DELETE FROM credentials WHERE id = ?1")?;
+                let mut del_stats =
+                    tx.prepare("DELETE FROM credential_stats WHERE cred_id = ?1")?;
+                for &id in ids {
+                    n += del_cred.execute(params![id])?;
+                    del_stats.execute(params![id])?;
+                }
+            }
+            tx.commit()?;
+            n
+        };
+        for &id in ids {
+            self.leases.forget_cred(id);
+            self.cooldown.lock().remove(&id);
+            self.delete_usage_logs_of(id)?;
+        }
+        Ok(deleted)
+    }
+
+    /// 分批删掉某个号的流水，每批一个事务、批与批之间把锁交出去。
+    fn delete_usage_logs_of(&self, cred_id: i64) -> Result<()> {
+        loop {
+            let n = {
+                let conn = self.conn.lock();
+                conn.execute(
+                    "DELETE FROM usage_logs WHERE rowid IN
+                         (SELECT rowid FROM usage_logs WHERE cred_id = ?1 LIMIT ?2)",
+                    params![cred_id, DELETE_CHUNK_ROWS],
+                )?
+            };
+            if (n as i64) < DELETE_CHUNK_ROWS {
+                return Ok(());
+            }
+        }
     }
 
     /// 清空全部凭证，返回删掉几条。
@@ -1269,6 +1373,60 @@ impl CredentialStore {
             &format!("UPDATE credentials SET {col} = ?1, updated_at = unixepoch() WHERE id = ?2"),
             params![value, id],
         )?;
+        Ok(())
+    }
+
+    /// 批量停用 / 启用。语义与 [`Self::set_disabled`] 逐条调用完全一致，只是全部落在
+    /// **一个事务**里：分开提交的话，改 20 个号就是 20 次写事务、20 次 WAL 落盘，
+    /// 而中途失败还会留下「一半改了一半没改」——那正是批量操作最不该有的状态。
+    pub fn set_disabled_many(&self, ids: &[i64], disabled: bool) -> Result<()> {
+        {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            let sql = if disabled {
+                "UPDATE credentials SET disabled = 1, updated_at = unixepoch() WHERE id = ?1"
+            } else {
+                "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
+                     updated_at = unixepoch() WHERE id = ?1"
+            };
+            {
+                let mut stmt = tx.prepare(sql)?;
+                for &id in ids {
+                    stmt.execute(params![id])?;
+                }
+            }
+            tx.commit()?;
+        }
+        if !disabled {
+            let mut cooldown = self.cooldown.lock();
+            for id in ids {
+                cooldown.remove(id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_priority_many(&self, ids: &[i64], priority: i64) -> Result<()> {
+        self.update_col_many("priority", ids, priority)
+    }
+
+    pub fn set_rpm_limit_many(&self, ids: &[i64], limit: i64) -> Result<()> {
+        self.update_col_many("rpm_limit", ids, limit)
+    }
+
+    /// 一个事务改一列，理由同 [`Self::set_disabled_many`]。
+    fn update_col_many(&self, col: &str, ids: &[i64], value: i64) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(&format!(
+                "UPDATE credentials SET {col} = ?1, updated_at = unixepoch() WHERE id = ?2"
+            ))?;
+            for &id in ids {
+                stmt.execute(params![value, id])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1483,6 +1641,9 @@ impl CredentialStore {
         anyhow::ensure!(!all.is_empty(), "no credentials saved yet; add an account in the web UI");
 
         let default_rpm = self.get_setting_i64(DEFAULT_RPM_LIMIT, 0);
+        // 档内 LRU 要用的「最近一次使用」，一条 SQL 取全池。逐个号去问的话，选号——
+        // 每条转发都要走一遍——就是 N 次查询、N 次抢那把全局锁。
+        let last_used = self.last_used_map();
         let mut soonest: Option<i64> = None;
         let mut candidates: Vec<(i64, i64, i64)> = Vec::new(); // (priority, last_used_at, id)
 
@@ -1520,7 +1681,7 @@ impl CredentialStore {
                 );
                 continue;
             }
-            candidates.push((c.priority, self.last_used_at(c.id).unwrap_or(0), c.id));
+            candidates.push((c.priority, last_used.get(&c.id).copied().unwrap_or(0), c.id));
         }
 
         if candidates.is_empty() {
@@ -1636,6 +1797,17 @@ impl CredentialStore {
     /// 把到点的限流暂停解除。
     fn resume_due(&self) -> Result<()> {
         let conn = self.conn.lock();
+        // 先问一句再写。这条路径每条转发都要走一遍，而「有号到点该放回来」是稀罕事；
+        // 直接 UPDATE 的话每条请求都要开一次写事务、写一次 WAL，绝大多数什么也没改。
+        let due = conn
+            .prepare_cached(
+                "SELECT 1 FROM credentials \
+                 WHERE resume_at IS NOT NULL AND resume_at <= ?1 LIMIT 1",
+            )?
+            .exists(params![now_secs() as i64])?;
+        if !due {
+            return Ok(());
+        }
         let n = conn.execute(
             "UPDATE credentials SET disabled = 0, resume_at = NULL, updated_at = unixepoch() \
              WHERE resume_at IS NOT NULL AND resume_at <= ?1",
@@ -1647,17 +1819,18 @@ impl CredentialStore {
         Ok(())
     }
 
-    fn last_used_at(&self, cred_id: i64) -> Option<i64> {
+    /// 全池的「最近一次使用」，一条 SQL。读不出来就当全都没用过（选号会退回按 id 定序），
+    /// 和从前逐条读、读失败按 0 算是同一个口径。
+    fn last_used_map(&self) -> HashMap<i64, i64> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT last_used_at FROM credential_stats WHERE cred_id = ?1",
-            params![cred_id],
-            |r| r.get::<_, Option<i64>>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .flatten()
+        let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT cred_id, last_used_at FROM credential_stats WHERE last_used_at IS NOT NULL",
+        ) else {
+            return HashMap::new();
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .and_then(|rows| rows.collect::<rusqlite::Result<HashMap<i64, i64>>>())
+            .unwrap_or_default()
     }
 }
 
@@ -1976,64 +2149,73 @@ impl CredentialStore {
 
     /// 取某个凭证的账本。
     pub fn stats_of(&self, cred_id: i64) -> Result<CredentialStats> {
-        let conn = self.conn.lock();
-        let row = conn
-            .query_row(
-                "SELECT last_used_at, cost_total_usd, request_total, snapshot_ts, quota_raw,
-                        input_tokens_total, cached_tokens_total, output_tokens_total,
-                        reset_credits_raw
-                 FROM credential_stats WHERE cred_id = ?1",
-                params![cred_id],
-                |r| {
-                    Ok((
-                        r.get::<_, Option<i64>>(0)?,
-                        r.get::<_, f64>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, i64>(7)?,
-                        r.get::<_, Option<String>>(8)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((
-            last_used_at,
-            cost_total_usd,
-            request_total,
-            snapshot_ts,
-            quota_raw,
-            input_tokens_total,
-            cached_tokens_total,
-            output_tokens_total,
-            reset_credits_raw,
-        )) = row
-        else {
-            return Ok(CredentialStats::default());
+        let row = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {STATS_COLS} FROM credential_stats WHERE cred_id = ?1"
+            ))?;
+            stmt.query_row(params![cred_id], row_to_stats).optional()?
+            // 作用域到此为止，**锁在这里就放掉**：下面的 window_usage_many 要自己拿一次
+            // conn，而这把锁不可重入（parking_lot::Mutex），握着它调过去就是死锁——
+            // 表现为整个账号列表接口卡住不返回。
         };
-        // **先把锁放掉**：下面的 window_usage 要自己拿一次 conn，而这把锁不可重入
-        // （parking_lot::Mutex），握着它调过去就是死锁——表现为整个账号列表接口卡住不返回。
-        drop(conn);
-        // 解不出来就当没有：一条坏掉的快照 JSON 不该让整个账号列表接口 500。
-        let quota: Option<QuotaSnapshot> = quota_raw.and_then(|s| serde_json::from_str(&s).ok());
-        let reset_credits: Option<ResetCredits> =
-            reset_credits_raw.and_then(|s| serde_json::from_str(&s).ok());
-        let (primary_window, secondary_window) = self.window_usage(cred_id, quota.as_ref())?;
-        Ok(CredentialStats {
-            last_used_at,
-            cost_total_usd,
-            request_total,
-            input_tokens_total,
-            cached_tokens_total,
-            output_tokens_total,
-            snapshot_ts,
-            quota,
-            reset_credits,
-            primary_window,
-            secondary_window,
-        })
+        let Some((_, mut stats)) = row else { return Ok(CredentialStats::default()) };
+        let mut windows = self.window_usage_many(&[(cred_id, stats.quota.as_ref())])?;
+        if let Some((primary, secondary)) = windows.remove(&cred_id) {
+            stats.primary_window = primary;
+            stats.secondary_window = secondary;
+        }
+        Ok(stats)
+    }
+
+    /// 全部凭证的账本，**一次取完**（两条 SQL，与账号数无关）。
+    ///
+    /// 账号列表每刷新一次就要每个号的账本，而界面是轮询的。逐个 [`Self::stats_of`] 是
+    /// 2N 条 SQL、2N 次抢那把全局 `conn` 锁——抢的是转发路径写流水、选号用的同一把，
+    /// 号越多、界面开得越久，转发被它挤掉的时间越长。
+    pub fn stats_all(&self) -> Result<HashMap<i64, CredentialStats>> {
+        let mut out: HashMap<i64, CredentialStats> = {
+            let conn = self.conn.lock();
+            let mut stmt =
+                conn.prepare_cached(&format!("SELECT {STATS_COLS} FROM credential_stats"))?;
+            let rows = stmt.query_map([], row_to_stats)?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
+        };
+        let windows = {
+            let specs: Vec<(i64, Option<&QuotaSnapshot>)> =
+                out.iter().map(|(id, st)| (*id, st.quota.as_ref())).collect();
+            self.window_usage_many(&specs)?
+        };
+        for (id, (primary, secondary)) in windows {
+            if let Some(st) = out.get_mut(&id) {
+                st.primary_window = primary;
+                st.secondary_window = secondary;
+            }
+        }
+        Ok(out)
+    }
+
+    /// 全池的终身合计（一条 SQL）。
+    ///
+    /// 概览那几个数只要这四项，不需要窗口统计，所以不走 [`Self::stats_all`]：那会为一个
+    /// 用不上的结果去扫流水。按现存账号内联——账本行随账号一起删（见 [`Self::delete_many`]），
+    /// 但库是可以被导入/迁移出孤儿行的，合计里不能把它们算进去。
+    pub fn pool_totals(&self) -> Result<PoolTotals> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(s.cost_total_usd), 0), COALESCE(SUM(s.request_total), 0),
+                    COALESCE(SUM(s.input_tokens_total), 0), COALESCE(SUM(s.cached_tokens_total), 0)
+               FROM credential_stats s JOIN credentials c ON c.id = s.cred_id",
+            [],
+            |r| {
+                Ok(PoolTotals {
+                    cost_total_usd: r.get(0)?,
+                    request_total: r.get(1)?,
+                    input_tokens_total: r.get(2)?,
+                    cached_tokens_total: r.get(3)?,
+                })
+            },
+        )?)
     }
 
     /// 记下这个号最新的重置券读数（见 [`ResetCredits`]）。
@@ -2055,65 +2237,101 @@ impl CredentialStore {
         Ok(())
     }
 
-    /// 两个额度窗口**当前周期内**的请求数 / token / 费用。
+    /// 若干个号的两个额度窗口**当前周期内**的请求数 / token / 费用，一条 SQL 算完。
     ///
     /// 窗口起点由快照反推：`重置时刻 - 窗口长度`。上游只报「还有多久重置」和「窗口多长」，
     /// 不报起点，而 coban **不写死窗口长度**（同一个账号在不同套餐下 5h/7d 各不相同，
-    /// 见 `QuotaWindow` 的注），所以两项缺任何一个就判定这个窗口没被报告、返回 `None`。
+    /// 见 `QuotaWindow` 的注），所以两项缺任何一个就判定这个窗口没被报告、不出现在结果里。
     ///
     /// 统计从 `usage_logs` 现算而不是另立账本：窗口起点会随每次快照移动，累加式的账本
     /// 没法回退。流水的保留期（30 天，见 [`USAGE_LOG_RETENTION_SECS`]）远长于最长的窗口，
     /// 所以窗口内的行不会被裁掉。
-    fn window_usage(
+    ///
+    /// **按号逐条问也能算出同样的数，但那是 N 条 SQL、N 次抢全局锁**——账号列表一次刷新就
+    /// 要算全池，而这是这个库里最贵的一条查询。各号的窗口起点各不相同，所以起点随参数
+    /// 一起送进去（`w` 那张临时表），再按 cred_id 分组，一次算完。
+    fn window_usage_many(
         &self,
-        cred_id: i64,
-        quota: Option<&QuotaSnapshot>,
-    ) -> Result<(Option<WindowUsage>, Option<WindowUsage>)> {
-        let Some(q) = quota else { return Ok((None, None)) };
+        specs: &[(i64, Option<&QuotaSnapshot>)],
+    ) -> Result<HashMap<i64, Windows>> {
         let start = |reset: &Option<String>, minutes: Option<i64>| -> Option<i64> {
             let reset_at = parse_reset_at(reset.as_deref()?)?;
             // 长度为 0 的窗口不是窗口：实测 Pro 账号的 secondary 那组头回的就是
             // `0% / 0 分钟 / 空重置时刻`，按它反推会得到「起点 = 重置时刻」的空窗口。
             Some(reset_at - minutes.filter(|m| *m > 0)? * 60)
         };
-        let primary = start(&q.primary_reset_at, q.primary_window_minutes);
-        let secondary = start(&q.secondary_reset_at, q.secondary_window_minutes);
-        let Some(floor) = [primary, secondary].into_iter().flatten().min() else {
-            return Ok((None, None));
-        };
+        // (cred_id, 主窗口起点, 次窗口起点, 两者中较早的那个)
+        let mut bounds: Vec<(i64, Option<i64>, Option<i64>, i64)> = Vec::new();
+        for (cred_id, quota) in specs {
+            let Some(q) = quota else { continue };
+            let primary = start(&q.primary_reset_at, q.primary_window_minutes);
+            let secondary = start(&q.secondary_reset_at, q.secondary_window_minutes);
+            let Some(floor) = [primary, secondary].into_iter().flatten().min() else { continue };
+            bounds.push((*cred_id, primary, secondary, floor));
+        }
+        if bounds.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // 先按「窗口存在、但这个周期一条都没跑」铺一层 0：下面那条 SQL 是 JOIN + GROUP BY，
+        // 一条流水都没有的号压根不会出现在结果里，而那与「没有这个窗口」是两回事。
+        let mut out: HashMap<i64, Windows> = bounds
+            .iter()
+            .map(|(id, p, s, _)| {
+                (*id, (p.map(|_| WindowUsage::default()), s.map(|_| WindowUsage::default())))
+            })
+            .collect();
 
-        let conn = self.conn.lock();
-        // `ts >= ?4` 这个下界是给索引用的（idx_usage_logs_cred_ts）：没有它，SQLite 只能
-        // 按 cred_id 定位，再把该账号 30 天的全部流水逐行走一遍靠 CASE 过滤——而窗口最长
-        // 才一周，且这条 SQL 每次刷新账号列表都要按凭证跑一遍、全程持着那把全局 conn 锁。
+        let values = vec!["(?,?,?,?)"; bounds.len()].join(",");
+        // `u.ts >= w.floor` 这个下界是给索引用的（idx_usage_logs_cred_ts）：没有它，SQLite
+        // 只能按 cred_id 定位，再把该账号 30 天的全部流水逐行走一遍靠 CASE 过滤——而窗口
+        // 最长才一周。
         //
         // token 那一项各列逐个 COALESCE 成 0 再相加：没嗅探到用量的行（4xx/429）各列都是
         // NULL，而 SQLite 里 NULL + x = NULL，会把整条流水的 token 抹掉。
-        let mut stmt = conn.prepare(
-            "SELECT
-                 SUM(CASE WHEN ts >= ?2 THEN 1 ELSE 0 END),
-                 COALESCE(SUM(CASE WHEN ts >= ?2 THEN COALESCE(
-                     total_tokens,
-                     COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) END), 0),
-                 COALESCE(SUM(CASE WHEN ts >= ?2 THEN cost_usd END), 0),
-                 SUM(CASE WHEN ts >= ?3 THEN 1 ELSE 0 END),
-                 COALESCE(SUM(CASE WHEN ts >= ?3 THEN COALESCE(
-                     total_tokens,
-                     COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) END), 0),
-                 COALESCE(SUM(CASE WHEN ts >= ?3 THEN cost_usd END), 0)
-               FROM usage_logs
-              WHERE cred_id = ?1 AND ts >= ?4",
-        )?;
-        // `ts >= NULL` 恒为 NULL，于是没被报告的那个窗口在 SQL 里自然算出 0；
-        // **要不要把它当成 0 由 Rust 这边定**——窗口不存在时返回 None，
-        // 与「这个周期一条都没跑」区分开。
-        let row = stmt.query_row(params![cred_id, primary, secondary, floor], |r| {
+        let sql = format!(
+            "WITH w(cred_id, p, s, floor) AS (VALUES {values})
+             SELECT w.cred_id,
+                 SUM(CASE WHEN u.ts >= w.p THEN 1 ELSE 0 END),
+                 COALESCE(SUM(CASE WHEN u.ts >= w.p THEN COALESCE(
+                     u.total_tokens,
+                     COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)) END), 0),
+                 COALESCE(SUM(CASE WHEN u.ts >= w.p THEN u.cost_usd END), 0),
+                 SUM(CASE WHEN u.ts >= w.s THEN 1 ELSE 0 END),
+                 COALESCE(SUM(CASE WHEN u.ts >= w.s THEN COALESCE(
+                     u.total_tokens,
+                     COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)) END), 0),
+                 COALESCE(SUM(CASE WHEN u.ts >= w.s THEN u.cost_usd END), 0)
+               FROM w JOIN usage_logs u ON u.cred_id = w.cred_id AND u.ts >= w.floor
+              GROUP BY w.cred_id"
+        );
+        let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(bounds.len() * 4);
+        for (id, primary, secondary, floor) in &bounds {
+            args.push((*id).into());
+            args.push((*primary).into());
+            args.push((*secondary).into());
+            args.push((*floor).into());
+        }
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
             Ok((
-                WindowUsage { requests: r.get(0)?, tokens: r.get(1)?, cost_usd: r.get(2)? },
-                WindowUsage { requests: r.get(3)?, tokens: r.get(4)?, cost_usd: r.get(5)? },
+                r.get::<_, i64>(0)?,
+                WindowUsage { requests: r.get(1)?, tokens: r.get(2)?, cost_usd: r.get(3)? },
+                WindowUsage { requests: r.get(4)?, tokens: r.get(5)?, cost_usd: r.get(6)? },
             ))
         })?;
-        Ok((primary.map(|_| row.0), secondary.map(|_| row.1)))
+        for row in rows {
+            let (cred_id, primary, secondary) = row?;
+            if let Some((p, s)) = out.get_mut(&cred_id) {
+                // `ts >= NULL` 恒为 NULL，于是没被报告的那个窗口在 SQL 里自然算出 0；
+                // **要不要把它当成 0 由 Rust 这边定**——窗口不存在时留 None，
+                // 与「这个周期一条都没跑」区分开。
+                *p = p.map(|_| primary);
+                *s = s.map(|_| secondary);
+            }
+        }
+        Ok(out)
     }
 
     /// 分页取用量流水（倒序），可按凭证过滤。
@@ -2280,10 +2498,49 @@ impl CredentialStore {
     }
 
     /// 裁掉过期的用量流水，返回删了几行。终身口径在账本里，不受影响。
+    ///
+    /// 分批删、每批一个事务（理由见 [`DELETE_CHUNK_ROWS`]）：这活儿每天跑一次、启动时也跑
+    /// 一次，而攒了一整天（或积压了几天）的流水一次删完，会在转发路径正忙的时候把那把全局
+    /// 锁占住不放。
+    ///
+    /// 顺带清掉**没有账号的孤儿流水**：删账号时流水是分批删的，中途崩了会留下一截
+    /// （见 [`Self::delete_many`]）。这一句同时兜住了历史上任何漏删——它们不影响统计，
+    /// 但会一直占着空间和索引。
     pub fn prune_usage_logs(&self) -> Result<usize> {
         let cutoff = now_secs() as i64 - USAGE_LOG_RETENTION_SECS;
-        let conn = self.conn.lock();
-        Ok(conn.execute("DELETE FROM usage_logs WHERE ts < ?1", params![cutoff])?)
+        let mut total = 0;
+        loop {
+            let n = {
+                let conn = self.conn.lock();
+                conn.execute(
+                    "DELETE FROM usage_logs WHERE rowid IN
+                         (SELECT rowid FROM usage_logs WHERE ts < ?1 LIMIT ?2)",
+                    params![cutoff, DELETE_CHUNK_ROWS],
+                )?
+            };
+            total += n;
+            if (n as i64) < DELETE_CHUNK_ROWS {
+                break;
+            }
+        }
+        loop {
+            let n = {
+                let conn = self.conn.lock();
+                conn.execute(
+                    "DELETE FROM usage_logs WHERE rowid IN
+                         (SELECT rowid FROM usage_logs
+                           WHERE cred_id IS NOT NULL
+                             AND cred_id NOT IN (SELECT id FROM credentials)
+                           LIMIT ?1)",
+                    params![DELETE_CHUNK_ROWS],
+                )?
+            };
+            total += n;
+            if (n as i64) < DELETE_CHUNK_ROWS {
+                break;
+            }
+        }
+        Ok(total)
     }
 }
 
@@ -3344,5 +3601,183 @@ mod tests {
         assert_eq!(s.get_setting_i64(DEFAULT_RPM_LIMIT, 7), 30);
         s.delete_setting(DEFAULT_RPM_LIMIT).unwrap();
         assert_eq!(s.get_setting_i64(DEFAULT_RPM_LIMIT, 7), 7);
+    }
+
+    /// 造一份「上游报了主窗口」的快照，落一条流水把它写进账本。
+    fn with_primary_window(s: &CredentialStore, cred_id: i64, tokens: i64, cost: f64) {
+        let quota = QuotaSnapshot {
+            primary_used_pct: Some(19.0),
+            primary_window_minutes: Some(10_080),
+            primary_reset_at: Some((now_secs() as i64 + 3600).to_string()),
+            ..Default::default()
+        };
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(cred_id),
+            has_usage: true,
+            input_tokens: Some(tokens),
+            output_tokens: Some(0),
+            total_tokens: Some(tokens),
+            cost_usd: Some(cost),
+            quota: Some(quota),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    /// 一次取全池的账本，必须和逐个号取到的**一模一样**——窗口那两项也算在内。
+    /// 这是把账号列表从 2N 条 SQL 降到 2 条的前提：结果不同就不是同一个接口了。
+    #[test]
+    fn stats_all_reads_the_same_ledger_as_stats_of() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+        let c = add(&s, "c"); // 一条流水都没有，连账本行都不该有
+        with_primary_window(&s, a.id, 100, 1.0);
+        with_primary_window(&s, a.id, 50, 0.5);
+        with_primary_window(&s, b.id, 7, 0.07);
+
+        let all = s.stats_all().unwrap();
+        for cred in [&a, &b] {
+            let one = s.stats_of(cred.id).unwrap();
+            let many = all.get(&cred.id).expect("每个跑过的号都在里面");
+            assert_eq!(many.request_total, one.request_total);
+            assert_eq!(many.cost_total_usd, one.cost_total_usd);
+            assert_eq!(many.input_tokens_total, one.input_tokens_total);
+            assert_eq!(
+                many.primary_window.map(|w| (w.requests, w.tokens)),
+                one.primary_window.map(|w| (w.requests, w.tokens)),
+            );
+            assert!(many.secondary_window.is_none() && one.secondary_window.is_none());
+        }
+        assert_eq!(all[&a.id].primary_window.unwrap().requests, 2);
+        assert_eq!(all[&b.id].primary_window.unwrap().requests, 1, "不得跨账号串");
+        assert!(!all.contains_key(&c.id), "没跑过的号没有账本行");
+    }
+
+    /// 窗口被上游报了、但这个周期里一条流水都没有：该读出一组 0。
+    ///
+    /// 过去这里会整份账本清零：那条聚合没有匹配行时 `SUM` 回 NULL，取成 i64 直接报错，
+    /// 而调用点是 `unwrap_or_default()`——于是卡片上连终身累计的花费都变成 0。
+    #[test]
+    fn a_reported_window_with_no_traffic_reads_zero_not_a_blank_ledger() {
+        let s = store();
+        let a = add(&s, "a");
+        with_primary_window(&s, a.id, 100, 1.0);
+        // 流水被裁掉（或那一条恰好落在窗口起点之前），账本与快照还在。
+        s.conn.lock().execute("DELETE FROM usage_logs", []).unwrap();
+
+        let st = s.stats_of(a.id).unwrap();
+        assert_eq!(st.request_total, 1, "终身账本不受流水裁剪影响");
+        let w = st.primary_window.expect("上游报过这个窗口，就不能变回 None");
+        assert_eq!((w.requests, w.tokens, w.cost_usd), (0, 0, 0.0));
+        assert_eq!(
+            s.stats_all().unwrap()[&a.id].primary_window.map(|w| w.requests),
+            Some(0),
+            "全池那条路要给同样的答案"
+        );
+    }
+
+    /// 灌若干条流水，直接写库（比逐条 insert_usage_log 快得多）。
+    fn fill_logs(s: &CredentialStore, cred_id: i64, rows: i64) {
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO usage_logs (cred_id, ts)
+                 WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+                 SELECT ?1, unixepoch() FROM n",
+                params![cred_id, rows],
+            )
+            .unwrap();
+    }
+
+    fn log_count(s: &CredentialStore, cred_id: i64) -> i64 {
+        s.conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM usage_logs WHERE cred_id = ?1",
+                params![cred_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 删号要把流水删干净——**哪怕多到得分好几批**（那正是它慢到卡住别的操作的原因），
+    /// 而且只删它自己的。
+    #[test]
+    fn deleting_a_credential_sweeps_all_its_logs_across_chunks() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+        fill_logs(&s, a.id, DELETE_CHUNK_ROWS * 2 + 7);
+        fill_logs(&s, b.id, 3);
+
+        assert!(s.delete(a.id).unwrap());
+        assert_eq!(log_count(&s, a.id), 0, "分批删也要一条不剩");
+        assert_eq!(log_count(&s, b.id), 3, "别人的流水不能动");
+    }
+
+    /// 删到一半崩掉会留下没有账号的孤儿流水，裁剪那一趟顺手清掉。
+    #[test]
+    fn pruning_sweeps_orphan_logs() {
+        let s = store();
+        let a = add(&s, "a");
+        fill_logs(&s, a.id, 5);
+        fill_logs(&s, a.id + 999, 4); // 账号已经不在了
+        s.conn
+            .lock()
+            .execute("INSERT INTO usage_logs (cred_id, ts) VALUES (NULL, unixepoch())", [])
+            .unwrap();
+
+        assert_eq!(s.prune_usage_logs().unwrap(), 4, "只清孤儿，没过期的一条都不动");
+        assert_eq!(log_count(&s, a.id), 5);
+        assert_eq!(log_count(&s, a.id + 999), 0);
+        let unattributed: i64 = s
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM usage_logs WHERE cred_id IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unattributed, 1, "没有 cred_id 的行不是孤儿，是没归到号上的请求");
+    }
+
+    /// 批量改一次事务做完，每个 id 都得生效；启用那一支照旧清掉停用痕迹。
+    #[test]
+    fn batch_updates_reach_every_id() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+        s.set_priority_many(&[a.id, b.id], 3).unwrap();
+        s.set_rpm_limit_many(&[a.id, b.id], 12).unwrap();
+        s.mark_banned(a.id, "for the test").unwrap();
+        s.set_disabled_many(&[a.id, b.id], false).unwrap();
+
+        for id in [a.id, b.id] {
+            let c = s.get(id).unwrap().unwrap();
+            assert_eq!((c.priority, c.rpm_limit), (3, 12));
+            assert!(!c.disabled);
+            assert!(c.ban_reason.is_none(), "手动启用要把封禁理由一并清掉");
+        }
+    }
+
+    /// 全池合计等于各号之和，且不把孤儿账本行算进去。
+    #[test]
+    fn pool_totals_sum_the_live_credentials_only() {
+        let s = store();
+        let a = add(&s, "a");
+        let b = add(&s, "b");
+        with_primary_window(&s, a.id, 100, 1.0);
+        with_primary_window(&s, b.id, 25, 0.25);
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO credential_stats (cred_id, cost_total_usd, request_total,
+                     input_tokens_total) VALUES (4242, 99.0, 99, 9900)",
+                [],
+            )
+            .unwrap();
+
+        let t = s.pool_totals().unwrap();
+        assert_eq!(t.request_total, 2);
+        assert!((t.cost_total_usd - 1.25).abs() < 1e-9, "{}", t.cost_total_usd);
+        assert_eq!(t.input_tokens_total, 125, "没有账号的那行不算数");
     }
 }

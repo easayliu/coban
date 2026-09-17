@@ -581,8 +581,31 @@ struct CredentialView {
     stats: store::CredentialStats,
 }
 
+/// 单条凭证的视图。账本现查——这条路径一次只看一个号。
 fn view_of(state: &AppState, c: &Credential) -> CredentialView {
     let default_rpm = state.store.get_setting_i64(store::DEFAULT_RPM_LIMIT, 0);
+    let stats = state.store.stats_of(c.id).unwrap_or_default();
+    view_with(state, c, default_rpm, stats)
+}
+
+/// 整张列表的视图。**账本与全局默认值各取一次**，不是每个号各查一遍：界面是轮询的，
+/// 逐号去查就是每次刷新 2N 条 SQL、2N 次抢那把全局 conn 锁，而转发路径抢的是同一把。
+fn views_of(state: &AppState, list: &[Credential]) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    let default_rpm = state.store.get_setting_i64(store::DEFAULT_RPM_LIMIT, 0);
+    let mut stats = state.store.stats_all().map_err(internal)?;
+    Ok(Json(
+        list.iter()
+            .map(|c| view_with(state, c, default_rpm, stats.remove(&c.id).unwrap_or_default()))
+            .collect(),
+    ))
+}
+
+fn view_with(
+    state: &AppState,
+    c: &Credential,
+    default_rpm: i64,
+    stats: store::CredentialStats,
+) -> CredentialView {
     CredentialView {
         id: c.id,
         label: c.label.clone(),
@@ -601,7 +624,7 @@ fn view_of(state: &AppState, c: &Credential) -> CredentialView {
         updated_at: c.updated_at,
         cooldown_secs: state.store.cooldown_secs(c.id),
         created_at: c.created_at,
-        stats: state.store.stats_of(c.id).unwrap_or_default(),
+        stats,
     }
 }
 
@@ -618,14 +641,15 @@ async fn list_credentials(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     let list = state.store.list().map_err(internal)?;
-    Ok(Json(list.iter().map(|c| view_of(&state, c)).collect()))
+    views_of(&state, &list)
 }
 
 async fn delete_credential(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.store.delete(id).map_err(internal)? {
+    let store = state.store.clone();
+    if !blocking(move || store.delete(id)).await? {
         return Err(not_found());
     }
     tracing::info!(cred_id = id, "credential deleted");
@@ -653,43 +677,44 @@ fn check_ids(ids: &[i64]) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// 逐条执行并返回**全部**账号的最新视图。
+/// 执行一次批量改动，并返回**全部**账号的最新视图。
 ///
 /// 回全量而不是只回改动的那几条：批量改优先级会连带改变列表顺序与分页，前端拿到部分
 /// 数据没法自洽地合并。列表本来就不大（账号数是个位数到几十）。
+///
+/// `op` 收的是整份 id 列表而不是逐个回调：store 那边把它们放进**一个事务**，于是「一条
+/// 失败就整体报错」之外还多一条——失败时库里一条都没改。从前逐条提交，中途失败会留下
+/// 一半改了一半没改的状态，而那正是批量操作最没法重试的情形。
 fn apply_batch(
     state: &AppState,
     ids: &[i64],
-    mut op: impl FnMut(i64) -> anyhow::Result<()>,
+    op: impl FnOnce(&[i64]) -> anyhow::Result<()>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(ids)?;
-    for &id in ids {
-        // 一条失败就整体报错：批量操作最怕「部分成功且不说是哪部分」，那种状态没法重试。
-        op(id).map_err(internal)?;
-    }
+    op(ids).map_err(internal)?;
     let list = state.store.list().map_err(internal)?;
-    Ok(Json(list.iter().map(|c| view_of(state, c)).collect()))
+    views_of(state, &list)
 }
 
 async fn set_priorities(
     State(state): State<AppState>,
     Json(req): Json<BatchReq<i64>>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    apply_batch(&state, &req.ids, |id| state.store.set_priority(id, req.value))
+    apply_batch(&state, &req.ids, |ids| state.store.set_priority_many(ids, req.value))
 }
 
 async fn set_rpm_limits(
     State(state): State<AppState>,
     Json(req): Json<BatchReq<i64>>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    apply_batch(&state, &req.ids, |id| state.store.set_rpm_limit(id, req.value))
+    apply_batch(&state, &req.ids, |ids| state.store.set_rpm_limit_many(ids, req.value))
 }
 
 async fn set_disabled_many(
     State(state): State<AppState>,
     Json(req): Json<BatchReq<bool>>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    apply_batch(&state, &req.ids, |id| state.store.set_disabled(id, req.value))
+    apply_batch(&state, &req.ids, |ids| state.store.set_disabled_many(ids, req.value))
 }
 
 #[derive(Deserialize)]
@@ -701,10 +726,14 @@ async fn delete_credentials(
     State(state): State<AppState>,
     Json(req): Json<IdsReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
     let n = req.ids.len();
-    let out = apply_batch(&state, &req.ids, |id| state.store.delete(id).map(|_| ()))?;
+    let store = state.store.clone();
+    let ids = req.ids.clone();
+    blocking(move || store.delete_many(&ids)).await?;
     tracing::info!(count = n, "credentials deleted in batch");
-    Ok(out)
+    let list = state.store.list().map_err(internal)?;
+    views_of(&state, &list)
 }
 
 #[derive(Deserialize)]
@@ -1003,29 +1032,19 @@ struct MetricsResp {
 
 async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>, ApiError> {
     let list = state.store.list().map_err(internal)?;
-    let mut cost = 0.0;
-    let mut requests = 0;
-    let mut rpm = 0;
-    let mut input_tokens = 0;
-    let mut cached_tokens = 0;
-    for c in &list {
-        let s = state.store.stats_of(c.id).unwrap_or_default();
-        cost += s.cost_total_usd;
-        requests += s.request_total;
-        input_tokens += s.input_tokens_total;
-        cached_tokens += s.cached_tokens_total;
-        rpm += state.store.current_rpm(c.id);
-    }
+    let totals = state.store.pool_totals().map_err(internal)?;
+    // RPM 是进程内的计数器（不碰库），逐个号加起来就是全池。
+    let rpm = list.iter().map(|c| state.store.current_rpm(c.id)).sum();
     Ok(Json(MetricsResp {
         credentials_total: list.len(),
         credentials_enabled: list.iter().filter(|c| !c.disabled).count(),
         rpm,
         window_secs: store::RPM_WINDOW_SECS as i64,
         in_flight: state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
-        cost_total_usd: cost,
-        requests_total: requests,
-        input_tokens_total: input_tokens,
-        cached_tokens_total: cached_tokens,
+        cost_total_usd: totals.cost_total_usd,
+        requests_total: totals.request_total,
+        input_tokens_total: totals.input_tokens_total,
+        cached_tokens_total: totals.cached_tokens_total,
     }))
 }
 
@@ -1336,6 +1355,23 @@ fn bad_request(msg: impl Into<String>) -> ApiError {
 
 fn not_found() -> ApiError {
     (StatusCode::NOT_FOUND, "not found".into())
+}
+
+/// 把一次会拿住 SQLite 锁不放的活儿挪到阻塞线程池上跑。
+///
+/// 这个库里绝大多数操作是毫秒级的，直接在异步线程上做没问题；**删账号不是**——它要连带
+/// 删掉那个号三十天的流水。那把 `conn` 锁是全局的、转发路径的每一步（选号、落库、刷
+/// token）都要抢，而抢不到时是在异步线程上**同步**等——并发几条请求就能把 runtime 的
+/// worker 全占住，表现为「删一个账号，所有接口一起卡住」。
+///
+/// 落库那条路早就是这么做的（见 `proxy::spawn_usage_log`），这里补上同一道。
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, ApiError> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(r) => r.map_err(internal),
+        Err(e) => Err(internal(e)),
+    }
 }
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
