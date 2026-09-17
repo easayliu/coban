@@ -150,7 +150,7 @@ pub async fn handle(
     let lite = declares_responses_lite(&headers);
     let base =
         |model: &str| (fill_base && !lite).then(|| base_instructions_for(&state, model)).flatten();
-    let Normalized { body, collapse, chat, prefix, input_len, hint, client_ids } =
+    let Normalized { body, collapse, chat, prefix, input_len, hint, req_model, client_ids } =
         match plan_request(&path, body, sort_tools, &base) {
             Ok(n) => n,
             // chat 那头的形状错误在 coban 这一层就判得出来，送到上游只换回一句指不到原因的 400。
@@ -197,6 +197,7 @@ pub async fn handle(
         prefix,
         input_len,
         source: incoming_session.as_ref().map_or("fingerprint", |(name, _)| *name),
+        req_model,
         headers: header_dump(&headers).into(),
     };
 
@@ -1297,6 +1298,7 @@ where
         input_len: session.input_len,
         source: session.source,
         headers: session.headers.clone(),
+        req_model: session.req_model.clone(),
         path: path.to_owned(),
         ua: ua.incoming.clone(),
         upstream_ua: ua.upstream.clone(),
@@ -1362,6 +1364,12 @@ struct Normalized {
     input_len: usize,
     /// 这条请求的 `x-codex-routing-hint` 取值，见 [`routing_hint`]。来访没带那个头时补它。
     hint: Option<String>,
+    /// 这条请求**要**的模型名，与 `hint` 同源：取自真要发出去的那份体，不是来访那份。
+    ///
+    /// 它与嗅探到的实际模型配成一对落库（见 [`store::UsageRecord::req_model`]）。单看任何
+    /// 一个都看不出上游改没改路由——实际那个只说「这次是谁生成的」，请求那个只说「我们要
+    /// 的是谁」，两者对上才是一次如实的路由记录。解不出体时为 `None`。
+    req_model: Option<String>,
     /// 体里带着那一族「设备/会话身份」字段（`client_metadata` 或 `prompt_cache_key`）。
     ///
     /// **在这里记一笔是为了省一次解析**：身份收敛（见 [`IdMode`]）要改的正是这几个字段，
@@ -1537,6 +1545,7 @@ fn plan_request(
             // 翻出来的体打的是 `responses` 端点，路由提示也就该跟着报——那条路上
             // `service_tier` 不存在（Chat Completions 没有这个字段），只报模型。
             hint: routing_hint_for(&t.model, None),
+            req_model: Some(t.model.clone()),
             body: t.body,
             // 「客户端没要流」在两种线格式里是同一件事，收拢那段代码也就共用。
             collapse: !t.stream,
@@ -1588,6 +1597,7 @@ fn normalize_responses_body(
             prefix: None,
             input_len: 0,
             hint: None,
+            req_model: None,
             client_ids: false,
         };
     }
@@ -1599,6 +1609,7 @@ fn normalize_responses_body(
             prefix: None,
             input_len: 0,
             hint: None,
+            req_model: None,
             client_ids: false,
         };
     };
@@ -1633,6 +1644,9 @@ fn normalize_responses_body(
     // **排在丢参数之后**：`service_tier: "auto"` 刚被丢掉，路由提示得反映真的发出去的那份体
     // ——报一个体里已经没有的 `tier=auto` 就是自己造一份对不上的声明。
     let hint = routing_hint(&obj);
+    // 与 `hint` 同一处、同一份体：那个头报的 `model=` 与这一列必须是同一个值，分两处取
+    // 迟早会出现「头说 A、流水记 B」。
+    let req_model = obj.get("model").and_then(|v| v.as_str()).map(str::to_owned);
     let client_ids = obj.contains_key("client_metadata") || obj.contains_key("prompt_cache_key");
     if !collapse
         && obj.get("store") == no
@@ -1645,7 +1659,16 @@ fn normalize_responses_body(
         && !filled_instructions
     {
         // 三项都已经对、也没有该丢的参数：不重新序列化（也就不会顺手改掉字段顺序）。
-        return Normalized { body, collapse, chat: None, prefix, input_len, hint, client_ids };
+        return Normalized {
+            body,
+            collapse,
+            chat: None,
+            prefix,
+            input_len,
+            hint,
+            req_model,
+            client_ids,
+        };
     }
     obj.insert("store".to_owned(), serde_json::Value::Bool(false));
     obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
@@ -1657,10 +1680,20 @@ fn normalize_responses_body(
             prefix,
             input_len,
             hint,
+            req_model,
             client_ids,
         },
         // 序列化一个刚解出来的 JSON 不会失败，真失败了也宁可发原体而不是空体。
-        Err(_) => Normalized { body, collapse, chat: None, prefix, input_len, hint, client_ids },
+        Err(_) => Normalized {
+            body,
+            collapse,
+            chat: None,
+            prefix,
+            input_len,
+            hint,
+            req_model,
+            client_ids,
+        },
     }
 }
 
@@ -3149,6 +3182,12 @@ struct SessionCtx {
     /// 会话键是哪来的：带来它的那个头名，没带就是 `"fingerprint"`。只进日志——键本身看不出
     /// 来源（客户端发个 32 位 hex 当会话 id，跟这边算的指纹长得一模一样）。
     source: &'static str,
+    /// 这条请求**要**的模型名（见 [`Normalized::req_model`]）。
+    ///
+    /// 与 `source`、`headers` 一样只为落库而跟着走：实际服务的模型要等流走完才嗅探得到，
+    /// 而要的那个在规范化那一刻就定了——两头只在落库那一处碰面（见 [`routed_req_model`]），
+    /// 那就得有人把它带到那里。
+    req_model: Option<String>,
     /// 来访请求的全部头，凭据类的值已盖住（见 [`header_dump`]）。
     ///
     /// **每条请求都建这一份，哪怕最后不打**：头只在转发那一刻抓得住，而这条请求是不是
@@ -4531,6 +4570,8 @@ struct UsageLogGuard {
     /// 与来访的全部头。流式请求几十秒才走完，这两样得跟着 guard 活到那时候。
     source: &'static str,
     headers: Arc<str>,
+    /// 这条请求要的模型名（见 [`SessionCtx::req_model`]）。
+    req_model: Option<String>,
     path: String,
     /// 来访客户端自报的 UA 与实际发出去那份（见 [`UaPair`]）。
     ua: Option<String>,
@@ -4576,6 +4617,7 @@ impl Drop for UsageLogGuard {
             cred_label: std::mem::take(&mut self.cred_label),
             cache_reason: Some(reason),
             session_id: self.session_key.take(),
+            req_model: routed_req_model(self.req_model.as_deref(), model.as_deref()),
             model,
             path: std::mem::take(&mut self.path),
             ua: self.ua.take(),
@@ -4594,6 +4636,16 @@ impl Drop for UsageLogGuard {
         };
         spawn_usage_log(self.store.clone(), rec);
     }
+}
+
+/// 这条流水的 `req_model` 该记什么：与**实际服务的**模型逐字相同就记 `None`。
+///
+/// 理由同 [`store::UsageRecord::upstream_ua`]：这一列要回答的是「上游改路由了吗、改成了
+/// 什么」，两者相同时它恒等于 `model`，白占着 30 天流水的地方，页面上也多一份读者得自己
+/// 比对一遍的噪声。反过来，**上游没报模型时照记**（错误响应那类，压根没生成）——那时这一
+/// 列是整条流水里唯一说得出「客户端要的是什么」的东西。
+fn routed_req_model(asked: Option<&str>, served: Option<&str>) -> Option<String> {
+    asked.filter(|a| Some(*a) != served).map(str::to_owned)
 }
 
 /// 非流式路径（错误响应）的落库。
@@ -4632,6 +4684,7 @@ fn log_usage(
         cred_label: cred.label.clone(),
         cache_reason: Some(reason),
         session_id: session.key.clone(),
+        req_model: routed_req_model(session.req_model.as_deref(), model.as_deref()),
         model,
         path: path.to_owned(),
         ua: ua.incoming.clone(),
@@ -5309,7 +5362,15 @@ pub async fn probe(state: &AppState, cred: &Credential, model: &str) -> ProbeRep
                 // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条
                 // 流水——额度快照来自头，不依赖 body。
                 Err(_) => {
-                    log_probe_usage(state, cred, status, &UsageSniffer::default(), &quota, started);
+                    log_probe_usage(
+                        state,
+                        cred,
+                        model,
+                        status,
+                        &UsageSniffer::default(),
+                        &quota,
+                        started,
+                    );
                     ProbeReport {
                         ok: false,
                         status: status.as_u16(),
@@ -5326,7 +5387,15 @@ pub async fn probe(state: &AppState, cred: &Credential, model: &str) -> ProbeRep
                 }
                 // 响应体读到一半断了：状态码与限流头都是真的，只是内容不完整，如实报出来。
                 Ok(Err(e)) => {
-                    log_probe_usage(state, cred, status, &UsageSniffer::default(), &quota, started);
+                    log_probe_usage(
+                        state,
+                        cred,
+                        model,
+                        status,
+                        &UsageSniffer::default(),
+                        &quota,
+                        started,
+                    );
                     ProbeReport {
                         ok: false,
                         status: status.as_u16(),
@@ -5343,7 +5412,7 @@ pub async fn probe(state: &AppState, cred: &Credential, model: &str) -> ProbeRep
                     // 各解析一遍既白花 CPU，也可能因为两处写法漂移而给出两个模型名。
                     let mut sniffer = UsageSniffer::default();
                     sniffer.feed(&bytes);
-                    log_probe_usage(state, cred, status, &sniffer, &quota, started);
+                    log_probe_usage(state, cred, model, status, &sniffer, &quota, started);
                     // 冷却是在读体之前按头打的（读体会把响应消费掉，而体可能读不完）。
                     // 体读到了、头又没给 retry-after 时，以体里的恢复提示为准把它顶掉——
                     // 理由同 [`rate_limit_cooldown`]。
@@ -5543,6 +5612,7 @@ fn upstream_error_kind(e: &reqwest::Error) -> &'static str {
 fn log_probe_usage(
     state: &AppState,
     cred: &Credential,
+    asked: &str,
     status: StatusCode,
     sniffer: &UsageSniffer,
     quota: &QuotaSnapshot,
@@ -5563,6 +5633,7 @@ fn log_probe_usage(
         // 探测自成一类：它没有会话、也不该在上游那边留下会话，混进「未归因」会让那一桶
         // 看着像是有一批真实请求归不了因。
         cache_reason: Some("probe"),
+        req_model: routed_req_model(Some(asked), model.as_deref()),
         model,
         path: PROBE_PATH.to_owned(),
         ua: Some(PROBE_UA.to_owned()),
@@ -7096,6 +7167,54 @@ mod tests {
             &untouched.body[..],
             br#"{"model":"m","store":false,"stream":true,"input":{"role":"user"},"include":["reasoning.encrypted_content"]}"#
         );
+    }
+
+    /// 两条线格式都要报出**客户端要的那个模型**：流水里那一对（要的 / 实际给的）缺了左边
+    /// 那半个，就只剩一个看不出上游改没改路由的模型名。
+    ///
+    /// 取的是**真要发出去的那份体**，与 `x-codex-routing-hint` 同源（见 [`routing_hint`]）：
+    /// 这一列与那个头报的必须是同一个值。
+    #[test]
+    fn both_wire_formats_report_the_model_the_caller_asked_for() {
+        let responses = plan_request(
+            "responses",
+            Bytes::from_static(
+                br#"{"model":"gpt-5.1-codex-max","input":[{"role":"user","content":"hi"}]}"#,
+            ),
+            false,
+            &no_base,
+        )
+        .unwrap();
+        assert_eq!(responses.req_model.as_deref(), Some("gpt-5.1-codex-max"));
+        assert_eq!(responses.hint.as_deref(), Some("model=gpt-5.1-codex-max"));
+
+        let chat = plan_request(
+            "chat/completions",
+            Bytes::from_static(br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}"#),
+            false,
+            &no_base,
+        )
+        .unwrap();
+        assert_eq!(chat.req_model.as_deref(), Some("gpt-5"));
+
+        // 体解不开（`models` 那类无体请求）时没有模型可言，也就不该编一个出来。
+        assert!(plan_request("models", Bytes::new(), false, &no_base).unwrap().req_model.is_none());
+    }
+
+    /// 要的与给的相同就不记——这一列存在的意义是「上游改路由了吗」，恒等于 `model` 的那份
+    /// 拷贝只会让页面上每一行都多出一个读者得自己比对一遍的名字。
+    ///
+    /// 反过来，**上游没报模型时照记**：错误响应那类压根没生成，那时这是整条流水里唯一说得出
+    /// 客户端要的是什么的一列。
+    #[test]
+    fn the_requested_model_is_recorded_only_when_it_is_news() {
+        assert_eq!(routed_req_model(Some("gpt-5"), Some("gpt-5")), None);
+        assert_eq!(
+            routed_req_model(Some("gpt-5.1-codex-max"), Some("gpt-5.1-codex-mini")).as_deref(),
+            Some("gpt-5.1-codex-max")
+        );
+        assert_eq!(routed_req_model(Some("gpt-5"), None).as_deref(), Some("gpt-5"));
+        assert_eq!(routed_req_model(None, Some("gpt-5")), None);
     }
 
     /// 两条线格式都要报出 `input[]` 的项数——`first_turn` 与「没见过的前缀」那几类全靠它分开。

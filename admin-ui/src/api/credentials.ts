@@ -149,7 +149,15 @@ export interface UsageLog {
   session_id: string | null
   /** 这条请求的缓存结局 / 未命中原因；null = 没有会话身份（`models` 那类）。见 `CACHE_REASONS`。 */
   cache_reason: string | null
+  /** 上游**实际服务**的模型：从响应里嗅探到的那个，计价按它算。 */
   model: string | null
+  /**
+   * 客户端**要**的模型；`null` = 与 `model` 逐字相同，即上游没改路由。
+   *
+   * 只在不同时才有值（后端相同就存 null），所以「这一列有值」本身就等于「这条请求被改过
+   * 路由」。错误响应那类没有实际模型（上游没生成），那时只有这一列说得出客户端要的是什么。
+   */
+  req_model: string | null
   path: string
   /** 来访客户端自报的 UA（已截断）。 */
   ua: string | null

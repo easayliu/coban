@@ -429,6 +429,18 @@ for (const hours of [24, 7 * 24, 30 * 24]) {
   queryClient.setQueryData(['cache-reasons', hours], previewCacheReasons)
 }
 
+// 上游改路由：预览里摆成「真的发生了」那一态——另外两态（一条都没被改、压根没流量）
+// 一个是一行字、一个什么都不显示，看不出什么。
+queryClient.setQueryData(['model-routing', 7 * 24], {
+  since: now - 7 * 24 * 3600,
+  observed: 12_880,
+  routed: 431,
+  pairs: [
+    { req_model: 'gpt-5.1-codex-max', model: 'gpt-5.1-codex', requests: 388, cost_usd: 24.71 },
+    { req_model: 'gpt-5', model: 'gpt-5-mini', requests: 43, cost_usd: 1.16 },
+  ],
+})
+
 const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   id: 1200 - index,
   ts: now - index * 73,
@@ -440,6 +452,9 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   cache_reason:
     index === 9 ? 'no_usage' : index === 5 ? 'rotated' : index % 4 === 1 ? 'instructions_changed' : 'hit',
   model: index % 3 === 0 ? 'gpt-5-codex' : 'gpt-5',
+  // 被改过路由的那一条（index 7 要的是 codex、上游给的是 gpt-5）才有值，其余留 null
+  // ——与后端一样，要的和给的相同就不记。
+  req_model: index === 7 ? 'gpt-5-codex' : null,
   path: '/backend-api/codex/responses',
   ua: index % 6 === 2 ? 'OpenAI/Python 1.108.1' : 'codex_cli_rs/0.47.0 (Mac OS 15.3; arm64)',
   // 被改写过的那几条（来访是 SDK）才有第二行，其余留 null——与后端一样，相同就不记。

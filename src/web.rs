@@ -140,6 +140,7 @@ pub async fn run(
         .route("/metrics", get(get_metrics))
         .route("/metrics/cache-series", get(get_cache_series))
         .route("/metrics/cache-reasons", get(get_cache_reasons))
+        .route("/metrics/model-routing", get(get_model_routing))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
@@ -1104,6 +1105,28 @@ async fn get_cache_reasons(
     let since = crate::credentials::now_secs() as i64 - hours * 3600;
     let reasons = state.store.cache_reasons(since).map_err(internal)?;
     Ok(Json(CacheReasonsResp { since, reasons }))
+}
+
+#[derive(Serialize)]
+struct ModelRoutingResp {
+    /// 同 [`CacheSeriesResp::since`]：夹过之后的真实起点。
+    since: i64,
+    #[serde(flatten)]
+    routing: store::ModelRouting,
+}
+
+/// 「上游有多少请求没给要的那个模型」。分子分母的口径见
+/// [`store::CredentialStore::model_routing`]——那件事只在**上游真的服务了一个模型**的请求
+/// 上谈得起，所以分母不是总条数。
+async fn get_model_routing(
+    State(state): State<AppState>,
+    Query(q): Query<CacheSeriesQuery>,
+) -> Result<Json<ModelRoutingResp>, ApiError> {
+    let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
+    let hours = q.hours.clamp(1, max_hours);
+    let since = crate::credentials::now_secs() as i64 - hours * 3600;
+    let routing = state.store.model_routing(since).map_err(internal)?;
+    Ok(Json(ModelRoutingResp { since, routing }))
 }
 
 // ---------- 设置 ----------

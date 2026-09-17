@@ -402,6 +402,9 @@ function UsageCards({
         // 会话 id 是个 UUID，整条显示会把这一格撑破；取前 8 位足够在一屏里区分，
         // 完整值挂在 title 上。
         const sessionShort = log.session_id ? log.session_id.slice(0, 8) : '—'
+        // 与表格里那一格同一处判断（见 [`ModelCell`]）：改过路由的行不压成灰的，
+        // 这份卡片一屏只放得下两三条，那一对名字是里头最该被看见的东西。
+        const model = modelPair(log, t)
         return (
           <li key={log.id} className="rounded-lg border bg-card px-3 py-2.5 text-xs">
             <div className="flex min-w-0 items-center gap-2">
@@ -420,8 +423,11 @@ function UsageCards({
                 {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
               </span>
             </div>
-            <p className="mt-1 truncate text-muted-foreground" title={log.model ?? undefined}>
-              {log.model ?? '—'}
+            <p
+              className={cn('mt-1 truncate', model.routed ? 'font-medium' : 'text-muted-foreground')}
+              title={model.title}
+            >
+              {model.text}
             </p>
             <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5">
               <LogFact label={t('输入 / 输出', 'In / out')}>
@@ -504,7 +510,7 @@ function UsageTable({
           tabIndex={0}
         />
       )}
-      className="min-w-[84rem] table-fixed text-xs"
+      className="min-w-[86rem] table-fixed text-xs"
       aria-describedby={descriptionId}
     >
       <TableCaption className="sr-only">
@@ -513,7 +519,7 @@ function UsageTable({
       <colgroup>
         <col className="w-[7.5rem]" />
         <col className="w-[4rem]" />
-        <col className="w-[9rem]" />
+        <col className="w-[11rem]" />
         <col className="w-[4.25rem]" />
         <col className="w-[4.25rem]" />
         <col className="w-[6.5rem]" />
@@ -538,7 +544,15 @@ function UsageTable({
         <TableRow className="bg-muted/96">
           <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('状态', 'Status')}</TableHead>
-          <TableHead className="whitespace-nowrap">{t('模型', 'Model')}</TableHead>
+          <TableHead
+            className="whitespace-nowrap"
+            title={t(
+              '上游实际服务的模型——从响应里读的，不是请求里写的。上游改了路由时这一格是「请求的 → 实际的」，其余行两者相同，只显示一个。',
+              'The model the upstream actually served, read from the response rather than the request. When the upstream rerouted, this cell reads "requested \u2192 served"; on every other row the two are the same and only one is shown.',
+            )}
+          >
+            {t('模型', 'Model')}
+          </TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('输入', 'Input')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('输出', 'Output')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('缓存 / 推理', 'Cached / reasoning')}</TableHead>
@@ -592,9 +606,7 @@ function UsageTable({
                   {log.status}
                 </Badge>
               </TableCell>
-              <TableCell className="max-w-40 truncate" title={log.model ?? undefined}>
-                {log.model ?? '—'}
-              </TableCell>
+              <ModelCell log={log} />
               <TableCell className="whitespace-nowrap text-right tabular-nums">
                 {num(log.input_tokens, locale)}
               </TableCell>
@@ -660,6 +672,42 @@ function CacheReasonCell({ reason }: { reason: string | null }) {
       title={cacheReasonHint(key, t) ?? undefined}
     >
       {cacheReasonLabel(key, t)}
+    </TableCell>
+  )
+}
+
+/**
+ * 这一行的模型该怎么读：要的那个与实际服务的那个。
+ *
+ * `req_model` 为空即两者相同（相同时后端存的就是 null，见 `UsageLog.req_model`），也就是
+ * 绝大多数行——那时只显示一个名字，与这一列一直以来的样子一字不差。**卡片与表格共用这
+ * 一处**：各写一遍的话，两处迟早在「哪个在箭头左边」上给出两种读法。
+ */
+function modelPair(log: UsageLog, t: (zh: string, en: string) => string) {
+  const served = log.model ?? '—'
+  if (!log.req_model) return { text: served, title: log.model ?? undefined, routed: false }
+  return {
+    text: `${log.req_model} → ${served}`,
+    title: `${t('请求', 'Requested')}: ${log.req_model}\n${t('实际', 'Served')}: ${served}`,
+    routed: true,
+  }
+}
+
+/**
+ * 模型单元格。
+ *
+ * 改过路由的行标成强调色：这一列平时扫过去全是同一批名字，一对名字混在里头不着色就看不见
+ * ——而「上游没给你要的那个模型」正是要一眼看见的东西。
+ */
+function ModelCell({ log }: { log: UsageLog }) {
+  const { t } = useI18n()
+  const { text, title, routed } = modelPair(log, t)
+  return (
+    <TableCell
+      className={cn('max-w-44 truncate', routed && 'font-medium text-foreground')}
+      title={title}
+    >
+      {text}
     </TableCell>
   )
 }

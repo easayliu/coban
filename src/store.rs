@@ -504,6 +504,13 @@ pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// 分批之后每批之间锁是松开的，转发照常穿插进来。
 const DELETE_CHUNK_ROWS: i64 = 2_000;
 
+/// 「被改路由」那张表最多回几对。
+///
+/// 真实流量里这个数是个位数（客户端配的模型就那么几个），设上限只为兜住一种情形：上游哪天
+/// 开始回带日期后缀的模型名（`gpt-5-2025-08-07` 那种），每个版本各成一对，这张表会跟着上游
+/// 的发布节奏无声变长。二十对之外的都是长尾，对「要不要去改客户端配置」这个判断没有贡献。
+const MODEL_ROUTING_PAIRS_MAX: i64 = 20;
+
 /// 算出该账号实际生效的 RPM 上限。
 ///
 /// 三态：`> 0` 用它自己的；`0` 跟随全局默认；`< 0` 明确不限（**能顶掉全局默认**，
@@ -532,7 +539,14 @@ pub struct UsageRecord {
     /// 这条请求的缓存结局与未命中的原因，见 [`crate::proxy`] 的 `cache_reason`。
     /// `None` = 这条请求没有会话身份（`models` 那类）。
     pub cache_reason: Option<&'static str>,
+    /// 上游**实际服务**的模型：从响应里嗅探到的那个（见 [`crate::proxy`] 的 `UsageSniffer`），
+    /// 不是客户端要的那个。计价按它算。
     pub model: Option<String>,
+    /// 客户端**要**的模型。`None` = 与 [`Self::model`] 逐字节相同，即上游没改路由。
+    ///
+    /// 只在不同时才记，理由同 [`Self::upstream_ua`]：相同时它恒等于 `model`，白占地方。
+    /// 上游没报模型（错误响应那类）时照记——那时这是唯一说得出「客户端要的是什么」的一列。
+    pub req_model: Option<String>,
     pub path: String,
     /// 来访客户端自报的 UA（已截断）。
     pub ua: Option<String>,
@@ -660,7 +674,10 @@ pub struct UsageLog {
     pub session_id: Option<String>,
     /// 缓存结局 / 未命中原因（见 [`UsageRecord::cache_reason`]）。
     pub cache_reason: Option<String>,
+    /// 上游实际服务的模型（见 [`UsageRecord::model`]）。
     pub model: Option<String>,
+    /// 客户端要的模型；`None` = 与 [`Self::model`] 相同，见 [`UsageRecord::req_model`]。
+    pub req_model: Option<String>,
     pub path: String,
     /// 来访客户端自报的 UA（已截断）。认「谁在发」用它。
     pub ua: Option<String>,
@@ -725,6 +742,33 @@ pub struct CacheReasonStat {
     pub requests: i64,
     pub input_tokens: i64,
     pub cached_tokens: i64,
+}
+
+/// 一对「要的模型 → 实际服务的模型」在某段时间里的合计。见 [`CredentialStore::model_routing`]。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelRoutingPair {
+    /// 客户端要的那个。
+    pub req_model: String,
+    /// 上游实际给的那个。**必然与 `req_model` 不同**——相同的请求压根不记 `req_model`
+    /// （见 [`UsageRecord::req_model`]）。
+    pub model: String,
+    pub requests: i64,
+    /// 这一对上花掉的钱。按**实际服务的**模型计价——账单认的是它，不是要的那个。
+    pub cost_usd: f64,
+}
+
+/// 「有多少请求被改了路由」的一次合计。见 [`CredentialStore::model_routing`]。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelRouting {
+    /// 分母：这段时间里**看得出上游给了哪个模型**的请求数。
+    ///
+    /// 错误响应那类不算（上游压根没生成，谈不上路由），所以它比总条数小。用它当分母而不是
+    /// 总条数：一批 429 会把「被改路由的比例」凭空稀释一半，而那批请求根本没有路由可言。
+    pub observed: i64,
+    /// 其中要的与给的不是同一个模型的那些。
+    pub routed: i64,
+    /// 按条数从多到少排好的那几对。
+    pub pairs: Vec<ModelRoutingPair>,
 }
 
 /// 一个额度窗口的**当前周期内**已经发生了什么。
@@ -887,7 +931,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
             cred_id        INTEGER,
             cred_label     TEXT    NOT NULL DEFAULT '',
             session_id     TEXT,
+            -- 上游实际服务的模型（从响应里嗅探）。
             model          TEXT,
+            -- 客户端要的模型。NULL = 与 model 逐字相同（上游没改路由），见
+            -- UsageRecord::req_model。
+            req_model      TEXT,
             path           TEXT    NOT NULL DEFAULT '',
             ua             TEXT,
             -- 实际发往上游的 UA（已截断）。NULL = 与 ua 那份逐字节相同，见
@@ -938,6 +986,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     migrate_cache_reason(conn)?;
     migrate_reset_credits(conn)?;
     migrate_upstream_ua(conn)?;
+    migrate_req_model(conn)?;
     Ok(())
 }
 
@@ -999,6 +1048,24 @@ fn migrate_upstream_ua(conn: &Connection) -> Result<()> {
     conn.execute_batch("ALTER TABLE usage_logs ADD COLUMN upstream_ua TEXT;")
         .context("failed to add upstream_ua to usage_logs")?;
     tracing::info!("schema migrated: usage_logs.upstream_ua added");
+    Ok(())
+}
+
+/// 给 `usage_logs` 补上 `req_model` 列。理由同 [`migrate_token_totals`]。
+///
+/// **不回填**：这一列出现之前，客户端要的是哪个模型压根没入库——旧行填任何值都是编的。
+/// 留 NULL 正好落在「与实际服务的那个相同」这个语义上，也就是「没看见改过路由」，而那是
+/// 旧行诚实的说法：当时确实没看。
+fn migrate_req_model(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('usage_logs') WHERE name = ?1")?
+        .exists(params!["req_model"])?;
+    if has_column {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE usage_logs ADD COLUMN req_model TEXT;")
+        .context("failed to add req_model to usage_logs")?;
+    tracing::info!("schema migrated: usage_logs.req_model added");
     Ok(())
 }
 
@@ -2028,8 +2095,8 @@ impl CredentialStore {
             "INSERT INTO usage_logs
                  (cred_id, cred_label, session_id, model, path, ua, status, has_usage,
                   input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens,
-                  ttft_ms, total_ms, cost_usd, quota_raw, cache_reason, upstream_ua)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                  ttft_ms, total_ms, cost_usd, quota_raw, cache_reason, upstream_ua, req_model)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 rec.cred_id,
                 rec.cred_label,
@@ -2050,6 +2117,7 @@ impl CredentialStore {
                 quota_raw,
                 rec.cache_reason,
                 rec.upstream_ua,
+                rec.req_model,
             ],
         )?;
         if let Some(cred_id) = rec.cred_id {
@@ -2386,7 +2454,7 @@ impl CredentialStore {
         let sql = format!(
             "SELECT id, ts, cred_id, cred_label, session_id, cache_reason, model, path, ua, status,
                     input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens,
-                    ttft_ms, total_ms, cost_usd, upstream_ua
+                    ttft_ms, total_ms, cost_usd, upstream_ua, req_model
              FROM usage_logs {where_sql} ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
             args.len() + 1,
             args.len() + 2
@@ -2415,6 +2483,7 @@ impl CredentialStore {
                 total_ms: r.get(16)?,
                 cost_usd: r.get(17)?,
                 upstream_ua: r.get(18)?,
+                req_model: r.get(19)?,
             })
         };
         let logs: Vec<UsageLog> = stmt
@@ -2495,6 +2564,46 @@ impl CredentialStore {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 「上游有多少请求没给要的那个模型」——`since`（Unix 秒）之后的合计，按条数排。
+    ///
+    /// 这是流水里那一对（要的 / 实际给的）的池级读数：明细一行一条说得出「这一条被改了」，
+    /// 说不出「这件事在多大比例上发生」，而后者才决定要不要去动客户端那头的模型配置。
+    ///
+    /// **`model IS NULL` 的行一概不算，分子分母都不算**。那类是错误响应（上游没生成，见
+    /// [`crate::proxy`] 的 `routed_req_model`）——它的 `req_model` 有值只是因为那时那一列是
+    /// 唯一说得出客户端要什么的地方，**不是**一次改路由。掺进来的话，一段限流期会让这个
+    /// 比例冲到 100%，而那期间上游一次路由都没做过。
+    ///
+    /// 探测（[`crate::proxy`] 的 `log_probe_usage`）照算：它也是一次真实的上游判决，
+    /// 「测 A 却回了 B」与转发路径上那件事是同一件，没有理由分开看。
+    pub fn model_routing(&self, since: i64) -> Result<ModelRouting> {
+        let conn = self.conn.lock();
+        let (observed, routed) = conn.query_row(
+            "SELECT COUNT(*), COUNT(req_model)
+               FROM usage_logs WHERE ts >= ?1 AND model IS NOT NULL",
+            params![since],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT req_model, model, COUNT(*), COALESCE(SUM(cost_usd), 0)
+               FROM usage_logs
+              WHERE ts >= ?1 AND model IS NOT NULL AND req_model IS NOT NULL
+              GROUP BY req_model, model
+              ORDER BY COUNT(*) DESC
+              LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since, MODEL_ROUTING_PAIRS_MAX], |r| {
+            Ok(ModelRoutingPair {
+                req_model: r.get(0)?,
+                model: r.get(1)?,
+                requests: r.get(2)?,
+                cost_usd: r.get(3)?,
+            })
+        })?;
+        let pairs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ModelRouting { observed, routed, pairs })
     }
 
     /// 裁掉过期的用量流水，返回删了几行。终身口径在账本里，不受影响。
@@ -2966,6 +3075,91 @@ mod tests {
         // 只有 4 个桶：20 条 first_turn 合成一行。
         assert_eq!(stats.len(), 4);
         assert_eq!(stats.iter().map(|r| r.requests).sum::<i64>(), 23);
+    }
+
+    /// 「被改了路由」的池级读数：**只数上游真的服务了一个模型的那些请求**。
+    ///
+    /// 错误响应也带着 `req_model`（那时它是唯一说得出客户端要什么的一列），但那不是一次
+    /// 路由。它要是掺进来，一段限流期就能把这个比例冲到 100%——而那期间上游一次路由都没做过。
+    #[test]
+    fn model_routing_counts_only_requests_that_got_a_model() {
+        let s = store();
+        let a = add(&s, "a");
+        let log = |model: Option<&str>, req: Option<&str>, cost: f64| {
+            s.insert_usage_log(&UsageRecord {
+                cred_id: Some(a.id),
+                model: model.map(str::to_owned),
+                req_model: req.map(str::to_owned),
+                cost_usd: Some(cost),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // 要什么给什么：`req_model` 不记（见 UsageRecord::req_model）。
+        for _ in 0..3 {
+            log(Some("gpt-5"), None, 0.01);
+        }
+        // 上游改了路由。
+        log(Some("gpt-5-mini"), Some("gpt-5"), 0.02);
+        log(Some("gpt-5-mini"), Some("gpt-5"), 0.02);
+        log(Some("gpt-5-codex"), Some("gpt-5.1-codex-max"), 0.05);
+        // 错误响应：上游没生成，谈不上路由。分子分母都不该动。
+        log(None, Some("gpt-5"), 0.0);
+
+        let r = s.model_routing(0).unwrap();
+        assert_eq!(r.observed, 6, "错误响应那条不进分母");
+        assert_eq!(r.routed, 3);
+        // 按条数排：两条那一对在前。
+        assert_eq!(r.pairs.len(), 2);
+        assert_eq!(r.pairs[0].req_model, "gpt-5");
+        assert_eq!(r.pairs[0].model, "gpt-5-mini");
+        assert_eq!(r.pairs[0].requests, 2);
+        assert!((r.pairs[0].cost_usd - 0.04).abs() < 1e-9, "花费按实际服务的那个模型算");
+        assert_eq!(r.pairs[1].req_model, "gpt-5.1-codex-max");
+        assert_eq!(r.pairs[1].requests, 1);
+
+        // 窗口之外的一概不算。
+        let later = now_secs() as i64 + 3600;
+        assert_eq!(s.model_routing(later).unwrap().observed, 0);
+    }
+
+    /// 老库补 `req_model`：**不回填**——这一列出现之前，客户端要的是哪个模型压根没入库。
+    ///
+    /// 旧行留空正好落在「与实际服务的那个相同」这个语义上，于是它们只是「没看见改过路由」，
+    /// 不会被当成一批被改过的。
+    #[test]
+    fn migration_adds_req_model_without_backfilling() {
+        let s = store();
+        let a = add(&s, "a");
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(a.id),
+            model: Some("gpt-5-mini".into()),
+            req_model: Some("gpt-5".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        {
+            let conn = s.conn.lock();
+            conn.execute_batch("ALTER TABLE usage_logs DROP COLUMN req_model;").unwrap();
+            init_schema(&conn).unwrap();
+        }
+
+        let page = s.list_usage_page(Some(a.id), 10, 0, None).unwrap();
+        assert_eq!(page.logs.len(), 1);
+        assert!(page.logs[0].req_model.is_none(), "旧行留空，不编一个请求模型出来");
+        assert_eq!(s.model_routing(0).unwrap().routed, 0, "旧行不该被算成被改过路由");
+
+        // 迁移之后照常记。
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(a.id),
+            model: Some("gpt-5-mini".into()),
+            req_model: Some("gpt-5".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let page = s.list_usage_page(Some(a.id), 10, 0, None).unwrap();
+        assert_eq!(page.logs[0].req_model.as_deref(), Some("gpt-5"));
     }
 
     /// 老库补 `upstream_ua`：旧行留空（当时发出去的是什么，事后编不出来），新行照常记。

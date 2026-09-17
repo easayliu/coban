@@ -92,3 +92,41 @@ export async function getCacheReasons(hours: number): Promise<CacheReasons> {
   const { data } = await api.get('/metrics/cache-reasons', { params: { hours } })
   return data
 }
+
+/** 一对「要的模型 → 实际服务的模型」在这段时间里的合计。 */
+export interface ModelRoutingPair {
+  /** 客户端要的那个。 */
+  req_model: string
+  /** 上游实际给的那个。必然与 `req_model` 不同——相同的请求后端压根不记。 */
+  model: string
+  requests: number
+  /** 这一对上花掉的钱，按**实际服务的**模型计价（账单认的是它）。 */
+  cost_usd: number
+}
+
+export interface ModelRouting {
+  /** 真实起点（Unix 秒），同 `CacheSeries.since`。 */
+  since: number
+  /**
+   * 分母：这段时间里**看得出上游给了哪个模型**的请求数。
+   *
+   * 错误响应那类不算（上游没生成，谈不上路由），所以它比总条数小。口径由后端定，前端不要
+   * 拿别的数当分母——一批 429 会把这个比例凭空稀释一半，而那批请求根本没有路由可言。
+   */
+  observed: number
+  /** 其中要的与给的不是同一个模型的那些。 */
+  routed: number
+  /** 已按条数从多到少排好（最多 20 对）。前端不要重排。 */
+  pairs: ModelRoutingPair[]
+}
+
+/**
+ * 拉一段「上游有多少请求没给要的那个模型」。
+ *
+ * 明细里一行一条说得出「这一条被改了」，说不出「这件事在多大比例上发生」——而后者才决定
+ * 要不要去动客户端那头的模型配置。
+ */
+export async function getModelRouting(hours: number): Promise<ModelRouting> {
+  const { data } = await api.get('/metrics/model-routing', { params: { hours } })
+  return data
+}
