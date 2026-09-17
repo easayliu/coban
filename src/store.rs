@@ -504,12 +504,13 @@ pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// 分批之后每批之间锁是松开的，转发照常穿插进来。
 const DELETE_CHUNK_ROWS: i64 = 2_000;
 
-/// 「被改路由」那张表最多回几对。
+/// 「被改路由」那几对**全池合起来**最多回几行。
 ///
-/// 真实流量里这个数是个位数（客户端配的模型就那么几个），设上限只为兜住一种情形：上游哪天
+/// 真实流量里每个号是个位数（客户端配的模型就那么几个），设上限只为兜住一种情形：上游哪天
 /// 开始回带日期后缀的模型名（`gpt-5-2025-08-07` 那种），每个版本各成一对，这张表会跟着上游
-/// 的发布节奏无声变长。二十对之外的都是长尾，对「要不要去改客户端配置」这个判断没有贡献。
-const MODEL_ROUTING_PAIRS_MAX: i64 = 20;
+/// 的发布节奏、再乘上号数无声变长。按条数取前几行，落在长尾上的对「要不要去改客户端配置」
+/// 这个判断没有贡献——而每个号的 `routed` 总数是另一条查询算的，不受这个上限影响。
+const MODEL_ROUTING_PAIRS_MAX: i64 = 100;
 
 /// 算出该账号实际生效的 RPM 上限。
 ///
@@ -757,15 +758,21 @@ pub struct ModelRoutingPair {
     pub cost_usd: f64,
 }
 
-/// 「有多少请求被改了路由」的一次合计。见 [`CredentialStore::model_routing`]。
+/// **一个账号**这段时间里被改路由的情况。见 [`CredentialStore::model_routing`]。
+///
+/// 按号分而不是给一个池级总数：改路由是上游**对着某个账号**做的决定（这个号的档位、这个号
+/// 此刻的排队情况），池级那个平均数把「其中一个号被整体降级了」摊薄成一个谁也看不出的小
+/// 百分比，而那恰恰是唯一需要动手的情形。
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ModelRouting {
-    /// 分母：这段时间里**看得出上游给了哪个模型**的请求数。
+pub struct ModelRoutingAccount {
+    pub cred_id: i64,
+    /// 分母：这段时间里经这个号、**看得出上游给了哪个模型**的请求数。
     ///
-    /// 错误响应那类不算（上游压根没生成，谈不上路由），所以它比总条数小。用它当分母而不是
-    /// 总条数：一批 429 会把「被改路由的比例」凭空稀释一半，而那批请求根本没有路由可言。
+    /// 错误响应那类不算（上游压根没生成，谈不上路由），所以它比这个号的总条数小。用它当
+    /// 分母而不是总条数：一批 429 会把「被改路由的比例」凭空稀释一半，而那批请求根本没有
+    /// 路由可言。
     pub observed: i64,
-    /// 其中要的与给的不是同一个模型的那些。
+    /// 其中要的与给的不是同一个模型的那些。**必然大于 0**——一条都没有的号压根不回。
     pub routed: i64,
     /// 按条数从多到少排好的那几对。
     pub pairs: Vec<ModelRoutingPair>,
@@ -2578,32 +2585,58 @@ impl CredentialStore {
     ///
     /// 探测（[`crate::proxy`] 的 `log_probe_usage`）照算：它也是一次真实的上游判决，
     /// 「测 A 却回了 B」与转发路径上那件事是同一件，没有理由分开看。
-    pub fn model_routing(&self, since: i64) -> Result<ModelRouting> {
+    pub fn model_routing(&self, since: i64) -> Result<Vec<ModelRoutingAccount>> {
         let conn = self.conn.lock();
-        let (observed, routed) = conn.query_row(
-            "SELECT COUNT(*), COUNT(req_model)
-               FROM usage_logs WHERE ts >= ?1 AND model IS NOT NULL",
-            params![since],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        // 两条分组查询、不按号各发一条：号池大起来之后那就是每轮刷新几十条 SQL
+        // （同 [`Self::stats_all`] 那条规矩）。
         let mut stmt = conn.prepare(
-            "SELECT req_model, model, COUNT(*), COALESCE(SUM(cost_usd), 0)
+            "SELECT cred_id, COUNT(*), COUNT(req_model)
+               FROM usage_logs
+              WHERE ts >= ?1 AND model IS NOT NULL AND cred_id IS NOT NULL
+              GROUP BY cred_id
+             HAVING COUNT(req_model) > 0
+              ORDER BY COUNT(req_model) DESC",
+        )?;
+        let mut accounts = stmt
+            .query_map(params![since], |r| {
+                Ok(ModelRoutingAccount {
+                    cred_id: r.get(0)?,
+                    observed: r.get(1)?,
+                    routed: r.get(2)?,
+                    pairs: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT cred_id, req_model, model, COUNT(*), COALESCE(SUM(cost_usd), 0)
                FROM usage_logs
               WHERE ts >= ?1 AND model IS NOT NULL AND req_model IS NOT NULL
-              GROUP BY req_model, model
+                    AND cred_id IS NOT NULL
+              GROUP BY cred_id, req_model, model
               ORDER BY COUNT(*) DESC
               LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![since, MODEL_ROUTING_PAIRS_MAX], |r| {
-            Ok(ModelRoutingPair {
-                req_model: r.get(0)?,
-                model: r.get(1)?,
-                requests: r.get(2)?,
-                cost_usd: r.get(3)?,
-            })
-        })?;
-        let pairs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(ModelRouting { observed, routed, pairs })
+        let rows = stmt
+            .query_map(params![since, MODEL_ROUTING_PAIRS_MAX], |r| {
+                let cred_id: i64 = r.get(0)?;
+                Ok((
+                    cred_id,
+                    ModelRoutingPair {
+                        req_model: r.get(1)?,
+                        model: r.get(2)?,
+                        requests: r.get(3)?,
+                        cost_usd: r.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (cred_id, pair) in rows {
+            if let Some(a) = accounts.iter_mut().find(|a| a.cred_id == cred_id) {
+                a.pairs.push(pair);
+            }
+        }
+        Ok(accounts)
     }
 
     /// 裁掉过期的用量流水，返回删了几行。终身口径在账本里，不受影响。
@@ -3106,7 +3139,19 @@ mod tests {
         // 错误响应：上游没生成，谈不上路由。分子分母都不该动。
         log(None, Some("gpt-5"), 0.0);
 
-        let r = s.model_routing(0).unwrap();
+        // 另一个号一条都没被改：**它整个不该出现在结果里**，界面据此决定挂不挂徽章。
+        let b = add(&s, "b");
+        s.insert_usage_log(&UsageRecord {
+            cred_id: Some(b.id),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let all = s.model_routing(0).unwrap();
+        assert_eq!(all.len(), 1, "没被改过路由的号不进结果");
+        let r = &all[0];
+        assert_eq!(r.cred_id, a.id);
         assert_eq!(r.observed, 6, "错误响应那条不进分母");
         assert_eq!(r.routed, 3);
         // 按条数排：两条那一对在前。
@@ -3120,7 +3165,7 @@ mod tests {
 
         // 窗口之外的一概不算。
         let later = now_secs() as i64 + 3600;
-        assert_eq!(s.model_routing(later).unwrap().observed, 0);
+        assert!(s.model_routing(later).unwrap().is_empty());
     }
 
     /// 老库补 `req_model`：**不回填**——这一列出现之前，客户端要的是哪个模型压根没入库。
@@ -3148,7 +3193,7 @@ mod tests {
         let page = s.list_usage_page(Some(a.id), 10, 0, None).unwrap();
         assert_eq!(page.logs.len(), 1);
         assert!(page.logs[0].req_model.is_none(), "旧行留空，不编一个请求模型出来");
-        assert_eq!(s.model_routing(0).unwrap().routed, 0, "旧行不该被算成被改过路由");
+        assert!(s.model_routing(0).unwrap().is_empty(), "旧行不该被算成被改过路由");
 
         // 迁移之后照常记。
         s.insert_usage_log(&UsageRecord {

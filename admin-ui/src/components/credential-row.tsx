@@ -29,6 +29,7 @@ import {
   type SortKey,
 } from '@/components/credential-shared'
 import { Badge } from '@/components/ui/badge'
+import { ModelRoutingBadge } from '@/components/model-routing-badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Switch } from '@/components/ui/switch'
@@ -441,14 +442,20 @@ export const CredentialRow = memo(function CredentialRow({
           </Tooltip>
         </TableCell>
         <TableCell className={COL.status}>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Badge variant={status.variant} tabIndex={0} className="cursor-help">{status.label}</Badge>
-              }
-            />
-            <TooltipPopup className="max-w-72">{status.detail}</TooltipPopup>
-          </Tooltip>
+          {/* 两个视图对同一个号说同一套话（同这一列的副标识），所以改路由那枚徽章表格这边也
+              挂——挂在状态旁边而不是另起一列：它只在极少数号上出现，为它常占 w-24 不值当。
+              这一格宽 w-32，两枚并排放不下时换行，只有出现了徽章的那一行会高一点。 */}
+          <div className="flex flex-wrap items-center gap-1">
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Badge variant={status.variant} tabIndex={0} className="cursor-help">{status.label}</Badge>
+                }
+              />
+              <TooltipPopup className="max-w-72">{status.detail}</TooltipPopup>
+            </Tooltip>
+            <ModelRoutingBadge credId={cred.id} size="default" />
+          </div>
         </TableCell>
         <TableCell className={COL.priority}>
           <Badge variant="outline">P{cred.priority}</Badge>

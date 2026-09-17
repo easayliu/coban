@@ -48,7 +48,6 @@ import {
 } from '@/components/credential-shared'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { LiveTrafficMetric, OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
-import { ModelRoutingNote } from '@/components/model-routing-note'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardHeader, CardTitle } from '@/components/ui/card'
@@ -1084,9 +1083,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             />
           </section>
         )}
-        {/* 摆在指标那一排下面：它讲的也是流量的属性（上游给的是不是要的那个模型），但绝大
-            多数时候只有一行字，占一整格指标不值当。没有账号时不显示——那时连流水都没有。 */}
-        {count > 0 && <ModelRoutingNote />}
       </Card>
 
       <section className="min-w-0" aria-labelledby="account-list-title">

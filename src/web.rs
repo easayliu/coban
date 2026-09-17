@@ -1111,11 +1111,12 @@ async fn get_cache_reasons(
 struct ModelRoutingResp {
     /// 同 [`CacheSeriesResp::since`]：夹过之后的真实起点。
     since: i64,
-    #[serde(flatten)]
-    routing: store::ModelRouting,
+    /// **只有真被改过路由的号**在列表里，一条都没有的号不回（见
+    /// [`store::CredentialStore::model_routing`]）。界面据此只在那几个号上挂一枚徽章。
+    accounts: Vec<store::ModelRoutingAccount>,
 }
 
-/// 「上游有多少请求没给要的那个模型」。分子分母的口径见
+/// 各账号「上游有多少请求没给要的那个模型」。分子分母的口径见
 /// [`store::CredentialStore::model_routing`]——那件事只在**上游真的服务了一个模型**的请求
 /// 上谈得起，所以分母不是总条数。
 async fn get_model_routing(
@@ -1125,8 +1126,8 @@ async fn get_model_routing(
     let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
     let hours = q.hours.clamp(1, max_hours);
     let since = crate::credentials::now_secs() as i64 - hours * 3600;
-    let routing = state.store.model_routing(since).map_err(internal)?;
-    Ok(Json(ModelRoutingResp { since, routing }))
+    let accounts = state.store.model_routing(since).map_err(internal)?;
+    Ok(Json(ModelRoutingResp { since, accounts }))
 }
 
 // ---------- 设置 ----------

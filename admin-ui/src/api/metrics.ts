@@ -104,27 +104,34 @@ export interface ModelRoutingPair {
   cost_usd: number
 }
 
-export interface ModelRouting {
-  /** 真实起点（Unix 秒），同 `CacheSeries.since`。 */
-  since: number
+/** 一个账号这段时间里被改路由的情况。 */
+export interface ModelRoutingAccount {
+  cred_id: number
   /**
-   * 分母：这段时间里**看得出上游给了哪个模型**的请求数。
+   * 分母：经这个号、**看得出上游给了哪个模型**的请求数。
    *
-   * 错误响应那类不算（上游没生成，谈不上路由），所以它比总条数小。口径由后端定，前端不要
-   * 拿别的数当分母——一批 429 会把这个比例凭空稀释一半，而那批请求根本没有路由可言。
+   * 错误响应那类不算（上游没生成，谈不上路由），所以它比这个号的总条数小。口径由后端定，
+   * 前端不要拿别的数当分母——一批 429 会把这个比例凭空稀释一半，而那批请求根本没有路由可言。
    */
   observed: number
-  /** 其中要的与给的不是同一个模型的那些。 */
+  /** 其中要的与给的不是同一个模型的那些。**必然大于 0**。 */
   routed: number
-  /** 已按条数从多到少排好（最多 20 对）。前端不要重排。 */
+  /** 已按条数从多到少排好。前端不要重排。 */
   pairs: ModelRoutingPair[]
 }
 
+export interface ModelRouting {
+  /** 真实起点（Unix 秒），同 `CacheSeries.since`。 */
+  since: number
+  /** **只有真被改过路由的号在里面**：一条都没有的号压根不回。 */
+  accounts: ModelRoutingAccount[]
+}
+
 /**
- * 拉一段「上游有多少请求没给要的那个模型」。
+ * 拉一段各账号「上游有多少请求没给要的那个模型」。
  *
- * 明细里一行一条说得出「这一条被改了」，说不出「这件事在多大比例上发生」——而后者才决定
- * 要不要去动客户端那头的模型配置。
+ * 明细里一行一条说得出「这一条被改了」，说不出「这件事在这个号上有多常发生」——而后者才
+ * 决定要不要去动那个号上的模型配置。按号分是因为改路由是上游**对着某个账号**做的决定。
  */
 export async function getModelRouting(hours: number): Promise<ModelRouting> {
   const { data } = await api.get('/metrics/model-routing', { params: { hours } })

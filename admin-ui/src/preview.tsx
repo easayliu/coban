@@ -433,11 +433,18 @@ for (const hours of [24, 7 * 24, 30 * 24]) {
 // 一个是一行字、一个什么都不显示，看不出什么。
 queryClient.setQueryData(['model-routing', 7 * 24], {
   since: now - 7 * 24 * 3600,
-  observed: 12_880,
-  routed: 431,
-  pairs: [
-    { req_model: 'gpt-5.1-codex-max', model: 'gpt-5.1-codex', requests: 388, cost_usd: 24.71 },
-    { req_model: 'gpt-5', model: 'gpt-5-mini', requests: 43, cost_usd: 1.16 },
+  // 只摆一个号：没被改过路由的号后端压根不回，卡片上也就不该有那枚徽章——预览里两种都有
+  // 才看得出区别。
+  accounts: [
+    {
+      cred_id: nearLimit.id,
+      observed: 12_880,
+      routed: 431,
+      pairs: [
+        { req_model: 'gpt-5.1-codex-max', model: 'gpt-5.1-codex', requests: 388, cost_usd: 24.71 },
+        { req_model: 'gpt-5', model: 'gpt-5-mini', requests: 43, cost_usd: 1.16 },
+      ],
+    },
   ],
 })
 

@@ -40,6 +40,7 @@ import {
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
+import { ModelRoutingBadge } from '@/components/model-routing-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
@@ -415,6 +416,9 @@ export const CredentialCard = memo(function CredentialCard({
                 </TooltipPopup>
               </Tooltip>
             )}
+            {/* 排在重置券/credits 之后、套餐之前：它和那两枚一样是**会自己消失**的东西
+                （只看近 7 天），而套餐与优先级是属性。没被改过路由的号上它整个不出现。 */}
+            <ModelRoutingBadge credId={cred.id} />
             <Tooltip>
               <TooltipTrigger
                 className={cn(
