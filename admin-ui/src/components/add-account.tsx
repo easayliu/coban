@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, FileJsonIcon, UploadIcon } from 'lucide-react'
+import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, FileJsonIcon, LinkIcon, UploadIcon } from 'lucide-react'
 import { exchangeCode, getAuthorizeUrl, importAuthJson, type ImportReport } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
@@ -15,11 +15,6 @@ import { Form } from '@/components/ui/form'
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { toastManager } from '@/components/ui/toast'
-
-interface AuthorizeRequest {
-  session: number
-  popup: Window | null
-}
 
 /** 读进来的文件的显示信息。`accounts` 为 null 表示这份内容解析不出来。 */
 interface LoadedFile {
@@ -64,7 +59,9 @@ function countAccounts(text: string): number | null {
 /**
  * 添加账号弹窗。两条路：
  *
- * - **浏览器授权**：打开 OpenAI 授权页，完成后浏览器会跳到 `localhost:1455/auth/callback`
+ * - **浏览器授权**：先生成一条授权链接，**打不打开、在哪儿打开都由用户点**——同一台机器
+ *   上点「打开授权页」进新标签，手上这台没法登录 ChatGPT 就把链接复制到手机或另一台机器。
+ *   授权完成后浏览器会跳到 `localhost:1455/auth/callback`
  *   ——那个地址是 codex CLI 本机监听的，coban 这边**连不上是正常的**，页面报错也没关系，
  *   地址栏里那条 URL 就是全部所需。这一点必须在界面上说清楚，否则用户看到「无法访问此
  *   网站」会以为授权失败了，然后从头再来一遍。
@@ -201,25 +198,14 @@ export function AddAccount({
   })
 
   const authorize = useMutation({
-    mutationFn: (_request: AuthorizeRequest) => getAuthorizeUrl(),
-    onSuccess: ({ url, state }, request) => {
-      if (request.session !== authorizeSession.current) {
-        request.popup?.close()
-        return
-      }
+    mutationFn: (_session: number) => getAuthorizeUrl(),
+    onSuccess: ({ url, state }, session) => {
+      if (session !== authorizeSession.current) return
       setAuthUrl(url)
       setAuthState(state)
-      if (request.popup && !request.popup.closed) {
-        try {
-          request.popup.location.replace(url)
-        } catch {
-          // 跨窗口导航失败时，弹窗内仍会显示可手动点击的授权链接。
-        }
-      }
     },
-    onError: (error, request) => {
-      request.popup?.close()
-      if (request.session !== authorizeSession.current) return
+    onError: (error, session) => {
+      if (session !== authorizeSession.current) return
       failed(t('生成授权链接失败', 'Failed to create authorization link'))(error)
     },
   })
@@ -274,62 +260,65 @@ export function AddAccount({
 
             <TabsPanel value="oauth" className="space-y-5">
               <Field>
-                <FieldLabel>{t('1. 打开授权页面', '1. Open the authorization page')}</FieldLabel>
+                <FieldLabel>{t('1. 生成授权链接', '1. Create the authorization link')}</FieldLabel>
                 <FieldDescription>
                   {t(
-                    '用要接入的 ChatGPT 订阅账号完成授权。',
-                    'Authorize with the ChatGPT subscription account you want to connect.',
+                    '链接生成后再由你决定怎么打开：在新标签页打开，或复制到其它浏览器/设备上，用要接入的 ChatGPT 订阅账号完成授权。',
+                    'Once the link exists, you choose how to open it: in a new tab, or copied to another browser or device. Authorize with the ChatGPT subscription account you want to connect.',
                   )}
                 </FieldDescription>
                 <Button
                   type="button"
                   variant="outline"
                   loading={authorize.isPending}
-                  onClick={() => {
-                    const popup = window.open('about:blank', '_blank')
-                    if (popup) popup.opener = null
-                    authorize.mutate({ session: authorizeSession.current, popup })
-                  }}
+                  onClick={() => authorize.mutate(authorizeSession.current)}
                 >
-                  <ExternalLinkIcon />
-                  {t('打开 OpenAI 授权页', 'Open the OpenAI authorization page')}
+                  <LinkIcon />
+                  {authUrl
+                    ? t('重新生成链接', 'Create a new link')
+                    : t('生成授权链接', 'Create authorization link')}
                 </Button>
               </Field>
 
               {authUrl && (
                 <Alert variant="info">
-                  <ExternalLinkIcon aria-hidden />
-                  <AlertTitle>{t('授权页已在新标签打开', 'Authorization page opened in a new tab')}</AlertTitle>
+                  <LinkIcon aria-hidden />
+                  <AlertTitle>{t('授权链接已生成', 'Authorization link ready')}</AlertTitle>
                   <AlertDescription>
                     <p>
-                      {t('如果浏览器拦截了新标签页，可', 'If your browser blocked the new tab, you can')}{' '}
-                      <a href={authUrl} target="_blank" rel="noopener">
-                        {t('手动打开授权页面', 'open the authorization page manually')}
-                      </a>
                       {t(
-                        '，或把链接复制到其它浏览器/设备上完成授权。',
-                        ', or copy the link to another browser or device to finish authorization.',
+                        '在新标签页打开，或把链接复制到其它浏览器/设备上完成授权。',
+                        'Open it in a new tab, or copy it to another browser or device to finish authorizing.',
                       )}
                     </p>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="mt-2"
-                      onClick={async () => {
-                        const copied = await copyText(authUrl)
-                        toastManager.add(copied
-                          ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
-                          : {
-                              title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
-                              description: authUrl,
-                              type: 'error',
-                            })
-                      }}
-                    >
-                      <CopyIcon />
-                      {t('复制授权链接', 'Copy authorization link')}
-                    </Button>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        render={<a href={authUrl} target="_blank" rel="noopener" />}
+                      >
+                        <ExternalLinkIcon />
+                        {t('在新标签页打开', 'Open in a new tab')}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={async () => {
+                          const copied = await copyText(authUrl)
+                          toastManager.add(copied
+                            ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
+                            : {
+                                title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
+                                description: authUrl,
+                                type: 'error',
+                              })
+                        }}
+                      >
+                        <CopyIcon />
+                        {t('复制授权链接', 'Copy authorization link')}
+                      </Button>
+                    </div>
                   </AlertDescription>
                 </Alert>
               )}
