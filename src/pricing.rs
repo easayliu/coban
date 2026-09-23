@@ -71,7 +71,7 @@ const fn tiered(
 
 /// 价目表。键按**前缀**匹配，长者优先（见 [`price_of`]）。
 ///
-/// 取 OpenAI 公布的 API 价格（`developers.openai.com/api/docs/pricing`，2026-08-24 核对，gpt-6-astra 于 2026-09-05 补入）。
+/// 取 OpenAI 公布的 API 价格（`developers.openai.com/api/docs/pricing`，2026-08-24 核对，gpt-6-astra 于 2026-09-05、gpt-6-sol/luna 于 2026-09-23 补入）。
 /// 新模型没进表时按 `None` 处理——宁可缺一条估算，也不要拿一个猜的价格去乘出一个看着精确
 /// 的错数。
 ///
@@ -80,10 +80,13 @@ const fn tiered(
 /// 的判据就是本轮输入 token 数，那个数我们手上有，所以按 [`LONG_CONTEXT_THRESHOLD`] 建模了。
 const PRICES: &[(&str, Price)] = &[
     // ---- gpt-6 ----
-    // 只有 `gpt-6-astra` 一个名字，没有裸的 `gpt-6`。长档规则与 5.5/5.6 相同（272K 起整轮换档，
-    // 输入与缓存 2x、输出 1.5x）。官方还多列了一项 **cache write**（$12.5），这里不建模：`Price`
-    // 没有这个字段，上游 usage 也还没见到单独回报写缓存的 token 数。
+    // astra/sol/luna 三档，**没有裸的 `gpt-6`**（理由同下面 5.6 那条）。长档规则与 5.5/5.6 相同
+    // （272K 起整轮换档，输入与缓存 2x、输出 1.5x）。官方还多列了一项 **cache write**（astra
+    // $12.5、sol $2.5、luna $0.125），这里不建模：`Price` 没有这个字段，上游 usage 也还没见到
+    // 单独回报写缓存的 token 数。
     ("gpt-6-astra", tiered(10.0, 1.0, 50.0, 20.0, 2.0, 75.0)),
+    ("gpt-6-sol", tiered(2.0, 0.2, 10.0, 4.0, 0.4, 15.0)),
+    ("gpt-6-luna", tiered(0.1, 0.01, 0.5, 0.2, 0.02, 0.75)),
     // ---- gpt-5.6 三档 ----
     // **没有裸的 `gpt-5.6`**：官方价目表里不存在这个模型名（实测上游也拒这个名字），
     // 写一条进来只会让 sol/terra/luna 之外的 `gpt-5.6-*` 撞上一个凭空的价格。
@@ -310,6 +313,8 @@ mod tests {
     fn official_rates_are_pinned() {
         for (model, input, cached, output) in [
             ("gpt-6-astra", 10.0, 1.0, 50.0),
+            ("gpt-6-sol", 2.0, 0.2, 10.0),
+            ("gpt-6-luna", 0.1, 0.01, 0.5),
             // sol 2026-08-22 降价到 $4/$20（促销，官方称至少到 2026-11-21）。
             ("gpt-5.6-sol", 4.0, 0.4, 20.0),
             ("gpt-5.6-terra", 2.0, 0.2, 12.0),
@@ -337,6 +342,8 @@ mod tests {
     fn official_long_context_rates_are_pinned() {
         for (model, input, cached, output) in [
             ("gpt-6-astra", 20.0, 2.0, 75.0),
+            ("gpt-6-sol", 4.0, 0.4, 15.0),
+            ("gpt-6-luna", 0.2, 0.02, 0.75),
             ("gpt-5.6-sol", 8.0, 0.8, 30.0),
             ("gpt-5.6-terra", 4.0, 0.4, 18.0),
             ("gpt-5.6-luna", 0.4, 0.04, 1.8),
@@ -457,7 +464,9 @@ mod tests {
             "gpt-5.7",       // 下一个小版本
             "gpt-5.8-sol",   // 下一个小版本的变体
             "gpt-5.9-codex", //
-            "gpt-6",         // 下一个大版本
+            "gpt-6",         // 官方无此模型名，不能落到 astra/sol/luna 任一档上
+            "gpt-6-vega",    // 未知的 6 变体
+            "gpt-6.1",       // 下一个小版本
             "gpt-51",        // 数字直接续上，不是 gpt-5 的派生
             "gpt-4.2",       // 4.1 的下一版
             "o5",            // o 系列下一代
