@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import {
   ArrowLeftIcon,
   CableIcon,
+  GlobeIcon,
   LockKeyholeIcon,
   SlidersHorizontalIcon,
 } from 'lucide-react'
@@ -10,6 +11,7 @@ import {
   LimitsSettingsContent,
   SecuritySettingsContent,
 } from '@/components/access-settings'
+import { ProxyPoolSettingsContent } from '@/components/proxy-pool-settings'
 import { AppFooter } from '@/components/app-footer'
 import { LanguageSwitcher } from '@/components/language-switcher'
 import { ThemeSwitcher } from '@/components/theme-switcher'
@@ -26,7 +28,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
 import { useI18n } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 
-export type SettingsSection = 'access' | 'limits' | 'security'
+export type SettingsSection = 'access' | 'limits' | 'proxies' | 'security'
 
 export function SettingsPage({
   section,
@@ -58,6 +60,16 @@ export function SettingsPage({
       ),
       navDescription: t('重试、RPM 与额度阈值', 'Retries, RPM, and quota thresholds'),
       icon: SlidersHorizontalIcon,
+    },
+    {
+      key: 'proxies',
+      label: t('代理池', 'Proxy pool'),
+      description: t(
+        '集中管理出站代理：批量导入、测试连通性与出口位置、分配给账号、导出。',
+        'Manage outbound proxies: import in bulk, test reachability and exit location, assign to accounts, export.',
+      ),
+      navDescription: t('导入、测试、分配与导出', 'Import, test, assign, export'),
+      icon: GlobeIcon,
     },
     {
       key: 'security',
@@ -139,8 +151,8 @@ export function SettingsPage({
             </h1>
             <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
               {t(
-                '集中管理 Coban 的客户端接入、账号调度与控制台安全。',
-                'Manage Coban client access, account scheduling, and console security.',
+                '集中管理 Coban 的客户端接入、账号调度、出站代理与控制台安全。',
+                'Manage Coban client access, account scheduling, outbound proxies, and console security.',
               )}
             </p>
           </section>
@@ -222,6 +234,9 @@ export function SettingsPage({
               </TabsPanel>
               <TabsPanel className="min-w-0" value="limits">
                 {section === 'limits' && <LimitsSettingsContent />}
+              </TabsPanel>
+              <TabsPanel className="min-w-0" value="proxies">
+                {section === 'proxies' && <ProxyPoolSettingsContent />}
               </TabsPanel>
               <TabsPanel className="min-w-0" value="security">
                 {section === 'security' && <SecuritySettingsContent />}

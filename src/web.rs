@@ -123,6 +123,12 @@ pub async fn run(
         .route("/credentials/rpm-limit", post(set_rpm_limits))
         .route("/credentials/disabled", post(set_disabled_many))
         .route("/credentials/delete", post(delete_credentials))
+        .route("/credentials/proxy", post(set_proxies))
+        .route("/proxies", get(list_proxies).post(add_proxy))
+        .route("/proxies/import", post(import_proxies))
+        .route("/proxies/test", post(test_proxy))
+        .route("/proxies/delete", post(delete_proxies))
+        .route("/proxies/{id}", post(update_proxy))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_disabled))
         .route("/credentials/{id}/priority", post(set_priority))
@@ -804,6 +810,131 @@ async fn set_proxy(
         .set_proxy(id, Some(req.value.as_str()).filter(|s| !s.trim().is_empty()))
         .map_err(|e| bad_request(format!("{e:#}")))?;
     reload(&state, id)
+}
+
+/// 测一条代理 URL：经它连一次上游，回报通不通、出口 IP 与地区。
+///
+/// **收的是 URL 而不是池里的 id**：要测的常常是输入框里还没保存的值——先测通再保存，
+/// 而不是存进去一条坏代理、让号的真实流量先撞一次墙。
+async fn test_proxy(Json(req): Json<TextReq>) -> Result<Json<crate::clients::ProxyTestReport>, ApiError> {
+    crate::clients::test_proxy(&req.value).await.map(Json).map_err(|e| bad_request(format!("{e:#}")))
+}
+
+/// 代理池一条的视图：附上哪些账号在用它。
+#[derive(Serialize)]
+struct ProxyView {
+    #[serde(flatten)]
+    proxy: store::SavedProxy,
+    credential_labels: Vec<String>,
+}
+
+fn proxy_views(state: &AppState, list: Vec<store::SavedProxy>) -> Result<Vec<ProxyView>, ApiError> {
+    let mut usage = state.store.proxy_usage().map_err(internal)?;
+    Ok(list
+        .into_iter()
+        .map(|p| ProxyView { credential_labels: usage.remove(&p.url).unwrap_or_default(), proxy: p })
+        .collect())
+}
+
+/// 代理池全部条目。URL **不打码**：导出与「使用账号」都要原值，这组接口本来就在管理密码后面。
+async fn list_proxies(State(state): State<AppState>) -> Result<Json<Vec<ProxyView>>, ApiError> {
+    let list = state.store.list_proxies().map_err(internal)?;
+    proxy_views(&state, list).map(Json)
+}
+
+#[derive(Deserialize)]
+struct ProxyReq {
+    #[serde(default)]
+    label: String,
+    url: String,
+}
+
+async fn add_proxy(
+    State(state): State<AppState>,
+    Json(req): Json<ProxyReq>,
+) -> Result<Json<ProxyView>, ApiError> {
+    let p = state.store.add_proxy(&req.label, &req.url).map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(proxy_views(&state, vec![p])?.remove(0)))
+}
+
+async fn update_proxy(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<ProxyReq>,
+) -> Result<Json<ProxyView>, ApiError> {
+    let p = state
+        .store
+        .update_proxy(id, &req.label, &req.url)
+        .map_err(|e| bad_request(format!("{e:#}")))?
+        .ok_or_else(not_found)?;
+    Ok(Json(proxy_views(&state, vec![p])?.remove(0)))
+}
+
+#[derive(Deserialize)]
+struct ImportProxiesReq {
+    /// 多行文本，一行一条，格式见 [`crate::clients::parse_proxy_line`]。
+    text: String,
+    /// 行里没写协议时补哪个。
+    #[serde(default = "default_import_scheme")]
+    scheme: String,
+}
+
+fn default_import_scheme() -> String {
+    "http".into()
+}
+
+async fn import_proxies(
+    State(state): State<AppState>,
+    Json(req): Json<ImportProxiesReq>,
+) -> Result<Json<store::ProxyImportReport>, ApiError> {
+    let entries: Vec<_> = req
+        .text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with('#')
+        })
+        .map(|(i, l)| (i + 1, crate::clients::parse_proxy_line(l, &req.scheme)))
+        .collect();
+    if entries.is_empty() {
+        return Err(bad_request("nothing to import: enter at least one proxy"));
+    }
+    state.store.import_proxies(entries).map(Json).map_err(internal)
+}
+
+async fn delete_proxies(
+    State(state): State<AppState>,
+    Json(req): Json<IdsReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(bad_request("select at least one proxy"));
+    }
+    let n = state.store.delete_proxies(&req.ids).map_err(internal)?;
+    Ok(Json(serde_json::json!({ "deleted": n })))
+}
+
+#[derive(Deserialize)]
+struct SetProxiesReq {
+    ids: Vec<i64>,
+    /// 空串 / null = 改回直连。
+    proxy: Option<String>,
+}
+
+/// 批量给账号设代理（代理池「使用账号」与批量操作用）。
+async fn set_proxies(
+    State(state): State<AppState>,
+    Json(req): Json<SetProxiesReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(bad_request("select at least one account"));
+    }
+    state
+        .store
+        .set_proxies(&req.ids, req.proxy.as_deref())
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let list = state.store.list().map_err(internal)?;
+    views_of(&state, &list)
 }
 
 /// 立刻刷新这个凭证的 token。

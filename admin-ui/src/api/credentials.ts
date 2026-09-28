@@ -290,9 +290,15 @@ export async function setRpmLimit(id: number, rpmLimit: number): Promise<Credent
   return data
 }
 
-/** 空串 = 清除代理（直连）。 */
+/** 空串 = 清除代理（直连）。配上的地址后端会顺手收进代理池。 */
 export async function setProxy(id: number, proxy: string | null): Promise<Credential> {
   const { data } = await api.post(`/credentials/${id}/proxy`, { value: proxy ?? '' })
+  return data
+}
+
+/** 批量设置若干账号的代理，`null` = 改回直连。回整份账号列表。 */
+export async function setProxies(ids: number[], proxy: string | null): Promise<Credential[]> {
+  const { data } = await api.post('/credentials/proxy', { ids, proxy })
   return data
 }
 

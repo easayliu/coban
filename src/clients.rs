@@ -130,6 +130,150 @@ fn check_proxy_url(url: &str) -> Result<axum::http::Uri> {
     Ok(uri)
 }
 
+/// 解析批量导入里的一行，返回 (名称, 原始 URL)；URL 的校验与规范化留给入库那一步。
+///
+/// 认这几种写法（第一个空白之后的内容当名称，可省）：
+///
+/// - `socks5h://user:pass@host:port` —— 完整 URL，原样用；
+/// - `user:pass@host:port`、`host:port` —— 补上 `default_scheme`；
+/// - `host:port:user:pass` —— 代理商导出最常见的格式。账号密码在这里做 percent-encode：
+///   这种格式本来就不转义，密码里一个 `#` 或 `@` 原样拼进 URL 就会被切坏（见
+///   [`check_proxy_url`]）。
+///
+/// 空行与 `#` 开头的注释行由调用方跳过。
+pub fn parse_proxy_line(line: &str, default_scheme: &str) -> Result<(String, String)> {
+    let line = line.trim();
+    let (token, label) = match line.split_once(char::is_whitespace) {
+        Some((t, rest)) => (t, rest.trim()),
+        None => (line, ""),
+    };
+    if token.contains("://") {
+        return Ok((label.to_string(), token.to_string()));
+    }
+    let scheme = format!("{}://", default_scheme.trim_end_matches("://"));
+    anyhow::ensure!(
+        PROXY_SCHEMES.contains(&scheme.as_str()),
+        "unsupported default proxy scheme: {default_scheme}"
+    );
+    // 先认 host:port:user:pass，再认 `@`：这种格式的密码不转义，本身就可能带 `@`。
+    // 第二段是端口号才算——`user:pass@host:port` 切出来第二段是 `pass@host`。
+    let parts: Vec<&str> = token.splitn(4, ':').collect();
+    let url = match parts.as_slice() {
+        [host, port, user, pass] if port.parse::<u16>().is_ok() => {
+            format!("{scheme}{}:{}@{host}:{port}", encode_userinfo(user), encode_userinfo(pass))
+        }
+        _ if token.contains('@') => format!("{scheme}{token}"),
+        [host, port] => format!("{scheme}{host}:{port}"),
+        _ => anyhow::bail!(
+            "unrecognized proxy line (expected a URL, host:port, or host:port:user:pass): {token}"
+        ),
+    };
+    Ok((label.to_string(), url))
+}
+
+/// userinfo 的 percent-encode：只放行 RFC 3986 的 unreserved 字符，其余一律转义。
+fn encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 代理测试打的地址：上游域名自己的 Cloudflare trace。
+///
+/// **打 `chatgpt.com` 而不是某个第三方查 IP 服务**：要回答的是「这个代理能不能连到上游」，
+/// 换个目标测通了不说明任何事（不少代理/出口恰恰对 OpenAI 不通）。而这一个端点顺带回报
+/// 出口 IP 与国家码，一条请求就把「通不通」和「从哪儿出去」都答了，也不碰任何账号与额度。
+const PROXY_TEST_URL: &str = "https://chatgpt.com/cdn-cgi/trace";
+
+/// 代理测试的总超时。住宅代理慢，但超过这个数的出口拿来转流式回复也没法用。
+const PROXY_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 一次代理测试的结果。
+#[derive(serde::Serialize)]
+pub struct ProxyTestReport {
+    /// 拿到了上游的 2xx 且读出了出口 IP。
+    pub ok: bool,
+    /// 规范化之后实际测的那条 URL（`socks5://` 已改成 `socks5h://`），与保存时入库的一致。
+    pub proxy: String,
+    /// 上游 HTTP 状态码；`0` = 请求没到上游（连不上代理、代理拒绝、超时）。
+    pub status: u16,
+    pub latency_ms: u128,
+    /// 上游看到的出口 IP。
+    pub ip: Option<String>,
+    /// 出口所在国家/地区码（Cloudflare 的 `loc`，如 `US`）。
+    pub loc: Option<String>,
+    /// 接入的 Cloudflare 机房（`colo`，如 `LAX`）。
+    pub colo: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 用一条**尚未保存**的代理 URL 连一次上游，看它通不通、出口在哪。
+///
+/// 校验不过时返回 Err（调用方该回 400）；连接层面的失败算测试结果，放进 `error`。
+/// **现建一个客户端、不进 [`ClientPool`]**：测的可能是一条最后不保存的 URL，塞进池子只会
+/// 留下一个没人用的连接池。
+pub async fn test_proxy(raw: &str) -> Result<ProxyTestReport> {
+    let proxy = validate_proxy(raw)?;
+    let client = upstream_client(Some(&proxy))?;
+    let started = std::time::Instant::now();
+    let mut report = ProxyTestReport {
+        ok: false,
+        proxy,
+        status: 0,
+        latency_ms: 0,
+        ip: None,
+        loc: None,
+        colo: None,
+        error: None,
+    };
+    let result = async {
+        let resp = client.get(PROXY_TEST_URL).timeout(PROXY_TEST_TIMEOUT).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    }
+    .await;
+    report.latency_ms = started.elapsed().as_millis();
+    match result {
+        Ok((status, body)) => {
+            report.status = status.as_u16();
+            let field = |key: &str| {
+                body.lines()
+                    .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+                    .map(|v| v.trim().to_owned())
+                    .filter(|v| !v.is_empty())
+            };
+            report.ip = field("ip");
+            report.loc = field("loc");
+            report.colo = field("colo");
+            report.ok = status.is_success() && report.ip.is_some();
+            if !report.ok {
+                let snippet: String = body.chars().take(300).collect();
+                report.error = Some(format!("upstream answered {status}: {snippet}"));
+            }
+        }
+        // `{:#}` 不适用于 reqwest::Error；把 source 链拼出来，否则只剩一句「error sending request」，
+        // 看不出是代理拒绝认证、连不上还是超时。
+        Err(e) => {
+            let mut msg = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                msg.push_str(": ");
+                msg.push_str(&s.to_string());
+                src = s.source();
+            }
+            report.error = Some(msg);
+        }
+    }
+    Ok(report)
+}
+
 /// 出站客户端池：不配代理的号共用直连那一份，配了代理的按代理 URL 各缓存一份。
 ///
 /// 缓存的理由不是省内存而是**连接复用**：每次现建一个客户端等于每条请求都重新握手，
@@ -213,6 +357,18 @@ mod tests {
             "官方客户端一个 accept-encoding 都不发，这条请求里却有:\n{req}"
         );
         assert!(req.contains(config::UA_PREFIX), "UA 该是那份画像:\n{req}");
+    }
+
+    #[test]
+    fn parses_import_lines() {
+        let p = |l| parse_proxy_line(l, "socks5h").unwrap();
+        assert_eq!(p("http://h:8080 日本 1"), ("日本 1".into(), "http://h:8080".into()));
+        assert_eq!(p("h.example:1080"), ("".into(), "socks5h://h.example:1080".into()));
+        assert_eq!(p("u:p@h:1080"), ("".into(), "socks5h://u:p@h:1080".into()));
+        assert_eq!(p("h:1080:us/er:pa#ss"), ("".into(), "socks5h://us%2Fer:pa%23ss@h:1080".into()));
+        assert!(validate_proxy(&p("h:1080:u:pa#s@").1).is_ok());
+        assert!(parse_proxy_line("h:1:2", "socks5h").is_err());
+        assert!(parse_proxy_line("h:1", "ftp").is_err());
     }
 
     /// 这些全是「`Proxy::all` 会成功、代理却不生效」的形态，必须在入库时就拒掉。

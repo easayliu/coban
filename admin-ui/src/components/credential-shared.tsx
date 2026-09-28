@@ -1595,6 +1595,21 @@ export function proxyTitle(proxy: string, language: Language): string {
 }
 
 /**
+ * 代理 URL 打码显示：有认证信息时给 `protocol://***@host:port`，没有则只去掉末尾斜杠。
+ * 代理池页与下拉用——地址常带 user:pass，原样铺开等于把密码摊给截图和录屏。
+ */
+export function proxyMaskedUrl(proxy: string): string {
+  try {
+    const u = new URL(proxy)
+    const port = u.port ? `:${u.port}` : ''
+    const auth = u.username || u.password ? '***@' : ''
+    return `${u.protocol}//${auth}${u.hostname}${port}`
+  } catch {
+    return proxy.replace(/\/\/[^@/]*@/, '//***@')
+  }
+}
+
+/**
  * 这次勾选是不是「按着 shift 的范围选」。
  *
  * base-ui 把原生事件放在 `onCheckedChange` 第二个参数的 `event` 上，类型是个联合（鼠标、

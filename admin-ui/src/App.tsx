@@ -56,6 +56,7 @@ function readViewParams(): URLSearchParams {
 function readSettingsRoute(): SettingsSection | null {
   if (!window.location.hash.startsWith('#/settings')) return null
   if (window.location.hash.includes('/limits')) return 'limits'
+  if (window.location.hash.includes('/proxies')) return 'proxies'
   if (window.location.hash.includes('/security')) return 'security'
   // 兼容旧的 #/settings 与 #/settings/access 深链接。
   return 'access'

@@ -19,6 +19,35 @@ const COLS: &str = "id, label, email, plan_type, account_id, id_token, access_to
                     refresh_token, expires_at, priority, disabled, rpm_limit, ban_reason, \
                     resume_at, proxy, created_at, updated_at";
 
+/// 代理池里的一条。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SavedProxy {
+    pub id: i64,
+    pub label: String,
+    /// 规范化之后的 URL（已过 [`crate::clients::validate_proxy`]），含 user:pass。
+    pub url: String,
+    pub created_at: u64,
+}
+
+/// 一次批量导入的结果。
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ProxyImportReport {
+    pub added: usize,
+    /// 池里已有同一条 URL，跳过。
+    pub duplicated: usize,
+    /// 解析或校验不过的行：(行号, 原因)。行号从 1 起，对着输入框数。
+    pub invalid: Vec<(usize, String)>,
+}
+
+fn row_to_proxy(row: &Row) -> rusqlite::Result<SavedProxy> {
+    Ok(SavedProxy {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        url: row.get(2)?,
+        created_at: row.get::<_, i64>(3)? as u64,
+    })
+}
+
 /// `credential_stats` 表的列清单。理由同 [`COLS`]，读它的两条查询（单个号与全池）共用。
 const STATS_COLS: &str = "cred_id, last_used_at, cost_total_usd, request_total, snapshot_ts, \
                           quota_raw, input_tokens_total, cached_tokens_total, \
@@ -986,7 +1015,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
             -- 额度重置券的最新读数（JSON，见 ResetCredits）。与 quota_raw 分开存：
             -- 那份随每条转发更新，这份只有人点查询/重置时才动，新鲜度不是一回事。
             reset_credits_raw TEXT
-        ) STRICT;",
+        ) STRICT;
+
+        -- 代理池：可复用的出站代理地址，账号从这里挑。账号那头存的是 URL 本身
+        -- （credentials.proxy），两边按 URL 对上——池子只是目录，删掉一条不影响在用的号。
+        CREATE TABLE IF NOT EXISTS proxies (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            label      TEXT    NOT NULL DEFAULT '',
+            url        TEXT    NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_proxies_url ON proxies(url);",
     )
     .context("failed to initialize credential database schema")?;
     migrate_token_totals(conn)?;
@@ -994,7 +1033,63 @@ fn init_schema(conn: &Connection) -> Result<()> {
     migrate_reset_credits(conn)?;
     migrate_upstream_ua(conn)?;
     migrate_req_model(conn)?;
+    seed_proxy_pool(conn)?;
     Ok(())
+}
+
+/// 把账号上已配的代理收进代理池。
+///
+/// 代理池上线之前代理只存在账号行里；不收进来的话，池子一打开是空的，而那几条正在用的
+/// 代理既没法在池里测、也没法分给别的号。`INSERT OR IGNORE` 让它每次启动都能跑。
+fn seed_proxy_pool(conn: &Connection) -> Result<()> {
+    let urls: Vec<String> = conn
+        .prepare("SELECT DISTINCT proxy FROM credentials WHERE proxy IS NOT NULL AND proxy != ''")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for url in urls {
+        insert_proxy_if_absent(conn, &url)?;
+    }
+    Ok(())
+}
+
+/// 池里没有这条 URL 就按 host:port 起名插一条。
+fn insert_proxy_if_absent(conn: &Connection, url: &str) -> Result<()> {
+    let exists: bool = conn.prepare("SELECT 1 FROM proxies WHERE url = ?1")?.exists(params![url])?;
+    if exists {
+        return Ok(());
+    }
+    let label = unique_proxy_label(conn, &proxy_host_label(url))?;
+    conn.execute("INSERT INTO proxies (label, url) VALUES (?1, ?2)", params![label, url])?;
+    Ok(())
+}
+
+/// 代理的默认名称：`host:port`，**绝不带 user:pass**——名称会出现在账号卡片、下拉与导出里。
+fn proxy_host_label(url: &str) -> String {
+    url.parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|u| {
+            let host = u.host()?.to_string();
+            Some(match u.port_u16() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| "proxy".to_string())
+}
+
+/// 名称撞了就加 ` #2`、` #3`……名称不做唯一约束，但同名两条在下拉里分不出来。
+fn unique_proxy_label(conn: &Connection, base: &str) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT 1 FROM proxies WHERE label = ?1")?;
+    if !stmt.exists(params![base])? {
+        return Ok(base.to_string());
+    }
+    for n in 2.. {
+        let candidate = format!("{base} #{n}");
+        if !stmt.exists(params![candidate])? {
+            return Ok(candidate);
+        }
+    }
+    unreachable!()
 }
 
 /// 给 `credential_stats` 补上 `reset_credits_raw` 列。理由同 [`migrate_token_totals`]。
@@ -1428,17 +1523,167 @@ impl CredentialStore {
     ///
     /// 校验在 [`crate::clients::validate_proxy`]，**入库前就得过**——存进去一条建不出
     /// 客户端的代理，故障要等到下次选中这个号才暴露。
+    ///
+    /// 配上的地址顺手收进代理池（没有才插）：手填的一条不进池子的话，就没法在池里测、
+    /// 也没法再分给别的号。
     pub fn set_proxy(&self, id: i64, proxy: Option<&str>) -> Result<()> {
+        self.set_proxies(&[id], proxy)
+    }
+
+    /// 批量设置 / 清除若干账号的出站代理，单事务。语义同 [`Self::set_proxy`]。
+    pub fn set_proxies(&self, ids: &[i64], proxy: Option<&str>) -> Result<()> {
         let normalized = match proxy.map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw) => Some(crate::clients::validate_proxy(raw)?),
             None => None,
         };
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE credentials SET proxy = ?1, updated_at = unixepoch() WHERE id = ?2",
-            params![normalized, id],
-        )?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET proxy = ?1, updated_at = unixepoch() WHERE id = ?2",
+            )?;
+            for &id in ids {
+                stmt.execute(params![normalized, id])?;
+            }
+        }
+        if let Some(url) = &normalized {
+            insert_proxy_if_absent(&tx, url)?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// 代理池全部条目，按添加顺序。
+    pub fn list_proxies(&self) -> Result<Vec<SavedProxy>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, label, url, created_at FROM proxies ORDER BY id")?;
+        let rows = stmt.query_map([], row_to_proxy)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 每条代理 URL 被哪些账号在用（url → 账号名称）。按 URL 字符串对上，见 `proxies` 表的注。
+    pub fn proxy_usage(&self) -> Result<HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT proxy, label FROM credentials \
+             WHERE proxy IS NOT NULL AND proxy != '' ORDER BY priority, id",
+        )?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (url, label) = row?;
+            map.entry(url).or_default().push(label);
+        }
+        Ok(map)
+    }
+
+    /// 往代理池加一条。URL 先过校验与规范化；`label` 留空按 host:port 起名。
+    pub fn add_proxy(&self, label: &str, raw_url: &str) -> Result<SavedProxy> {
+        let url = crate::clients::validate_proxy(raw_url)?;
+        let conn = self.conn.lock();
+        let exists: bool =
+            conn.prepare("SELECT 1 FROM proxies WHERE url = ?1")?.exists(params![url])?;
+        anyhow::ensure!(!exists, "this proxy is already in the pool: {url}");
+        let label = match label.trim() {
+            "" => unique_proxy_label(&conn, &proxy_host_label(&url))?,
+            l => l.to_string(),
+        };
+        conn.query_row(
+            "INSERT INTO proxies (label, url) VALUES (?1, ?2) \
+             RETURNING id, label, url, created_at",
+            params![label, url],
+            row_to_proxy,
+        )
+        .map_err(Into::into)
+    }
+
+    /// 批量导入：每条 (名称, 原始 URL)，名称可空。已有的 URL 跳过，不覆盖名称。
+    ///
+    /// 行号随条目带进来，是因为解析那一步（[`crate::clients::parse_proxy_line`]）已经丢掉了
+    /// 空行和注释行，这里再数就对不上输入框了。
+    pub fn import_proxies(
+        &self,
+        entries: Vec<(usize, Result<(String, String)>)>,
+    ) -> Result<ProxyImportReport> {
+        let mut report = ProxyImportReport::default();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for (line, entry) in entries {
+            let (label, url) = match entry.and_then(|(label, raw)| {
+                Ok((label, crate::clients::validate_proxy(&raw)?))
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    report.invalid.push((line, format!("{e:#}")));
+                    continue;
+                }
+            };
+            let exists: bool =
+                tx.prepare("SELECT 1 FROM proxies WHERE url = ?1")?.exists(params![url])?;
+            if exists {
+                report.duplicated += 1;
+                continue;
+            }
+            let label = match label.trim() {
+                "" => unique_proxy_label(&tx, &proxy_host_label(&url))?,
+                l => l.to_string(),
+            };
+            tx.execute("INSERT INTO proxies (label, url) VALUES (?1, ?2)", params![label, url])?;
+            report.added += 1;
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// 改一条代理的名称与地址。**地址变了就把正在用旧地址的账号一并改过去**，同一事务。
+    ///
+    /// 不跟着改的话，账号还走旧地址，池里那条却已经是新地址：「使用账号」一栏清零，
+    /// 人以为没号在用，其实它们正走着一条池里已经找不到的代理。
+    pub fn update_proxy(&self, id: i64, label: &str, raw_url: &str) -> Result<Option<SavedProxy>> {
+        let url = crate::clients::validate_proxy(raw_url)?;
+        let label = label.trim();
+        anyhow::ensure!(!label.is_empty(), "the proxy name must not be empty");
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let old: Option<String> = tx
+            .query_row("SELECT url FROM proxies WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        let Some(old) = old else {
+            return Ok(None);
+        };
+        if old != url {
+            let taken: bool = tx
+                .prepare("SELECT 1 FROM proxies WHERE url = ?1 AND id != ?2")?
+                .exists(params![url, id])?;
+            anyhow::ensure!(!taken, "another entry in the pool already has this URL: {url}");
+            tx.execute(
+                "UPDATE credentials SET proxy = ?1, updated_at = unixepoch() WHERE proxy = ?2",
+                params![url, old],
+            )?;
+        }
+        let saved = tx.query_row(
+            "UPDATE proxies SET label = ?1, url = ?2 WHERE id = ?3 \
+             RETURNING id, label, url, created_at",
+            params![label, url, id],
+            row_to_proxy,
+        )?;
+        tx.commit()?;
+        Ok(Some(saved))
+    }
+
+    /// 从代理池删掉若干条，返回真的删掉几条。**不动账号**：在用的号照旧走那个地址。
+    pub fn delete_proxies(&self, ids: &[i64]) -> Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare("DELETE FROM proxies WHERE id = ?1")?;
+            for &id in ids {
+                n += stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     fn update_col(&self, col: &str, id: i64, value: i64) -> Result<()> {
@@ -2689,6 +2934,41 @@ impl CredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 代理池与账号按 URL 对上：手配的代理进池、改池里的地址账号跟着走、删池条目不动账号。
+    #[test]
+    fn proxy_pool_tracks_account_urls() {
+        let s = CredentialStore::open_in_memory().unwrap();
+        let (a, _) = s.upsert("a", None, None, "acct-a", None, "at", "rt-a", now_secs() + 3600).unwrap();
+        let (b, _) = s.upsert("b", None, None, "acct-b", None, "at", "rt-b", now_secs() + 3600).unwrap();
+
+        s.set_proxy(a.id, Some("socks5://h:1080")).unwrap();
+        let pool = s.list_proxies().unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].url, "socks5h://h:1080");
+        assert_eq!(pool[0].label, "h:1080");
+
+        s.set_proxies(&[b.id], Some("socks5h://h:1080")).unwrap();
+        assert_eq!(s.proxy_usage().unwrap()["socks5h://h:1080"], vec!["a", "b"]);
+        assert!(s.add_proxy("", "socks5://h:1080").is_err(), "同一条 URL 不能进两次");
+
+        s.update_proxy(pool[0].id, "新名", "http://h2:8080").unwrap().unwrap();
+        assert_eq!(s.get(a.id).unwrap().unwrap().proxy.as_deref(), Some("http://h2:8080"));
+        assert_eq!(s.get(b.id).unwrap().unwrap().proxy.as_deref(), Some("http://h2:8080"));
+
+        let report = s
+            .import_proxies(vec![
+                (1, Ok(("".into(), "http://h2:8080".into()))),
+                (2, Ok(("x".into(), "socks5://h3:1".into()))),
+                (3, Ok(("".into(), "ftp://h4:1".into()))),
+            ])
+            .unwrap();
+        assert_eq!((report.added, report.duplicated, report.invalid.len()), (1, 1, 1));
+        assert_eq!(report.invalid[0].0, 3);
+
+        assert_eq!(s.delete_proxies(&[pool[0].id]).unwrap(), 1);
+        assert_eq!(s.get(a.id).unwrap().unwrap().proxy.as_deref(), Some("http://h2:8080"));
+    }
 
     fn store() -> CredentialStore {
         CredentialStore::open_in_memory().unwrap()
