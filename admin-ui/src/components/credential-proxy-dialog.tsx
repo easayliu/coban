@@ -237,7 +237,7 @@ export function ProxyTestResultView({
       <MapPinIcon className="mt-0.5 size-3.5 shrink-0" />
       {result.ok ? (
         <div className="min-w-0 space-y-0.5">
-          <p className="font-medium font-mono">{result.ip}</p>
+          <p className="break-all font-medium font-mono">{result.ip}</p>
           <p className="text-muted-foreground">
             {[
               result.loc && regionName(result.loc, language),

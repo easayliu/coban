@@ -1,11 +1,10 @@
-import { useCallback, useState } from 'react'
+import { Fragment, useCallback, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CheckIcon,
   CopyIcon,
   DownloadIcon,
   FileUpIcon,
-  FilterIcon,
   GlobeIcon,
   PencilIcon,
   PlayIcon,
@@ -61,6 +60,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/c
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { toastManager } from '@/components/ui/toast'
 
 /**
@@ -68,6 +68,9 @@ import { toastManager } from '@/components/ui/toast'
  * 同时从几十个出口打 chatgpt.com，住宅代理那头也容易被判成滥用。
  */
 const BATCH_TEST_CONCURRENCY = 4
+
+/** 按最近一次测试结果筛。结果只在本页内存里，刷新页面就回到全部「未测」。 */
+type StatusFilter = 'all' | 'ok' | 'failed' | 'untested'
 
 /** 删除确认框的目标：一条，或一批（失败项 / 勾选项）。 */
 type DeleteTarget = { kind: 'one' | 'failed' | 'selected'; proxies: SavedProxy[] }
@@ -86,7 +89,7 @@ export function ProxyPoolSettingsContent() {
   const [testing, setTesting] = useState<Set<string>>(() => new Set())
   // 记下是哪个批量按钮在跑：几个按钮互斥，但转圈只转被点的那个。
   const [batchRunning, setBatchRunning] = useState<'all' | 'failed' | 'selected' | null>(null)
-  const [onlyFailed, setOnlyFailed] = useState(false)
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [selected, setSelected] = useState<Set<number>>(() => new Set())
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
   const [importOpen, setImportOpen] = useState(false)
@@ -162,7 +165,7 @@ export function ProxyPoolSettingsContent() {
       })
       setDeleteTarget(null)
       // 筛选跟着这批失败项一起结束：不复位的话，下次测出失败会一下子只剩失败项，像是代理被删了。
-      if (target.kind === 'failed') setOnlyFailed(false)
+      if (target.kind === 'failed') setStatusFilter('all')
       invalidate()
       toastManager.add({
         title: t(`已删除 ${deleted} 条代理`, `Deleted ${deleted} prox${deleted === 1 ? 'y' : 'ies'}`),
@@ -221,9 +224,22 @@ export function ProxyPoolSettingsContent() {
   const testedCount = proxies.filter((p) => results[p.url]).length
   const okCount = proxies.filter((p) => results[p.url]?.ok).length
   const failedProxies = proxies.filter((p) => results[p.url]?.ok === false)
-  // 失败项清空后（重测都通了 / 删光了）自动回到全部列表，不留一个空的筛选结果。
-  const filtering = onlyFailed && failedProxies.length > 0
-  const visibleProxies = filtering ? failedProxies : proxies
+  const byStatus: Record<StatusFilter, SavedProxy[]> = {
+    all: proxies,
+    ok: proxies.filter((p) => results[p.url]?.ok),
+    failed: failedProxies,
+    untested: proxies.filter((p) => !results[p.url]),
+  }
+  // 筛到的那一类清空后（失败项重测都通了 / 删光了）自动回到全部，不留一个空列表——
+  // 看着像代理被删了。
+  const activeFilter: StatusFilter = byStatus[statusFilter].length > 0 ? statusFilter : 'all'
+  const visibleProxies = byStatus[activeFilter]
+  const filterLabels: Record<StatusFilter, string> = {
+    all: t('全部', 'All'),
+    ok: t('可用', 'Working'),
+    failed: t('失败', 'Failed'),
+    untested: t('未测', 'Untested'),
+  }
   // 勾选只认还在池里的：别处删掉的条目不能留在「已选 N 条」里。
   const selectedProxies = proxies.filter((p) => selected.has(p.id))
   const allVisibleSelected = visibleProxies.length > 0 && visibleProxies.every((p) => selected.has(p.id))
@@ -380,6 +396,33 @@ export function ProxyPoolSettingsContent() {
           </div>
         </div>
 
+        {/* 测过才有得筛：一条没测时四个选项里三个是 0，只是占地方。「全选」只勾筛出来的这些，
+            于是「筛可用 → 全选 → 导出 / 分给账号」一路能走通。 */}
+        {testedCount > 0 && (
+          <div className="flex items-center gap-2 border-t px-4 py-2.5 sm:px-5">
+            <ToggleGroup
+              value={[activeFilter]}
+              onValueChange={(values) => {
+                const next = values[values.length - 1] as StatusFilter | undefined
+                if (next) setStatusFilter(next)
+              }}
+              variant="outline"
+              size="sm"
+              aria-label={t('按测试结果筛选', 'Filter by test result')}
+            >
+              {(Object.keys(filterLabels) as StatusFilter[]).map((key, i) => (
+                <Fragment key={key}>
+                  {i > 0 && <ToggleGroupSeparator />}
+                  <ToggleGroupItem value={key} disabled={byStatus[key].length === 0} className="px-2.5 text-xs">
+                    {filterLabels[key]}
+                    <span className="text-muted-foreground tabular-nums">{byStatus[key].length}</span>
+                  </ToggleGroupItem>
+                </Fragment>
+              ))}
+            </ToggleGroup>
+          </div>
+        )}
+
         {/* 失败项单独一行：筛选、重测、删除都只针对这批，和上面的全池操作分开，免得误删。 */}
         {failedProxies.length > 0 && (
           <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 bg-destructive/5 px-4 py-2.5 sm:px-5">
@@ -387,15 +430,6 @@ export function ProxyPoolSettingsContent() {
               {t(`${failedProxies.length} 条测试失败`, `${failedProxies.length} failed`)}
             </p>
             <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                variant={filtering ? 'secondary' : 'ghost'}
-                aria-pressed={filtering}
-                onClick={() => setOnlyFailed((v) => !v)}
-              >
-                <FilterIcon />
-                {filtering ? t('显示全部', 'Show all') : t('只看失败', 'Only failed')}
-              </Button>
               <Button
                 size="sm"
                 variant="outline"
