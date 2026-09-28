@@ -1054,7 +1054,8 @@ fn seed_proxy_pool(conn: &Connection) -> Result<()> {
 
 /// 池里没有这条 URL 就按 host:port 起名插一条。
 fn insert_proxy_if_absent(conn: &Connection, url: &str) -> Result<()> {
-    let exists: bool = conn.prepare("SELECT 1 FROM proxies WHERE url = ?1")?.exists(params![url])?;
+    let exists: bool =
+        conn.prepare("SELECT 1 FROM proxies WHERE url = ?1")?.exists(params![url])?;
     if exists {
         return Ok(());
     }
@@ -1609,9 +1610,9 @@ impl CredentialStore {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         for (line, entry) in entries {
-            let (label, url) = match entry.and_then(|(label, raw)| {
-                Ok((label, crate::clients::validate_proxy(&raw)?))
-            }) {
+            let (label, url) = match entry
+                .and_then(|(label, raw)| Ok((label, crate::clients::validate_proxy(&raw)?)))
+            {
                 Ok(v) => v,
                 Err(e) => {
                     report.invalid.push((line, format!("{e:#}")));
@@ -2939,8 +2940,10 @@ mod tests {
     #[test]
     fn proxy_pool_tracks_account_urls() {
         let s = CredentialStore::open_in_memory().unwrap();
-        let (a, _) = s.upsert("a", None, None, "acct-a", None, "at", "rt-a", now_secs() + 3600).unwrap();
-        let (b, _) = s.upsert("b", None, None, "acct-b", None, "at", "rt-b", now_secs() + 3600).unwrap();
+        let (a, _) =
+            s.upsert("a", None, None, "acct-a", None, "at", "rt-a", now_secs() + 3600).unwrap();
+        let (b, _) =
+            s.upsert("b", None, None, "acct-b", None, "at", "rt-b", now_secs() + 3600).unwrap();
 
         s.set_proxy(a.id, Some("socks5://h:1080")).unwrap();
         let pool = s.list_proxies().unwrap();

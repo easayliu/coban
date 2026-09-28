@@ -816,8 +816,13 @@ async fn set_proxy(
 ///
 /// **收的是 URL 而不是池里的 id**：要测的常常是输入框里还没保存的值——先测通再保存，
 /// 而不是存进去一条坏代理、让号的真实流量先撞一次墙。
-async fn test_proxy(Json(req): Json<TextReq>) -> Result<Json<crate::clients::ProxyTestReport>, ApiError> {
-    crate::clients::test_proxy(&req.value).await.map(Json).map_err(|e| bad_request(format!("{e:#}")))
+async fn test_proxy(
+    Json(req): Json<TextReq>,
+) -> Result<Json<crate::clients::ProxyTestReport>, ApiError> {
+    crate::clients::test_proxy(&req.value)
+        .await
+        .map(Json)
+        .map_err(|e| bad_request(format!("{e:#}")))
 }
 
 /// 代理池一条的视图：附上哪些账号在用它。
@@ -832,7 +837,10 @@ fn proxy_views(state: &AppState, list: Vec<store::SavedProxy>) -> Result<Vec<Pro
     let mut usage = state.store.proxy_usage().map_err(internal)?;
     Ok(list
         .into_iter()
-        .map(|p| ProxyView { credential_labels: usage.remove(&p.url).unwrap_or_default(), proxy: p })
+        .map(|p| ProxyView {
+            credential_labels: usage.remove(&p.url).unwrap_or_default(),
+            proxy: p,
+        })
         .collect())
 }
 
@@ -853,7 +861,8 @@ async fn add_proxy(
     State(state): State<AppState>,
     Json(req): Json<ProxyReq>,
 ) -> Result<Json<ProxyView>, ApiError> {
-    let p = state.store.add_proxy(&req.label, &req.url).map_err(|e| bad_request(format!("{e:#}")))?;
+    let p =
+        state.store.add_proxy(&req.label, &req.url).map_err(|e| bad_request(format!("{e:#}")))?;
     Ok(Json(proxy_views(&state, vec![p])?.remove(0)))
 }
 
